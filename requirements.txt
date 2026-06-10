@@ -1,0 +1,8 @@
+streamlit
+pandas
+openpyxl
+selenium
+webdriver-manager
+matplotlib
+numpy
+urllib3

@@ -1,0 +1,1314 @@
+# -*- coding: utf-8 -*-
+"""
+rinkos_logika.py
+
+Visa rinkos ataskaitos logika, pritaikyta naudoti su Streamlit.
+Šis failas neturi Streamlit UI; jį importuoja app.py.
+"""
+
+import os
+os.environ["WDM_SSL_VERIFY"] = "0"
+
+import re
+import time
+import hashlib
+import warnings
+from difflib import SequenceMatcher
+from datetime import datetime, date
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.styles.stylesheet")
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+NASDAQ_NEWS_URL = "https://nasdaqbaltic.com/statistics/lt/news"
+
+SEGMENTAI = {
+    "Akcijos": ["Baltijos Papildomasis sąrašas", "Baltijos Oficialusis sąrašas"],
+    "Obligacijos": ["Baltijos skolos VP sąrašas"],
+}
+
+IZVALGU_SPALVOS = {
+    "🔥 Staigus aktyvumas su didele apimtimi": "#ff6f61",
+    "🚨 Didelis poveikis rinkai": "#ff9999",
+    "⚠️ Mažas likvidumas + kainos pokytis": "#ffd966",
+    "🔍 Didelė apyvarta be kainos pokyčio": "#b4c6e7",
+    "🔁 Aktyvumas be kainos pokyčio": "#a9d18e",
+}
+
+
+def extract_dates_from_filename(filename: str):
+    m = re.search(r"(\d{8})_(\d{8})", filename or "")
+    if not m:
+        return None, None
+    start_date = datetime.strptime(m.group(1), "%Y%m%d").date()
+    end_date = datetime.strptime(m.group(2), "%Y%m%d").date()
+    return start_date, end_date
+
+
+def report_caption_from_filename(filename: str) -> str:
+    start_date, end_date = extract_dates_from_filename(filename)
+    if start_date and end_date:
+        return f"Rinkos apžvalga ({start_date} – {end_date})"
+    return "Rinkos apžvalga"
+
+
+def normalize(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"(group|grupė|bankas)", "", text)
+    text = re.sub(r"\b(uab|ab|as)\b", "", text)
+    text = re.sub(r"[^\w\s]", "", text)
+    return text.strip()
+
+
+def atitinka(pavadinimas: str, antraste: str) -> bool:
+    """
+    SPECIALUS ATVEJIS AUGA GROUP:
+    Jei įmonės pavadinime yra 'auga' ir 'group', atitinka tik jei antraštėje yra 'auga group'.
+    """
+    if not isinstance(pavadinimas, str) or not isinstance(antraste, str):
+        return False
+
+    if re.search(r"\bauga\b", pavadinimas, flags=re.I) and re.search(r"\bgroup\b", pavadinimas, flags=re.I):
+        return bool(re.search(r"\bauga\s+group\b", antraste, flags=re.I))
+
+    pavad = normalize(pavadinimas)
+    antr = normalize(antraste)
+    if not pavad or not antr:
+        return False
+    if pavad in antr:
+        return True
+    return SequenceMatcher(None, pavad, antr).ratio() > 0.65
+
+
+def extract_date_from_url(url: str):
+    match = re.search(r"/(\d{4})/(\d{2})/(\d{2})/", url or "")
+    if match:
+        return datetime.strptime("-".join(match.groups()), "%Y-%m-%d").date()
+    return None
+
+
+def get_inner_text(driver, el):
+    try:
+        return (driver.execute_script("return arguments[0].innerText || arguments[0].textContent;", el) or "").strip()
+    except Exception:
+        try:
+            return (el.text or "").strip()
+        except Exception:
+            return ""
+
+
+def extract_title_and_text_generic(driver, timeout=15):
+    """Paimame H1/H2 + pagrindinį tekstą (main/article); jei nepavyksta – didžiausią tekstinį bloką."""
+    title, content = "", ""
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")
+    except Exception:
+        pass
+
+    try:
+        for sel in ["h1", "header h1", "article h1", "h2", ".title", ".headline"]:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els:
+                title = get_inner_text(driver, els[0])
+                if title:
+                    break
+    except Exception:
+        pass
+
+    candidates = [
+        "article", "main", "section.article", "div.article", "div.article-body",
+        "div.article-content", ".content", ".vz-article__content", ".vz-article__body",
+        ".nef-message-details", ".notice", ".notice__content", ".page-content", ".content-area",
+    ]
+    try:
+        for sel in candidates:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            best = ""
+            for e in els:
+                t = get_inner_text(driver, e)
+                if len(t) > len(best):
+                    best = t
+            if len(best) > 100:
+                content = best
+                break
+    except Exception:
+        pass
+
+    if not content:
+        try:
+            body = driver.find_element(By.TAG_NAME, "body")
+            content = get_inner_text(driver, body)
+        except Exception:
+            content = ""
+
+    def clean_text(t):
+        t = re.sub(r"\r", "", t or "")
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
+    return clean_text(title), clean_text(content)
+
+
+def _init_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1600,1200")
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+
+def _open_new_tab_and_get(driver, url, timeout=25):
+    """Atidarome naują skirtuką, paimame (title, content), grįžtame į pagrindinį tabą."""
+    try:
+        driver.execute_script("window.open('about:blank','_blank');")
+        driver.switch_to.window(driver.window_handles[-1])
+        driver.get(url)
+        t, c = extract_title_and_text_generic(driver, timeout=timeout)
+        driver.close()
+        driver.switch_to.window(driver.window_handles[0])
+        return t, c
+    except Exception:
+        try:
+            driver.get(url)
+            t, c = extract_title_and_text_generic(driver, timeout=timeout)
+        except Exception:
+            t, c = "", ""
+        return t, c
+
+
+def _click_possible_cookie_banners(driver):
+    candidates = [
+        (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'accept')]"),
+        (By.XPATH, "//button[contains(., 'Sutinku')]"),
+        (By.XPATH, "//button[contains(., 'Leisti')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'allow')]"),
+    ]
+    for by, sel in candidates:
+        try:
+            el = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, sel)))
+            el.click()
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def _wait_ready(driver, timeout=30):
+    WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")
+
+
+def _click_language_lt_real_button(driver, timeout=20) -> bool:
+    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, "nef-navigation")))
+    host = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(
+        (By.CSS_SELECTOR, 'nef-navigation-button.language-selector[data-language="lt"]')
+    ))
+    try:
+        shadow_root = host.shadow_root
+    except Exception:
+        shadow_root = driver.execute_script("return arguments[0].shadowRoot", host)
+    button = WebDriverWait(driver, timeout).until(
+        lambda d: shadow_root.find_element(By.CSS_SELECTOR, "button.nef-c-navigation-button__button")
+    )
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
+    try:
+        button.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", button)
+    return True
+
+
+def scrape_crib_dom_lt(start_date: date, end_date: date, progress=None) -> pd.DataFrame:
+    if progress:
+        progress("CRIB naujienos: prisijungiama prie CRIB.lt...")
+    driver = _init_driver()
+    records = []
+    try:
+        driver.get("https://www.crib.lt/")
+        _wait_ready(driver, 35)
+        _click_possible_cookie_banners(driver)
+
+        if progress:
+            progress("CRIB: perjungiama LT kalba...")
+        _click_language_lt_real_button(driver, timeout=20)
+
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "nef-table-row.message-row"))
+        )
+
+        for _ in range(4):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.8)
+
+        rows = driver.find_elements(By.CSS_SELECTOR, "nef-table-row.message-row")
+        if progress:
+            progress(f"CRIB: rasta {len(rows)} naujienų eilučių")
+
+        for row in rows:
+            try:
+                link_el = None
+                for sel in ["nef-link[href]", "a.table-link"]:
+                    try:
+                        link_el = row.find_element(By.CSS_SELECTOR, sel)
+                        break
+                    except Exception:
+                        pass
+
+                headline = ""
+                href = None
+                if link_el:
+                    headline = get_inner_text(driver, link_el)
+                    try:
+                        href = link_el.get_attribute("href")
+                    except Exception:
+                        href = None
+
+                cat_el = None
+                for sel in [".table-category", "nef-table-cell.table-category"]:
+                    try:
+                        cat_el = row.find_element(By.CSS_SELECTOR, sel)
+                        break
+                    except Exception:
+                        pass
+                category = get_inner_text(driver, cat_el) if cat_el else ""
+
+                cmp_el = None
+                for sel in [".table-issuer", ".table-company", "nef-table-cell.table-issuer", "nef-table-cell.table-company"]:
+                    try:
+                        cmp_el = row.find_element(By.CSS_SELECTOR, sel)
+                        break
+                    except Exception:
+                        pass
+                company = get_inner_text(driver, cmp_el) if cmp_el else ""
+
+                dt_el = None
+                for sel in [".table-date", "nef-table-cell.table-date"]:
+                    try:
+                        dt_el = row.find_element(By.CSS_SELECTOR, sel)
+                        break
+                    except Exception:
+                        pass
+                if dt_el is None:
+                    try:
+                        dt_el = row.find_elements(By.CSS_SELECTOR, "nef-table-cell")[0]
+                    except Exception:
+                        pass
+
+                published_raw = get_inner_text(driver, dt_el) if dt_el else ""
+                published_txt = re.sub(r"\s+[A-Za-z]{2,5}$", "", published_raw).strip()
+
+                dt = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        dt = datetime.strptime(published_txt, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if dt is None:
+                    try:
+                        dt = pd.to_datetime(published_raw).to_pydatetime()
+                    except Exception:
+                        continue
+
+                if not (start_date <= dt.date() <= end_date):
+                    continue
+
+                if href and href.startswith("/"):
+                    href = "https://www.crib.lt" + href
+
+                if href:
+                    if "lang=" in href:
+                        href = re.sub(r"(\?|&)lang=[a-z]{2}", r"\1lang=lt", href)
+                    else:
+                        sep = "&" if "?" in href else "?"
+                        href = f"{href}{sep}lang=lt"
+
+                label = f"{dt.strftime('%Y-%m-%d %H:%M')} – {headline}" if headline else dt.strftime("%Y-%m-%d %H:%M")
+                if href:
+                    label = f'<a href="{href}" target="_blank">{label}</a>'
+
+                full_title, full_text = ("", "")
+                if href:
+                    full_title, full_text = _open_new_tab_and_get(driver, href, timeout=20)
+
+                records.append({
+                    "Bendrovė": company,
+                    "Kategorija": category,
+                    "Naujiena": label,
+                    "Published_dt": dt,
+                    "Nuoroda": href or "",
+                    "Pilna_antraštė": full_title or headline or "",
+                    "Pilnas_tekstas": full_text or "",
+                })
+            except Exception:
+                continue
+    finally:
+        driver.quit()
+
+    df_news = pd.DataFrame(records)
+    if df_news.empty:
+        return pd.DataFrame(columns=[
+            "Bendrovė", "Kategorija", "Naujiena", "Published_dt", "Nuoroda",
+            "Pilna_antraštė", "Pilnas_tekstas", "Bendrovė_norm",
+        ])
+
+    df_news["Bendrovė_norm"] = (
+        df_news["Bendrovė"].astype(str).str.lower()
+        .str.replace(" group", "", regex=False)
+        .str.replace(" grupė", "", regex=False)
+        .str.replace(" bankas", "", regex=False)
+        .str.replace(r"\b(uab|ab|as)\b", "", regex=True)
+        .str.replace(r"[^\w\s]", "", regex=True)
+        .str.strip()
+    )
+    df_news = df_news.sort_values("Published_dt", ascending=False).reset_index(drop=True)
+    return df_news
+
+
+def vz_scrape_full(start_date, end_date, df_stat: pd.DataFrame, progress=None):
+    """VŽ: sąrašas + pilni tekstai. Grąžina (vz_map, vz_df)."""
+    if progress:
+        progress("VŽ: renkami straipsniai ir pilni tekstai...")
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    try:
+        driver.get("https://www.vz.lt/")
+        time.sleep(1)
+
+        try:
+            accept_button = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"))
+            )
+            accept_button.click()
+            time.sleep(1)
+        except Exception:
+            pass
+
+        try:
+            WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.articles")))
+        except Exception:
+            pass
+
+        items = []
+        for el in driver.find_elements(By.CSS_SELECTOR, "article.vz-article"):
+            try:
+                antraste_el = el.find_element(By.CSS_SELECTOR, "div.vz-article__summary--description")
+                nuoroda = antraste_el.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
+                antraste = antraste_el.text.strip()
+                data_url = extract_date_from_url(nuoroda)
+                if data_url is not None and start_date <= data_url <= end_date:
+                    t, content = _open_new_tab_and_get(driver, nuoroda, timeout=20)
+                    if not t:
+                        t = antraste
+                    items.append({
+                        "Antraštė": t.strip(),
+                        "Nuoroda": nuoroda,
+                        "Data": data_url,
+                        "Pilnas_tekstas": content.strip(),
+                    })
+            except Exception:
+                continue
+    finally:
+        driver.quit()
+
+    vz_df = pd.DataFrame(items)
+    if vz_df.empty:
+        return {}, pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+
+    vz_map = {}
+    imones = df_stat["Bendrovė"].dropna().unique()
+    for imone in imones:
+        found = ""
+        for _, row in vz_df.iterrows():
+            if atitinka(imone, row.get("Antraštė", "")):
+                found = f'<a href="{row["Nuoroda"]}" target="_blank">{row["Antraštė"]}</a>'
+                break
+        vz_map[imone] = found
+
+    return vz_map, vz_df
+
+
+def _safe_click(driver, by, selector, timeout=10):
+    el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+    return el
+
+
+def _try_accept_cookies(driver):
+    candidates = [
+        (By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"),
+        (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
+        (By.XPATH, "//button[contains(., 'Sutinku')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'accept')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'allow')]"),
+    ]
+    for by, sel in candidates:
+        try:
+            _safe_click(driver, by, sel, timeout=3)
+            time.sleep(0.6)
+            return
+        except Exception:
+            pass
+
+
+def _set_date_input(driver, label_text: str, value_yyyy_mm_dd: str):
+    xpaths = [
+        f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+        f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+    ]
+    for xp in xpaths:
+        try:
+            inp = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, xp)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+            inp.clear()
+            inp.send_keys(value_yyyy_mm_dd)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _tick_vilnius_checkbox(driver):
+    xps = [
+        "//label[contains(., 'Vilnius')]",
+        "//*[contains(., 'Vilnius') and (self::label or self::span or self::div)]",
+    ]
+    for xp in xps:
+        try:
+            el = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, xp)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+            time.sleep(0.3)
+            return True
+        except Exception:
+            pass
+
+    for css in ["input[id*='viln' i]", "input[name*='viln' i]", "input[value*='viln' i]"]:
+        try:
+            cb = driver.find_element(By.CSS_SELECTOR, css)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+            if not cb.is_selected():
+                driver.execute_script("arguments[0].click();", cb)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _click_search(driver):
+    candidates = [
+        (By.XPATH, "//button[contains(., 'Paieška')]"),
+        (By.XPATH, "//input[@type='submit' and contains(@value, 'Paieška')]") ,
+        (By.CSS_SELECTOR, "button[type='submit']"),
+    ]
+    for by, sel in candidates:
+        try:
+            _safe_click(driver, by, sel, timeout=8)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _parse_news_rows(driver):
+    rows = []
+    selectors = ["table tbody tr", "div.table-responsive table tbody tr", ".table tbody tr", "table tr"]
+    table_rows = []
+    for sel in selectors:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            els = [e for e in els if (e.text or "").strip()]
+            if len(els) >= 5:
+                table_rows = els
+                break
+        except Exception:
+            pass
+
+    if not table_rows:
+        return rows
+
+    for tr in table_rows:
+        try:
+            tds = tr.find_elements(By.CSS_SELECTOR, "td")
+            if not tds:
+                continue
+
+            link = ""
+            title = ""
+            try:
+                a = tr.find_element(By.CSS_SELECTOR, "a")
+                link = a.get_attribute("href") or ""
+                title = (a.text or "").strip()
+            except Exception:
+                title = (tds[0].text if tds else tr.text).strip()
+
+            day_txt = (tds[0].text or "").strip() if len(tds) >= 1 else ""
+            time_txt = (tds[1].text or "").strip() if len(tds) >= 2 else ""
+
+            company = ""
+            for cand_idx in [3, 4, 5, 2]:
+                if len(tds) > cand_idx:
+                    company = (tds[cand_idx].text or "").strip()
+                    if company:
+                        break
+
+            exchange = ""
+            lang = ""
+            for cand_idx in [6, 7, 5]:
+                if len(tds) > cand_idx:
+                    maybe = (tds[cand_idx].text or "").strip()
+                    if maybe in {"VLN", "RIG", "TAL"}:
+                        exchange = maybe
+                    if maybe.lower() in {"lt", "lv", "et", "en"}:
+                        lang = maybe.lower()
+
+            rows.append({
+                "Diena": day_txt,
+                "Laikas": time_txt,
+                "Nasdaq_antraštė": title,
+                "Nasdaq_nuoroda": link,
+                "Nasdaq_bendrovė": company,
+                "Birža": exchange,
+                "Kalba": lang,
+            })
+        except Exception:
+            continue
+    return rows
+
+
+def _nasdaq_dt(row) -> pd.Timestamp:
+    d = str(row.get("Diena", "")).strip()
+    t = str(row.get("Laikas", "")).strip()
+    s = f"{d} {t}".strip()
+    return pd.to_datetime(s, errors="coerce")
+
+
+def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, progress=None) -> pd.DataFrame:
+    if progress:
+        progress("Nasdaq Baltic: renkami Vilniaus pranešimai ir pilni tekstai...")
+    driver = _init_driver()
+    try:
+        driver.get(NASDAQ_NEWS_URL)
+        WebDriverWait(driver, 25).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        _try_accept_cookies(driver)
+
+        ok_vln = _tick_vilnius_checkbox(driver)
+        if progress and not ok_vln:
+            progress("Nasdaq: nepavyko patikimai pažymėti 'Vilnius' varnelės.")
+
+        _set_date_input(driver, "Nuo", start_date.strftime("%Y-%m-%d"))
+        _set_date_input(driver, "Iki", end_date.strftime("%Y-%m-%d"))
+        _click_search(driver)
+        time.sleep(1.2)
+
+        items = _parse_news_rows(driver)
+        df_n = pd.DataFrame(items)
+        if df_n.empty:
+            return pd.DataFrame(columns=[
+                "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
+                "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
+            ])
+
+        df_n["__dt"] = df_n.apply(_nasdaq_dt, axis=1)
+        cache = {}
+        urls = df_n["Nasdaq_nuoroda"].fillna("").astype(str).unique().tolist()
+        urls = [u.strip() for u in urls if u and u.strip().lower().startswith("http")]
+
+        for url in urls:
+            try:
+                t, c = _open_new_tab_and_get(driver, url, timeout=25)
+                cache[url] = (t or "", c or "")
+            except Exception:
+                cache[url] = ("", "")
+
+        def _get_cached_title(row):
+            u = (row.get("Nasdaq_nuoroda") or "").strip()
+            t = cache.get(u, ("", ""))[0]
+            return t if t else (row.get("Nasdaq_antraštė") or "")
+
+        def _get_cached_text(row):
+            u = (row.get("Nasdaq_nuoroda") or "").strip()
+            return cache.get(u, ("", ""))[1]
+
+        df_n["Nasdaq_pilna_antraštė"] = df_n.apply(_get_cached_title, axis=1)
+        df_n["Nasdaq_pilnas_tekstas"] = df_n.apply(_get_cached_text, axis=1)
+        return df_n
+    finally:
+        driver.quit()
+
+
+def build_nasdaq_map_for_companies(df_first_north: pd.DataFrame, df_nasdaq_news: pd.DataFrame, max_items=5) -> dict:
+    out = {}
+    if df_nasdaq_news is None or df_nasdaq_news.empty:
+        for b in df_first_north["Bendrovė"].dropna().unique():
+            out[b] = ""
+        return out
+
+    news = df_nasdaq_news.copy()
+    news["__title"] = news["Nasdaq_antraštė"].fillna("").astype(str)
+    news["__company"] = news["Nasdaq_bendrovė"].fillna("").astype(str)
+
+    for bendrove in df_first_north["Bendrovė"].dropna().unique():
+        hits = []
+        for _, r in news.iterrows():
+            title = r["__title"]
+            comp = r["__company"]
+            if atitinka(bendrove, title) or atitinka(bendrove, comp):
+                url = (r.get("Nasdaq_nuoroda") or "").strip()
+                t = (r.get("Nasdaq_antraštė") or "").strip()
+                if not t:
+                    continue
+                if url:
+                    hits.append(f'<a href="{url}" target="_blank">{t}</a>')
+                else:
+                    hits.append(t)
+
+        seen = set()
+        hits_unique = []
+        for h in hits:
+            key = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", h)).strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                hits_unique.append(h)
+        out[bendrove] = "\n".join(hits_unique[:max_items])
+    return out
+
+
+def _to_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0)
+
+
+def filter_traded_or_has_news(df_fn: pd.DataFrame) -> pd.DataFrame:
+    apyv = _to_num(df_fn.get("Apyvarta", pd.Series([0] * len(df_fn))))
+    sand = _to_num(df_fn.get("Sand.", pd.Series([0] * len(df_fn))))
+    kiek = _to_num(df_fn.get("Kiekis", pd.Series([0] * len(df_fn))))
+    traded = (apyv > 0) | (sand > 0) | (kiek > 0)
+    news_txt = df_fn.get("Nasdaq pranešimai", pd.Series([""] * len(df_fn))).fillna("").astype(str).str.strip()
+    has_news = news_txt != ""
+    return df_fn[traded | has_news].copy()
+
+
+def spalvinti_pokycio_abs_gradienta(col):
+    col_num = pd.to_numeric(col, errors="coerce")
+    if col_num.notna().any():
+        norm = mcolors.Normalize(vmin=0, vmax=col_num.abs().max(skipna=True))
+        cmap = plt.get_cmap("OrRd")
+        return [f"background-color: {mcolors.to_hex(cmap(norm(abs(v))))}" if pd.notna(v) else "" for v in col_num]
+    return [""] * len(col)
+
+
+def spalvinti_izvalga(val):
+    spalva = IZVALGU_SPALVOS.get(val, "")
+    return f"background-color: {spalva}; font-weight: bold" if spalva else ""
+
+
+def render_lentele(df_: pd.DataFrame, caption: str):
+    df_ = df_.copy()
+    if "Pok.%" in df_.columns:
+        df_ = df_.sort_values(by="Pok.%", key=lambda x: x.abs(), ascending=False)
+    cols = [
+        "Trumpinys", "Bendrovė", "Atid.", "Paskutinė kaina", "Pok.%", "Apyvarta", "Kiekis",
+        "Sand.", "Kategorija", "Naujiena", "Verslo žinios", "Įžvalgos",
+    ]
+    for c in cols:
+        if c not in df_.columns:
+            df_[c] = ""
+    df_ = df_[cols].copy()
+    df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce").apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+
+    return (
+        df_.style
+        .set_caption(caption)
+        .set_table_styles([
+            {"selector": "caption", "props": [("caption-side", "top"), ("font-weight", "bold"), ("font-size", "14px"), ("color", "#333"), ("padding", "8px")]},
+            {"selector": "th", "props": [("background-color", "#f2f2f2"), ("font-weight", "bold"), ("text-align", "center")]},
+            {"selector": "td", "props": [("text-align", "left"), ("font-size", "12px")]},
+            {"selector": "tr:nth-child(even)", "props": [("background-color", "#fafafa")]},
+            {"selector": "tr:nth-child(odd)", "props": [("background-color", "#ffffff")]},
+        ])
+        .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
+        .apply(spalvinti_pokycio_abs_gradienta, subset=["Pok.%"])
+        .map(spalvinti_izvalga, subset=["Įžvalgos"])
+        .hide(axis="index")
+        .set_properties(subset=["Naujiena", "Verslo žinios", "Įžvalgos"], **{"white-space": "pre-line"})
+    )
+
+
+def render_first_north(df_: pd.DataFrame, caption: str):
+    df_ = df_.copy()
+    if "Pok.%" in df_.columns:
+        df_ = df_.sort_values(by="Pok.%", key=lambda x: x.abs(), ascending=False)
+    cols = [
+        "Trumpinys", "Bendrovė", "Atid.", "Paskutinė kaina", "Pok.%", "Apyvarta", "Kiekis",
+        "Sand.", "Sąrašas/segmentas", "Nasdaq pranešimai",
+    ]
+    for c in cols:
+        if c not in df_.columns:
+            df_[c] = ""
+    df_ = df_[cols].copy()
+    df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce").apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+
+    return (
+        df_.style
+        .set_caption(caption)
+        .set_table_styles([
+            {"selector": "caption", "props": [("caption-side", "top"), ("font-weight", "bold"), ("font-size", "14px"), ("color", "#333"), ("padding", "8px")]},
+            {"selector": "th", "props": [("background-color", "#f2f2f2"), ("font-weight", "bold"), ("text-align", "center")]},
+            {"selector": "td", "props": [("text-align", "left"), ("font-size", "12px")]},
+            {"selector": "tr:nth-child(even)", "props": [("background-color", "#fafafa")]},
+            {"selector": "tr:nth-child(odd)", "props": [("background-color", "#ffffff")]},
+        ])
+        .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
+        .apply(spalvinti_pokycio_abs_gradienta, subset=["Pok.%"])
+        .hide(axis="index")
+        .set_properties(subset=["Nasdaq pranešimai"], **{"white-space": "pre-line"})
+    )
+
+
+def ivertink_izvalga(row):
+    if abs(row.get("Pok.%", 0)) > 3 and row.get("Apyvarta", 0) > 100000 and row.get("Kiekis", 0) > 20000:
+        return "🔥 Staigus aktyvumas su didele apimtimi"
+    elif abs(row.get("Pok.%", 0)) > 3 and row.get("Apyvarta", 0) > 50000 and row.get("Kiekis", 0) > 10000 and row.get("Sand.", 0) > 50:
+        return "🚨 Didelis poveikis rinkai"
+    elif abs(row.get("Pok.%", 0)) > 2 and row.get("Apyvarta", 0) < 500 and row.get("Kiekis", 0) < 1000 and row.get("Sand.", 0) <= 5:
+        return "⚠️ Mažas likvidumas + kainos pokytis"
+    elif abs(row.get("Pok.%", 0)) < 1 and row.get("Apyvarta", 0) > 100000 and row.get("Sand.", 0) > 100:
+        return "🔍 Didelė apyvarta be kainos pokyčio"
+    elif row.get("Sand.", 0) > 150 and abs(row.get("Pok.%", 0)) < 0.5:
+        return "🔁 Aktyvumas be kainos pokyčio"
+    return ""
+
+
+def sujungti_naujienas_keli(df_imones: pd.DataFrame, df_news: pd.DataFrame) -> pd.DataFrame:
+    df_out = df_imones.copy()
+    df_out["Bendrovė_norm"] = df_out["Bendrovė"].astype(str).map(normalize)
+    if df_news is None or df_news.empty:
+        df_out["Naujiena"] = ""
+        df_out["Kategorija"] = ""
+        return df_out
+
+    news_keys = df_news["Bendrovė_norm"].dropna().unique().tolist()
+    naujienos_list, kategorijos_list = [], []
+
+    for _, row in df_out.iterrows():
+        key = row["Bendrovė_norm"]
+        candidates = []
+        for nk in news_keys:
+            if not nk:
+                continue
+            if key and (key in nk or nk in key or SequenceMatcher(None, key, nk).ratio() >= 0.80):
+                candidates.append(nk)
+
+        if candidates:
+            subset = df_news[df_news["Bendrovė_norm"].isin(candidates)].copy()
+            joined_news = "\n".join(subset["Naujiena"].tolist())
+            seen = set()
+            ordered_cats = [c for c in subset["Kategorija"].tolist() if not (c in seen or seen.add(c))]
+            joined_cats = ", ".join([c for c in ordered_cats if c])
+        else:
+            joined_news = ""
+            joined_cats = ""
+
+        naujienos_list.append(joined_news)
+        kategorijos_list.append(joined_cats)
+
+    df_out["Naujiena"] = naujienos_list
+    df_out["Kategorija"] = kategorijos_list
+    return df_out
+
+
+def _news_dedup_key(url: str, title: str, text: str) -> str:
+    url = (url or "").strip().lower()
+    if url:
+        return url
+    base = (normalize(title or "") + "||" + normalize((text or "")[:200]))
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def sudeti_visas_naujienas_distinct(df_imones: pd.DataFrame, df_crib: pd.DataFrame, df_vz_raw: pd.DataFrame, df_nasdaq_raw: pd.DataFrame) -> pd.DataFrame:
+    imones_df = df_imones[["Bendrovė"]].dropna().drop_duplicates().copy()
+    imones_df["Bendrovė_norm"] = imones_df["Bendrovė"].astype(str).map(normalize)
+
+    crib = df_crib.copy() if df_crib is not None and not df_crib.empty else pd.DataFrame()
+    if not crib.empty and "Bendrovė_norm" not in crib.columns:
+        crib["Bendrovė_norm"] = crib["Bendrovė"].astype(str).map(normalize)
+
+    vz_raw = df_vz_raw.copy() if df_vz_raw is not None and not df_vz_raw.empty else pd.DataFrame()
+    nasdaq_raw = df_nasdaq_raw.copy() if df_nasdaq_raw is not None and not df_nasdaq_raw.empty else pd.DataFrame()
+
+    out_rows = []
+    for _, im in imones_df.iterrows():
+        bend = im["Bendrovė"]
+        key = im["Bendrovė_norm"]
+        seen_keys = set()
+
+        if not crib.empty and key:
+            nk_list = [nk for nk in crib["Bendrovė_norm"].dropna().unique()
+                       if (key in nk or nk in key or SequenceMatcher(None, key, nk).ratio() >= 0.80)]
+            if nk_list:
+                sub = crib[crib["Bendrovė_norm"].isin(nk_list)].copy().sort_values("Published_dt", ascending=False)
+                for _, r in sub.iterrows():
+                    t = str(r.get("Pilna_antraštė", "")).strip()
+                    txt = str(r.get("Pilnas_tekstas", "")).strip()
+                    url = (r.get("Nuoroda", "") or "").strip()
+                    k = _news_dedup_key(url, t, txt)
+                    if k in seen_keys:
+                        continue
+                    seen_keys.add(k)
+                    label = ""
+                    if t:
+                        label += f"<strong>{t}</strong>\n"
+                    if txt:
+                        label += f"{txt}\n"
+                    if url:
+                        label += f'\nŠaltinis: <a href="{url}" target="_blank">{url}</a>'
+                    out_rows.append({"Bendrovė": bend, "Kategorija": r.get("Kategorija", ""), "Data": pd.to_datetime(r.get("Published_dt", None), errors="coerce"), "Turinys": label})
+
+        if not vz_raw.empty:
+            matches = vz_raw[vz_raw["Antraštė"].apply(lambda s: atitinka(bend, s))]
+            if not matches.empty:
+                matches = matches.sort_values("Data", ascending=False)
+                for _, r in matches.iterrows():
+                    t = str(r.get("Antraštė", "")).strip()
+                    txt = str(r.get("Pilnas_tekstas", "")).strip()
+                    url = (r.get("Nuoroda", "") or "").strip()
+                    k = _news_dedup_key(url, t, txt)
+                    if k in seen_keys:
+                        continue
+                    seen_keys.add(k)
+                    label = ""
+                    if t:
+                        label += f"<strong>{t}</strong>\n"
+                    if txt:
+                        label += f"{txt}\n"
+                    if url:
+                        label += f'\nŠaltinis: <a href="{url}" target="_blank">{url}</a>'
+                    out_rows.append({"Bendrovė": bend, "Kategorija": "Verslo žinios", "Data": pd.to_datetime(r.get("Data", None), errors="coerce"), "Turinys": label})
+
+        if not nasdaq_raw.empty:
+            sub = nasdaq_raw[
+                nasdaq_raw["Nasdaq_antraštė"].apply(lambda s: atitinka(bend, str(s))) |
+                nasdaq_raw["Nasdaq_bendrovė"].apply(lambda s: atitinka(bend, str(s)))
+            ].copy()
+            if not sub.empty:
+                sub = sub.sort_values("__dt", ascending=False)
+                for _, r in sub.iterrows():
+                    t = str(r.get("Nasdaq_pilna_antraštė", "") or r.get("Nasdaq_antraštė", "")).strip()
+                    txt = str(r.get("Nasdaq_pilnas_tekstas", "")).strip()
+                    url = (r.get("Nasdaq_nuoroda", "") or "").strip()
+                    k = _news_dedup_key(url, t, txt)
+                    if k in seen_keys:
+                        continue
+                    seen_keys.add(k)
+                    label = ""
+                    if t:
+                        label += f"<strong>{t}</strong>\n"
+                    if txt:
+                        label += f"{txt}\n"
+                    if url:
+                        label += f'\nŠaltinis: <a href="{url}" target="_blank">{url}</a>'
+                    out_rows.append({"Bendrovė": bend, "Kategorija": "Nasdaq Baltic (Vilnius)", "Data": pd.to_datetime(r.get("__dt", None), errors="coerce"), "Turinys": label})
+
+    df_all = pd.DataFrame(out_rows)
+    if not df_all.empty:
+        df_all = df_all.sort_values(["Bendrovė", "Data"], ascending=[True, False]).reset_index(drop=True)
+        df_all["Data"] = df_all["Data"].apply(lambda x: "" if pd.isna(x) else pd.to_datetime(x).strftime("%Y-%m-%d %H:%M"))
+    else:
+        df_all = pd.DataFrame(columns=["Bendrovė", "Kategorija", "Data", "Turinys"])
+    return df_all
+
+
+def render_visos_naujienos(df_all: pd.DataFrame, caption="Visos skirtingos naujienos pagal bendrovę"):
+    if df_all is None or df_all.empty:
+        df_all = pd.DataFrame([{"Bendrovė": "—", "Kategorija": "", "Data": "", "Turinys": "Naujienų nerasta šiame periode."}])
+    return (
+        df_all.style
+        .set_caption(caption)
+        .set_table_styles([
+            {"selector": "caption", "props": [("caption-side", "top"), ("font-weight", "bold"), ("font-size", "14px"), ("color", "#333"), ("padding", "8px")]},
+            {"selector": "th", "props": [("background-color", "#f2f2f2"), ("font-weight", "bold"), ("text-align", "left")]},
+            {"selector": "td", "props": [("text-align", "left"), ("font-size", "12px")]},
+        ])
+        .hide(axis="index")
+        .set_properties(subset=["Turinys"], **{"white-space": "pre-line"})
+    )
+
+
+def build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos) -> str:
+    return f"""
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+    <meta charset="UTF-8">
+    <title>Rinkos ataskaita</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; margin-bottom: 25px; }}
+        th, td {{ border: 1px solid #ddd; padding: 6px; vertical-align: top; }}
+        a {{ color: #0645ad; }}
+    </style>
+</head>
+<body>
+    {styled_akcijos.to_html()}
+    <br><hr><br>
+    {styled_obligacijos.to_html()}
+    <br><hr><br>
+    {styled_first_north.to_html()}
+    <br><hr><br>
+    {styled_visos.to_html()}
+</body>
+</html>
+"""
+
+
+def generate_report(excel_file, filename: str, start_date: date = None, end_date: date = None, progress=None) -> dict:
+    """
+    Pagrindinė funkcija Streamlit aplikacijai.
+
+    excel_file gali būti:
+    - Streamlit UploadedFile objektas;
+    - failo kelias;
+    - file-like objektas.
+    """
+    if progress:
+        progress("Statistics: nuskaitomas Excel failas...")
+    df = pd.read_excel(excel_file, sheet_name="VLN")
+
+    file_start, file_end = extract_dates_from_filename(filename)
+    start_date = start_date or file_start
+    end_date = end_date or file_end
+    if start_date is None or end_date is None:
+        raise ValueError("Nepavyko nustatyti laikotarpio. Pasirinkite datas rankiniu būdu arba naudokite failo pavadinimą su YYYYMMDD_YYYYMMDD.")
+
+    caption = report_caption_from_filename(filename)
+    if caption == "Rinkos apžvalga":
+        caption = f"Rinkos apžvalga ({start_date} – {end_date})"
+
+    df_news = scrape_crib_dom_lt(start_date, end_date, progress=progress)
+    vz_map, vz_df = vz_scrape_full(start_date, end_date, df, progress=progress)
+    df_nasdaq = scrape_nasdaq_vilnius_news_with_full_text(start_date, end_date, progress=progress)
+
+    if progress:
+        progress("Formuojamos akcijų, obligacijų ir First North lentelės...")
+
+    df_akcijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Akcijos"])].copy()
+    df_obligacijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Obligacijos"])].copy()
+
+    df_akcijos = sujungti_naujienas_keli(df_akcijos, df_news)
+    df_obligacijos = sujungti_naujienas_keli(df_obligacijos, df_news)
+    df_obligacijos = df_obligacijos[df_obligacijos["Naujiena"] != ""]
+
+    df_akcijos["Verslo žinios"] = df_akcijos["Bendrovė"].map(vz_map).fillna("")
+    df_obligacijos["Verslo žinios"] = df_obligacijos["Bendrovė"].map(vz_map).fillna("")
+
+    df_akcijos["Įžvalgos"] = df_akcijos.apply(ivertink_izvalga, axis=1)
+    df_obligacijos["Įžvalgos"] = df_obligacijos.apply(ivertink_izvalga, axis=1)
+
+    df_first_north = df[df["Sąrašas/segmentas"].astype(str).str.contains("First North", case=False, na=False)].copy()
+    nasdaq_map = build_nasdaq_map_for_companies(df_first_north, df_nasdaq, max_items=5)
+    df_first_north["Nasdaq pranešimai"] = df_first_north["Bendrovė"].map(nasdaq_map).fillna("")
+    df_first_north = filter_traded_or_has_news(df_first_north)
+
+    df_visos = sudeti_visas_naujienas_distinct(df, df_news, vz_df, df_nasdaq)
+
+    styled_akcijos = render_lentele(df_akcijos, caption)
+    styled_obligacijos = render_lentele(df_obligacijos, "Baltijos skolos VP sąrašas (obligacijos)")
+    styled_first_north = render_first_north(
+        df_first_north,
+        f"First North (prekiauta arba yra pranešimų) – Nasdaq Vilnius (tik antraštės) ({start_date} – {end_date})",
+    )
+    styled_visos = render_visos_naujienos(
+        df_visos,
+        "Visos skirtingos naujienos (CRIB + VŽ + Nasdaq Baltic (Vilnius), pilnas tekstas)",
+    )
+
+    html = build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos)
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "df_raw": df,
+        "df_akcijos": df_akcijos,
+        "df_obligacijos": df_obligacijos,
+        "df_first_north": df_first_north,
+        "df_visos": df_visos,
+        "df_crib": df_news,
+        "df_vz": vz_df,
+        "df_nasdaq": df_nasdaq,
+        "styled_akcijos": styled_akcijos,
+        "styled_obligacijos": styled_obligacijos,
+        "styled_first_north": styled_first_north,
+        "styled_visos": styled_visos,
+        "html": html,
+    }
+
+
+def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_dir="downloads", progress=None):
+    """
+    Automatiškai atsisiunčia Nasdaq Baltic statistikos Excel failą iš:
+    https://nasdaqbaltic.com/statistics/lt/statistics
+
+    Grąžina:
+        (excel_file_like, filename)
+    """
+    from io import BytesIO
+    from pathlib import Path
+
+    def log(message):
+        if progress:
+            progress(message)
+
+    if start_date is None or end_date is None:
+        raise ValueError("Reikia nurodyti pradžios ir pabaigos datas.")
+    if start_date > end_date:
+        raise ValueError("Data 'Nuo' negali būti vėlesnė už datą 'Iki'.")
+
+    download_path = Path(download_dir).resolve()
+    download_path.mkdir(parents=True, exist_ok=True)
+
+    # Išvalome senus laikinus atsisiuntimus, kad tiksliai rastume naują failą.
+    for p in download_path.glob("*"):
+        try:
+            if p.is_file() and p.suffix.lower() in {".xlsx", ".xls", ".csv", ".crdownload", ".tmp"}:
+                p.unlink()
+        except Exception:
+            pass
+
+    log("Jungiamasi prie Nasdaq Baltic statistikos puslapio...")
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1600,1200")
+    options.add_experimental_option("prefs", {
+        "download.default_directory": str(download_path),
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+    })
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+    try:
+        # Chrome headless atsisiuntimų leidimas.
+        try:
+            driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": str(download_path),
+            })
+        except Exception:
+            pass
+
+        driver.get("https://nasdaqbaltic.com/statistics/lt/statistics")
+        WebDriverWait(driver, 40).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        time.sleep(2.5)
+
+        # Slapukai.
+        cookie_candidates = [
+            (By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"),
+            (By.ID, "onetrust-accept-btn-handler"),
+            (By.XPATH, "//button[contains(., 'Sutinku') or contains(., 'Leisti') or contains(., 'Priimti') or contains(., 'Accept') or contains(., 'Allow')]") ,
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]") ,
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]") ,
+        ]
+        for by, selector in cookie_candidates:
+            try:
+                btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, selector)))
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(0.5)
+                break
+            except Exception:
+                pass
+
+        start_txt = start_date.strftime("%Y-%m-%d")
+        end_txt = end_date.strftime("%Y-%m-%d")
+        log(f"Parenkamas laikotarpis: {start_txt} - {end_txt}")
+
+        def set_date_input(label_text, value):
+            xpaths = [
+                f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+                f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+                f"//input[contains(@placeholder, '{label_text}')]",
+                f"//input[contains(@aria-label, '{label_text}')]",
+            ]
+            for xp in xpaths:
+                try:
+                    inp = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, xp)))
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+                    driver.execute_script(
+                        """
+                        arguments[0].value = arguments[1];
+                        arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+                        arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+                        arguments[0].blur();
+                        """,
+                        inp,
+                        value,
+                    )
+                    time.sleep(0.4)
+                    return True
+                except Exception:
+                    pass
+            return False
+
+        if not set_date_input("Nuo", start_txt):
+            raise RuntimeError("Nepavyko nustatyti datos lauko 'Nuo'.")
+        if not set_date_input("Iki", end_txt):
+            raise RuntimeError("Nepavyko nustatyti datos lauko 'Iki'.")
+
+        # Pažymime Vilnius, jeigu toks filtras yra. Jei nėra - tęsiame.
+        for xp in [
+            "//label[contains(., 'Vilnius')]",
+            "//*[contains(., 'Vilnius') and (self::label or self::span or self::div)]",
+        ]:
+            try:
+                el = WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH, xp)))
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                driver.execute_script("arguments[0].click();", el)
+                time.sleep(0.3)
+                break
+            except Exception:
+                pass
+
+        # Paspaudžiame paiešką/pritaikymą, jeigu mygtukas yra.
+        for xp in [
+            "//button[contains(., 'Paieška')]",
+            "//button[contains(., 'Ieškoti')]",
+            "//button[contains(., 'Rodyti')]",
+            "//input[@type='submit' and (contains(@value, 'Paieška') or contains(@value, 'Ieškoti') or contains(@value, 'Rodyti'))]",
+            "//button[@type='submit']",
+        ]:
+            try:
+                btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(1.5)
+                break
+            except Exception:
+                pass
+
+        log("Spaudžiamas Excel atsisiuntimo mygtukas...")
+        before = {p.name for p in download_path.glob("*")}
+
+        download_xpaths = [
+            "//a[contains(., 'Excel')]",
+            "//button[contains(., 'Excel')]",
+            "//a[contains(., 'Atsisiųsti')]",
+            "//button[contains(., 'Atsisiųsti')]",
+            "//a[contains(., 'Download')]",
+            "//button[contains(., 'Download')]",
+            "//a[contains(@href, '.xlsx')]",
+            "//a[contains(@href, 'download')]",
+            "//a[contains(@href, 'export')]",
+            "//*[self::button or self::a][contains(@class, 'download') or contains(@class, 'export')]",
+            "//*[self::button or self::a][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'excel')]",
+        ]
+
+        clicked = False
+        for xp in download_xpaths:
+            try:
+                elements = driver.find_elements(By.XPATH, xp)
+                for el in elements:
+                    try:
+                        if not el.is_displayed():
+                            continue
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        time.sleep(0.2)
+                        try:
+                            el.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", el)
+                        clicked = True
+                        break
+                    except Exception:
+                        continue
+                if clicked:
+                    break
+            except Exception:
+                pass
+
+        if not clicked:
+            raise RuntimeError(
+                "Nepavyko rasti arba paspausti Nasdaq statistikos atsisiuntimo mygtuko. "
+                "Gali reikėti patikslinti selektorius pagal realų Nasdaq puslapio HTML."
+            )
+
+        # Laukiame, kol failas atsisiųs.
+        timeout_seconds = 90
+        started = time.time()
+        downloaded_file = None
+        while time.time() - started < timeout_seconds:
+            files = list(download_path.glob("*"))
+            partial = [p for p in files if p.suffix.lower() in {".crdownload", ".tmp"}]
+            complete = [
+                p for p in files
+                if p.is_file()
+                and p.name not in before
+                and p.suffix.lower() in {".xlsx", ".xls", ".csv"}
+                and p.stat().st_size > 0
+            ]
+            if complete and not partial:
+                downloaded_file = max(complete, key=lambda p: p.stat().st_mtime)
+                break
+            time.sleep(0.7)
+
+        if downloaded_file is None:
+            complete = [p for p in download_path.glob("*.xls*") if p.is_file() and p.stat().st_size > 0]
+            if complete:
+                downloaded_file = max(complete, key=lambda p: p.stat().st_mtime)
+
+        if downloaded_file is None:
+            raise TimeoutError("Nasdaq statistikos failas neatsisiuntė per nustatytą laiką.")
+
+        filename = downloaded_file.name
+        if not re.search(r"\d{8}_\d{8}", filename):
+            filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+
+        log(f"Failas atsisiųstas: {filename}")
+
+        with open(downloaded_file, "rb") as f:
+            content = f.read()
+
+        excel_file = BytesIO(content)
+        excel_file.name = filename
+        excel_file.seek(0)
+        return excel_file, filename
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
