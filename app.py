@@ -565,10 +565,10 @@ if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
 else:
     shown_filename = uploaded_file.name if uploaded_file is not None else "-"
 
-col1, col2, col3 = st.columns(3)
-col1.metric("📄 Failas", shown_filename)
-col2.metric("🗓️ Nuo", str(start_date or "-"))
-col3.metric("🗓️ Iki", str(end_date or "-"))
+col1, col2 = st.columns(2)
+
+col1.metric("🗓️ Nuo", str(start_date or "-"))
+col2.metric("🗓️ Iki", str(end_date or "-"))
 
 st.markdown("---")
 
