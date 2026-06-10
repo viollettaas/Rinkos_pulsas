@@ -6,3 +6,4 @@ webdriver-manager
 matplotlib
 numpy
 urllib3
+supabase
