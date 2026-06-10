@@ -720,12 +720,38 @@ def filter_traded_or_has_news(df_fn: pd.DataFrame) -> pd.DataFrame:
 
 def spalvinti_pokycio_abs_gradienta(col):
     col_num = pd.to_numeric(col, errors="coerce")
-    if col_num.notna().any():
-        norm = mcolors.Normalize(vmin=0, vmax=col_num.abs().max(skipna=True))
-        cmap = plt.get_cmap("OrRd")
-        return [f"background-color: {mcolors.to_hex(cmap(norm(abs(v))))}" if pd.notna(v) else "" for v in col_num]
-    return [""] * len(col)
+    max_abs = col_num.abs().max(skipna=True)
 
+    if pd.isna(max_abs) or max_abs == 0:
+        return [""] * len(col)
+
+    styles = []
+
+    for v in col_num:
+        if pd.isna(v):
+            styles.append("")
+            continue
+
+        intensity = min(abs(v) / max_abs, 1)
+
+        if v < 0:
+            if intensity > 0.66:
+                styles.append("background-color: #fde2e2; color: #8a1f1f; font-weight: 800")
+            elif intensity > 0.33:
+                styles.append("background-color: #fff0f0; color: #9b2c2c; font-weight: 700")
+            else:
+                styles.append("background-color: #fff7f7; color: #7a2e2e")
+        elif v > 0:
+            if intensity > 0.66:
+                styles.append("background-color: #dff3e8; color: #14532d; font-weight: 800")
+            elif intensity > 0.33:
+                styles.append("background-color: #edf8f1; color: #166534; font-weight: 700")
+            else:
+                styles.append("background-color: #f6fbf8; color: #166534")
+        else:
+            styles.append("background-color: #f8fafc; color: #334155")
+
+    return styles
 
 def spalvinti_izvalga(val):
     spalva = IZVALGU_SPALVOS.get(val, "")
