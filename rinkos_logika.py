@@ -1188,14 +1188,15 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df = pd.read_excel(excel_file, sheet_name="VLN")
 
     file_start, file_end = extract_dates_from_filename(filename)
+    # Jeigu datos paduotos iš Streamlit UI, visada naudojame jas.
+    # Failo pavadinimo datos naudojamos tik rankiniu režimu, kai UI datos nepaduotos.
     start_date = start_date or file_start
     end_date = end_date or file_end
     if start_date is None or end_date is None:
         raise ValueError("Nepavyko nustatyti laikotarpio. Pasirinkite datas rankiniu būdu arba naudokite failo pavadinimą su YYYYMMDD_YYYYMMDD.")
 
-    caption = report_caption_from_filename(filename)
-    if caption == "Rinkos apžvalga":
-        caption = f"Rinkos apžvalga ({start_date} – {end_date})"
+    # Antraštė formuojama pagal realiai pasirinktą laikotarpį, o ne pagal Nasdaq sugeneruotą failo pavadinimą.
+    caption = f"Rinkos apžvalga ({start_date} – {end_date})"
 
     df_news = scrape_crib_dom_lt(start_date, end_date, progress=progress)
     vz_map, vz_df = vz_scrape_full(start_date, end_date, df, progress=progress)
@@ -1261,11 +1262,16 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
     Automatiškai atsisiunčia Nasdaq Baltic statistikos Excel failą iš:
     https://nasdaqbaltic.com/statistics/lt/statistics
 
+    SVARBU: datos į Nasdaq puslapį įrašomos ne tik per JS value pakeitimą,
+    bet ir per realius Selenium veiksmus + input/change/blur event'us. Taip
+    React/Angular tipo formos tikrai perskaičiuoja filtrus prieš Excel eksportą.
+
     Grąžina:
         (excel_file_like, filename)
     """
     from io import BytesIO
     from pathlib import Path
+    from selenium.webdriver.common.keys import Keys
 
     def log(message):
         if progress:
@@ -1279,7 +1285,6 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
     download_path = Path(download_dir).resolve()
     download_path.mkdir(parents=True, exist_ok=True)
 
-    # Išvalome senus laikinus atsisiuntimus, kad tiksliai rastume naują failą.
     for p in download_path.glob("*"):
         try:
             if p.is_file() and p.suffix.lower() in {".xlsx", ".xls", ".csv", ".crdownload", ".tmp"}:
@@ -1305,8 +1310,212 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
+    def js_find_date_input(label_text):
+        """Randa input pagal etiketę ir paprastame DOM, ir shadow DOM."""
+        return driver.execute_script(
+            r"""
+            const labelText = String(arguments[0] || '').toLowerCase();
+
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+            }
+
+            function textOf(el) {
+                return ((el && (el.innerText || el.textContent)) || '').trim().toLowerCase();
+            }
+
+            function allRoots() {
+                const roots = [document];
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    if (el.shadowRoot) roots.push(el.shadowRoot);
+                }
+                return roots;
+            }
+
+            for (const root of allRoots()) {
+                const inputs = Array.from(root.querySelectorAll('input'))
+                    .filter(i => visible(i) && !i.disabled && i.type !== 'hidden');
+
+                for (const inp of inputs) {
+                    const aria = (inp.getAttribute('aria-label') || '').toLowerCase();
+                    const placeholder = (inp.getAttribute('placeholder') || '').toLowerCase();
+                    const name = (inp.getAttribute('name') || '').toLowerCase();
+                    const id = (inp.getAttribute('id') || '').toLowerCase();
+                    if (aria.includes(labelText) || placeholder.includes(labelText) || name.includes(labelText) || id.includes(labelText)) {
+                        return inp;
+                    }
+                }
+
+                const labels = Array.from(root.querySelectorAll('label, span, div, p'))
+                    .filter(el => visible(el) && textOf(el).includes(labelText));
+                for (const lab of labels) {
+                    let cur = lab;
+                    for (let k = 0; k < 6 && cur; k++, cur = cur.parentElement) {
+                        const nearby = Array.from(cur.querySelectorAll('input'))
+                            .filter(i => visible(i) && !i.disabled && i.type !== 'hidden');
+                        if (nearby.length) return nearby[0];
+                    }
+                }
+            }
+            return null;
+            """,
+            label_text,
+        )
+
+    def set_react_input_value(inp, value):
+        """Patikimai pakeičia input reikšmę React/Angular formoms."""
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+        time.sleep(0.2)
+
+        # 1) Realus Selenium įvedimas.
+        try:
+            inp.click()
+            time.sleep(0.1)
+            inp.send_keys(Keys.CONTROL, "a")
+            inp.send_keys(Keys.BACKSPACE)
+            inp.send_keys(value)
+            inp.send_keys(Keys.TAB)
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+        # 2) Native setter + visi svarbūs event'ai.
+        driver.execute_script(
+            r"""
+            const el = arguments[0];
+            const val = arguments[1];
+            const proto = Object.getPrototypeOf(el);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (desc && desc.set) {
+                desc.set.call(el, val);
+            } else {
+                el.value = val;
+            }
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'Enter'}));
+            el.blur();
+            """,
+            inp,
+            value,
+        )
+        time.sleep(0.5)
+
+    def get_input_value(inp):
+        try:
+            return (inp.get_attribute("value") or "").strip()
+        except Exception:
+            return ""
+
+    def normalize_date_value(v):
+        v = (v or "").strip().replace("/", "-").replace(".", "-")
+        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", v)
+        if not m:
+            return v
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+
+    def set_date_input(label_text, value):
+        inp = js_find_date_input(label_text)
+        if inp is None:
+            # Atsarginiai XPath'ai paprastam DOM.
+            xpaths = [
+                f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+                f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+                f"//input[contains(@placeholder, '{label_text}')]",
+                f"//input[contains(@aria-label, '{label_text}')]",
+            ]
+            for xp in xpaths:
+                try:
+                    inp = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, xp)))
+                    break
+                except Exception:
+                    inp = None
+
+        if inp is None:
+            return False, ""
+
+        set_react_input_value(inp, value)
+        actual = normalize_date_value(get_input_value(inp))
+        ok = actual == value
+
+        # Kartais komponentas pirmą kartą perrašo reikšmę - bandome antrą kartą.
+        if not ok:
+            set_react_input_value(inp, value)
+            actual = normalize_date_value(get_input_value(inp))
+            ok = actual == value
+
+        return ok, actual
+
+    def click_button_by_text(texts, timeout=8):
+        lowered = [t.lower() for t in texts]
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            try:
+                clicked = driver.execute_script(
+                    r"""
+                    const wanted = arguments[0];
+                    function visible(el) {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                    }
+                    function roots() {
+                        const out = [document];
+                        for (const el of document.querySelectorAll('*')) {
+                            if (el.shadowRoot) out.push(el.shadowRoot);
+                        }
+                        return out;
+                    }
+                    for (const root of roots()) {
+                        const els = Array.from(root.querySelectorAll('button, a, input[type="submit"]'));
+                        for (const el of els) {
+                            if (!visible(el) || el.disabled || el.getAttribute('disabled') !== null) continue;
+                            const txt = ((el.innerText || el.textContent || el.value || '') + ' ' +
+                                         (el.getAttribute('aria-label') || '') + ' ' +
+                                         (el.getAttribute('title') || '') + ' ' +
+                                         (el.getAttribute('class') || '')).toLowerCase();
+                            if (wanted.some(w => txt.includes(w))) {
+                                el.scrollIntoView({block:'center'});
+                                try { el.click(); } catch(e) { el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true})); }
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                    """,
+                    lowered,
+                )
+                if clicked:
+                    time.sleep(1.2)
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.4)
+        return False
+
+    def visible_table_signature():
+        try:
+            return driver.execute_script(
+                r"""
+                const tables = Array.from(document.querySelectorAll('table'));
+                let best = '';
+                for (const t of tables) {
+                    const txt = (t.innerText || t.textContent || '').trim();
+                    if (txt.length > best.length) best = txt;
+                }
+                return best.slice(0, 2000);
+                """
+            ) or ""
+        except Exception:
+            return ""
+
     try:
-        # Chrome headless atsisiuntimų leidimas.
         try:
             driver.execute_cdp_cmd("Page.setDownloadBehavior", {
                 "behavior": "allow",
@@ -1317,17 +1526,15 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
 
         driver.get("https://nasdaqbaltic.com/statistics/lt/statistics")
         WebDriverWait(driver, 40).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        time.sleep(2.5)
+        time.sleep(3)
 
-        # Slapukai.
-        cookie_candidates = [
+        for by, selector in [
             (By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"),
             (By.ID, "onetrust-accept-btn-handler"),
             (By.XPATH, "//button[contains(., 'Sutinku') or contains(., 'Leisti') or contains(., 'Priimti') or contains(., 'Accept') or contains(., 'Allow')]") ,
             (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]") ,
             (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]") ,
-        ]
-        for by, selector in cookie_candidates:
+        ]:
             try:
                 btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, selector)))
                 driver.execute_script("arguments[0].click();", btn)
@@ -1338,110 +1545,77 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
 
         start_txt = start_date.strftime("%Y-%m-%d")
         end_txt = end_date.strftime("%Y-%m-%d")
-        log(f"Parenkamas laikotarpis: {start_txt} - {end_txt}")
+        log(f"Parenkamas Nasdaq statistikos laikotarpis: {start_txt} - {end_txt}")
 
-        def set_date_input(label_text, value):
-            xpaths = [
-                f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
-                f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
-                f"//input[contains(@placeholder, '{label_text}')]",
-                f"//input[contains(@aria-label, '{label_text}')]",
-            ]
-            for xp in xpaths:
-                try:
-                    inp = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, xp)))
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-                    driver.execute_script(
-                        """
-                        arguments[0].value = arguments[1];
-                        arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
-                        arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
-                        arguments[0].blur();
-                        """,
-                        inp,
-                        value,
-                    )
-                    time.sleep(0.4)
-                    return True
-                except Exception:
-                    pass
-            return False
+        ok_from, actual_from = set_date_input("Nuo", start_txt)
+        ok_to, actual_to = set_date_input("Iki", end_txt)
 
-        if not set_date_input("Nuo", start_txt):
-            raise RuntimeError("Nepavyko nustatyti datos lauko 'Nuo'.")
-        if not set_date_input("Iki", end_txt):
-            raise RuntimeError("Nepavyko nustatyti datos lauko 'Iki'.")
+        if not ok_from:
+            raise RuntimeError(f"Nepavyko patikimai nustatyti datos lauko 'Nuo'. Lauke liko: {actual_from!r}, reikėjo: {start_txt!r}.")
+        if not ok_to:
+            raise RuntimeError(f"Nepavyko patikimai nustatyti datos lauko 'Iki'. Lauke liko: {actual_to!r}, reikėjo: {end_txt!r}.")
 
-        # Pažymime Vilnius, jeigu toks filtras yra. Jei nėra - tęsiame.
-        for xp in [
-            "//label[contains(., 'Vilnius')]",
-            "//*[contains(., 'Vilnius') and (self::label or self::span or self::div)]",
-        ]:
+        log(f"Nasdaq formoje patvirtintos datos: Nuo {actual_from}, Iki {actual_to}")
+
+        # Pažymime Vilnius, jeigu toks filtras yra.
+        try:
+            driver.execute_script(
+                r"""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                }
+                const els = Array.from(document.querySelectorAll('label, span, div, input'));
+                for (const el of els) {
+                    const txt = ((el.innerText || el.textContent || el.value || '') + ' ' +
+                                (el.getAttribute('aria-label') || '') + ' ' +
+                                (el.getAttribute('name') || '')).toLowerCase();
+                    if (visible(el) && txt.includes('vilnius')) {
+                        el.scrollIntoView({block:'center'});
+                        try { el.click(); } catch(e) { el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true})); }
+                        break;
+                    }
+                }
+                """
+            )
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        old_sig = visible_table_signature()
+        clicked_search = click_button_by_text(["paieška", "ieškoti", "rodyti", "search", "show", "apply"], timeout=8)
+        if clicked_search:
+            # Laukiame, kol lentelė / rezultatai persikraus. Jei tekstas nepasikeičia, vis tiek duodame AJAX laiko.
             try:
-                el = WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH, xp)))
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                driver.execute_script("arguments[0].click();", el)
-                time.sleep(0.3)
-                break
+                WebDriverWait(driver, 20).until(lambda d: visible_table_signature() != old_sig or len(visible_table_signature()) > 0)
             except Exception:
                 pass
+            time.sleep(2.5)
+        else:
+            # Kai kuriuose puslapio variantuose filtrai pritaikomi automatiškai.
+            time.sleep(2.5)
 
-        # Paspaudžiame paiešką/pritaikymą, jeigu mygtukas yra.
-        for xp in [
-            "//button[contains(., 'Paieška')]",
-            "//button[contains(., 'Ieškoti')]",
-            "//button[contains(., 'Rodyti')]",
-            "//input[@type='submit' and (contains(@value, 'Paieška') or contains(@value, 'Ieškoti') or contains(@value, 'Rodyti'))]",
-            "//button[@type='submit']",
-        ]:
+        # Dar kartą patikriname, kad prieš eksportą formoje liko pasirinktos datos.
+        ok_from, actual_from = set_date_input("Nuo", start_txt)
+        ok_to, actual_to = set_date_input("Iki", end_txt)
+        if not (ok_from and ok_to):
+            raise RuntimeError(f"Prieš eksportą datos nesutapo: Nuo={actual_from!r}, Iki={actual_to!r}.")
+
+        old_sig = visible_table_signature()
+        clicked_search = click_button_by_text(["paieška", "ieškoti", "rodyti", "search", "show", "apply"], timeout=5)
+        if clicked_search:
             try:
-                btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xp)))
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(1.5)
-                break
+                WebDriverWait(driver, 20).until(lambda d: visible_table_signature() != old_sig or len(visible_table_signature()) > 0)
             except Exception:
                 pass
+            time.sleep(2.0)
 
         log("Spaudžiamas Excel atsisiuntimo mygtukas...")
         before = {p.name for p in download_path.glob("*")}
 
-        download_xpaths = [
-            "//a[contains(., 'Excel')]",
-            "//button[contains(., 'Excel')]",
-            "//a[contains(., 'Atsisiųsti')]",
-            "//button[contains(., 'Atsisiųsti')]",
-            "//a[contains(., 'Download')]",
-            "//button[contains(., 'Download')]",
-            "//a[contains(@href, '.xlsx')]",
-            "//a[contains(@href, 'download')]",
-            "//a[contains(@href, 'export')]",
-            "//*[self::button or self::a][contains(@class, 'download') or contains(@class, 'export')]",
-            "//*[self::button or self::a][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'excel')]",
-        ]
-
-        clicked = False
-        for xp in download_xpaths:
-            try:
-                elements = driver.find_elements(By.XPATH, xp)
-                for el in elements:
-                    try:
-                        if not el.is_displayed():
-                            continue
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                        time.sleep(0.2)
-                        try:
-                            el.click()
-                        except Exception:
-                            driver.execute_script("arguments[0].click();", el)
-                        clicked = True
-                        break
-                    except Exception:
-                        continue
-                if clicked:
-                    break
-            except Exception:
-                pass
+        clicked = click_button_by_text(["excel", "atsisiųsti", "download", "export"], timeout=12)
 
         if not clicked:
             raise RuntimeError(
@@ -1449,7 +1623,6 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
                 "Gali reikėti patikslinti selektorius pagal realų Nasdaq puslapio HTML."
             )
 
-        # Laukiame, kol failas atsisiųs.
         timeout_seconds = 90
         started = time.time()
         downloaded_file = None
@@ -1476,11 +1649,10 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
         if downloaded_file is None:
             raise TimeoutError("Nasdaq statistikos failas neatsisiuntė per nustatytą laiką.")
 
-        filename = downloaded_file.name
-        if not re.search(r"\d{8}_\d{8}", filename):
-            filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        # Failo pavadinimą priskiriame pagal vartotojo pasirinktą periodą, ne pagal Nasdaq default vardą.
+        filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
 
-        log(f"Failas atsisiųstas: {filename}")
+        log(f"Failas atsisiųstas pagal pasirinktą periodą: {filename}")
 
         with open(downloaded_file, "rb") as f:
             content = f.read()
