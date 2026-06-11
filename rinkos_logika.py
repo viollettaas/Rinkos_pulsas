@@ -30,12 +30,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+
 
 NASDAQ_NEWS_URL = "https://nasdaqbaltic.com/statistics/lt/news"
 
-KODO_VERSIJA = "2026-06-11_nasdaq_dates_no_stale_v3"
+KODO_VERSIJA = "2026-06-11_nasdaq_ssl_safe_v5"
 
 SEGMENTAI = {
     "Akcijos": ["Baltijos Papildomasis sąrašas", "Baltijos Oficialusis sąrašas"],
@@ -1259,6 +1260,28 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     }
 
 
+
+def normalize_date_value(value: str) -> str:
+    """Normalizuoja datos laukų reikšmes į YYYY-MM-DD, jei įmanoma."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    m = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", value)
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    m = re.search(r"(\d{1,2})[-./](\d{1,2})[-./](\d{4})", value)
+    if m:
+        d, mo, y = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    try:
+        dt = pd.to_datetime(value, errors="coerce")
+        if pd.notna(dt):
+            return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return value
+
 def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_dir="downloads", progress=None):
     """
     Automatiškai atsisiunčia Nasdaq Baltic statistikos Excel failą iš:
@@ -1302,6 +1325,12 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1600,1200")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors=yes")
+    options.add_argument("--allow-insecure-localhost")
+    options.add_argument("--test-type")
+    options.add_argument("--disable-web-security")
+    options.set_capability("acceptInsecureCerts", True)
     options.add_experimental_option("prefs", {
         "download.default_directory": str(download_path),
         "download.prompt_for_download": False,
@@ -1510,9 +1539,44 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
         except Exception:
             pass
 
-        driver.get("https://nasdaqbaltic.com/statistics/lt/statistics")
-        WebDriverWait(driver, 40).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        time.sleep(3)
+        def safe_get_nasdaq_statistics_page():
+            urls = [
+                "https://nasdaqbaltic.com/statistics/lt/statistics",
+                "https://www.nasdaqbaltic.com/statistics/lt/statistics",
+                "http://nasdaqbaltic.com/statistics/lt/statistics",
+                "http://www.nasdaqbaltic.com/statistics/lt/statistics",
+            ]
+            last_error = None
+            for url in urls:
+                for attempt in range(2):
+                    try:
+                        log(f"Bandoma atidaryti Nasdaq statistics puslapį: {url}")
+                        driver.get(url)
+                        WebDriverWait(driver, 40).until(
+                            lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"}
+                        )
+                        time.sleep(3)
+                        body_text = (driver.find_element(By.TAG_NAME, "body").text or "").strip()
+                        current = driver.current_url or ""
+                        if body_text or "nasdaqbaltic" in current.lower():
+                            return url
+                    except WebDriverException as e:
+                        last_error = e
+                        msg = str(e)
+                        if "ERR_SSL" in msg or "SSL" in msg or "CERT" in msg:
+                            time.sleep(2)
+                            continue
+                        time.sleep(1)
+                    except Exception as e:
+                        last_error = e
+                        time.sleep(1)
+            raise RuntimeError(
+                "Nepavyko atidaryti Nasdaq Baltic statistics puslapio dėl naršyklės / SSL / tinklo klaidos. "
+                "Patikrinkite, ar serverio aplinkoje leidžiamas prisijungimas prie nasdaqbaltic.com. "
+                f"Paskutinė klaida: {last_error}"
+            )
+
+        safe_get_nasdaq_statistics_page()
 
         for by, selector in [
             (By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"),
