@@ -561,7 +561,7 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
     border-top: 1px solid rgba(157,190,230,0.20);
 }
 .datasource-block {
-    margin-top: 14px;
+    margin-top: 16px;
 }
 section[data-testid="stSidebar"] .stRadio {
     margin-bottom: 8px !important;
@@ -823,6 +823,16 @@ if report_mode == "Emitentų atranka":
     st.stop()
 
 with st.sidebar:
+    # ------------------------------------------------------------
+    # PAGEIDAUJAMA TVARKA SIDEBAR'E:
+    # 1) datos
+    # 2) generavimo mygtukas
+    # 3) duomenų šaltinis
+    # ------------------------------------------------------------
+    st.markdown('<div class="sidebar-section-title">🗓️ Laikotarpis</div>', unsafe_allow_html=True)
+    start_date = st.date_input("Nuo", value=date.today(), key="rinkos_start_date")
+    end_date = st.date_input("Iki", value=date.today(), key="rinkos_end_date")
+
     run_btn = st.button(
         "🚀 Generuoti ataskaitą",
         type="primary",
@@ -843,8 +853,8 @@ with st.sidebar:
         "Pasirinkite duomenų gavimo būdą",
         ["Atsisiųsti iš Nasdaq Baltic", "Įkelti Excel rankiniu būdu"],
         label_visibility="collapsed",
+        key="rinkos_duomenu_saltinis",
     )
-
 
     uploaded_file = None
     filename = None
@@ -852,19 +862,15 @@ with st.sidebar:
     if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
         st.markdown('<div class="sidebar-section-title">📥 Nasdaq Baltic atsisiuntimas</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-section-subtitle">Pasirinkite laikotarpį. Programa pati atsisiųs Excel failą iš Nasdaq Baltic.</div>',
+            '<div class="sidebar-section-subtitle">Bus atsisiųstas Nasdaq statistikos Excel failas pagal aukščiau pasirinktą laikotarpį.</div>',
             unsafe_allow_html=True,
         )
-
-        start_date = st.date_input("Nuo", value=date.today())
-        end_date = st.date_input("Iki", value=date.today())
-
         st.markdown('<div class="status-ok">✅ Automatinis atsisiuntimas įjungtas</div>', unsafe_allow_html=True)
 
     else:
         st.markdown('<div class="sidebar-section-title">📄 Statistikos Excel failas</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-section-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx)</div>',
+            '<div class="sidebar-section-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx). Ataskaitos laikotarpis bus imamas iš aukščiau pasirinktų datų.</div>',
             unsafe_allow_html=True,
         )
 
@@ -903,7 +909,7 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
 
-            if st.button("🔄 Pakeisti failą", use_container_width=True):
+            if st.button("🔄 Pakeisti failą", use_container_width=True, key="change_statistics_file_btn"):
                 st.session_state.uploader_key += 1
                 st.session_state.uploaded_file_cache = None
                 st.session_state.report_result = None
@@ -914,20 +920,6 @@ with st.sidebar:
             st.markdown('<div class="status-empty">🛡️ Failas neįkeltas</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="status-ok">✅ Failas įkeltas</div>', unsafe_allow_html=True)
-
-
-        naudoti_rankines_datas = st.checkbox(
-            "Datas įvesti rankiniu būdu",
-            value=False,
-        )
-
-        if uploaded_file is not None and not naudoti_rankines_datas:
-            file_start, file_end = extract_dates_from_filename(uploaded_file.name)
-            start_date = file_start
-            end_date = file_end
-        else:
-            start_date = st.date_input("Nuo", value=date.today())
-            end_date = st.date_input("Iki", value=date.today())
 
 
 result = st.session_state.report_result
