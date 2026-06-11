@@ -42,7 +42,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 
-from supabase_cache import save_news_df, log_scrape
+from supabase_cache import save_news_df, load_news_df, log_scrape
 
 
 NEXT_BUTTON_HOST_ID = "pagination"
@@ -406,24 +406,80 @@ def wait_for_page_change(driver, old_signature, timeout=12):
     return False
 
 
-def update_crib_news(max_pages: int = 20, stop_empty_pages: int = 3, headless: bool = True, progress=None):
-    """
-    Atnaujina CRIB naujienu baze.
+def _make_existing_key_from_db_row(row) -> str:
+    url = str(row.get("url", "") or row.get("Nuoroda", "") or "").strip().lower()
+    if url:
+        return "url|" + url
 
-    Args:
-        max_pages: maksimalus puslapiu skaicius, kuri galima patikrinti.
-        stop_empty_pages: kiek puslapiu is eiles be nauju irasu leidziama iki stop.
-        headless: ar paleisti Chrome headless rezimu.
-        progress: optional callable(message).
+    title = str(row.get("title", "") or row.get("Pilna_antraštė", "") or "").strip().lower()
+    published = str(row.get("published_at", "") or row.get("Published_dt", "") or "").strip()
+    try:
+        published = pd.to_datetime(published, errors="coerce").strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    company = str(row.get("company", "") or row.get("Bendrovė", "") or "").strip().lower()
+    return f"fallback|{company}|{title}|{published}"
+
+
+def _make_existing_key_from_crib_row(row) -> str:
+    url = str(row.get("Nuoroda", "") or "").strip().lower()
+    if url:
+        return "url|" + url
+
+    title = str(row.get("Pilna_antraštė", "") or "").strip().lower()
+    published = row.get("Published_dt")
+    try:
+        published = pd.to_datetime(published, errors="coerce").strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        published = str(published or "").strip()
+    company = str(row.get("Bendrovė", "") or "").strip().lower()
+    return f"fallback|{company}|{title}|{published}"
+
+
+def load_existing_crib_keys(start_lookup: date = date(2023, 1, 1)) -> set:
+    """
+    Užkrauna jau DB esančių CRIB pranešimų raktus.
+    Naudojama tam, kad atnaujinimo metu nereikėtų eiti per kelis tuščius puslapius:
+    - jei pirmas puslapis visas jau DB, sustojame po pirmo puslapio;
+    - jei randame naujų įrašų, einame tik iki pirmo jau DB esančio pranešimo.
+    """
+    try:
+        df_existing = load_news_df("crib", start_lookup, date.today())
+    except Exception:
+        return set()
+
+    if df_existing is None or df_existing.empty:
+        return set()
+
+    return {
+        _make_existing_key_from_db_row(row)
+        for _, row in df_existing.iterrows()
+        if _make_existing_key_from_db_row(row)
+    }
+
+
+def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None):
+    """
+    Atnaujina CRIB naujienų bazę.
+
+    Logika:
+    - pirmiausia paima jau DB esančių CRIB pranešimų raktus;
+    - patikrina pirmą CRIB puslapį;
+    - jei pirmame puslapyje nėra naujų pranešimų, sustoja po pirmo puslapio;
+    - jei naujų yra, įrašo juos ir eina toliau tik iki pirmo jau DB esančio pranešimo;
+    - detalius puslapius atidaro tik naujiems pranešimams, todėl atnaujinimas yra greitesnis.
 
     Returns:
-        dict su pages_processed, records_found, records_inserted.
+        dict su pages_processed, records_found, records_inserted, new_candidates.
     """
+    existing_keys = load_existing_crib_keys()
+
     driver = init_driver(headless=headless)
     total_found = 0
     total_inserted = 0
-    empty_pages = 0
+    total_new_candidates = 0
     page = 1
+    reached_existing = False
 
     try:
         _notify(progress, "Atidaromas CRIB...")
@@ -450,8 +506,24 @@ def update_crib_news(max_pages: int = 20, stop_empty_pages: int = 3, headless: b
             newest_on_page = max(page_dates) if page_dates else date.today()
             oldest_on_page = min(page_dates) if page_dates else date.today()
 
+            new_rows = []
+            for r in rows_basic:
+                key = _make_existing_key_from_crib_row(r)
+
+                if existing_keys and key in existing_keys:
+                    reached_existing = True
+                    break
+
+                new_rows.append(r)
+
+            # Jei pirmame puslapyje nieko naujo nerasta, daugiau puslapių netikriname.
+            if page == 1 and not new_rows:
+                _notify(progress, "Naujų CRIB pranešimų pirmame puslapyje nerasta.")
+                total_found += len(rows_basic)
+                break
+
             records = []
-            for idx, r in enumerate(rows_basic, start=1):
+            for idx, r in enumerate(new_rows, start=1):
                 url = str(r.get("Nuoroda") or "").strip()
                 title = str(r.get("Pilna_antraštė") or "").strip()
                 full_title, full_text = "", ""
@@ -480,15 +552,16 @@ def update_crib_news(max_pages: int = 20, stop_empty_pages: int = 3, headless: b
                 except Exception:
                     pass
 
-            total_found += found
+                # Kad šiame pačiame paleidime dublikatų neapdorotume antrą kartą.
+                for _, row in df_page.iterrows():
+                    existing_keys.add(_make_existing_key_from_crib_row(row))
+
+            total_found += len(rows_basic)
+            total_new_candidates += found
             total_inserted += inserted
 
-            if inserted == 0:
-                empty_pages += 1
-            else:
-                empty_pages = 0
-
-            if empty_pages >= stop_empty_pages:
+            # Jei šiame puslapyje jau pasiekėme pirmą DB esantį pranešimą, toliau neiname.
+            if reached_existing:
                 break
 
             old_sig = first_row_signature(driver)
@@ -507,6 +580,7 @@ def update_crib_news(max_pages: int = 20, stop_empty_pages: int = 3, headless: b
             "pages_processed": page,
             "records_found": total_found,
             "records_inserted": total_inserted,
+            "new_candidates": total_new_candidates,
         }
 
     except Exception as e:
