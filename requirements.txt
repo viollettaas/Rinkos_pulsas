@@ -7,3 +7,4 @@ matplotlib
 numpy
 urllib3
 supabase
+bs4 
