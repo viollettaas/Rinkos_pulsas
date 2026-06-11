@@ -14,10 +14,12 @@ import time
 import hashlib
 import warnings
 from difflib import SequenceMatcher
-from datetime import datetime, date
-
-import urllib3
+from datetime import datetime, date, timedelta
+from io import BytesIO
+from supabase_cache import save_news_df, load_news_df, log_scrape, _supabase_headers, _supabase_rest_url, _http_client
 import requests
+import httpx
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.styles.stylesheet")
 
@@ -720,40 +722,81 @@ def filter_traded_or_has_news(df_fn: pd.DataFrame) -> pd.DataFrame:
 
 
 def spalvinti_pokycio_abs_gradienta(col):
-    col_num = pd.to_numeric(col, errors="coerce")
-    max_abs = col_num.abs().max(skipna=True)
+    """
+    Pok.% stulpelio spalvinimas tik labiausiai išsiskiriančioms reikšmėms.
 
-    if pd.isna(max_abs) or max_abs == 0:
-        return [""] * len(col)
+    Logika:
+    - vidurinės reikšmės tarp Q25 ir Q75 neakcentuojamos;
+    - didesni teigiami pokyčiai spalvinami švelniu žaliu gradientu;
+    - didesni neigiami pokyčiai spalvinami švelniu raudonu gradientu;
+    - gradientas skaičiuojamas pagal konkrečioje lentelėje esančias reikšmes.
+    """
+    s = pd.Series(col).astype(str)
+    s = (
+        s.str.replace("−", "-", regex=False)   # unicode minus
+         .str.replace("–", "-", regex=False)
+         .str.replace("%", "", regex=False)
+         .str.replace(",", ".", regex=False)
+         .str.strip()
+    )
+    col_num = pd.to_numeric(s, errors="coerce")
+    valid = col_num.dropna()
+
+    if valid.empty:
+        return [""] * len(col_num)
+
+    q25 = valid.quantile(0.25)
+    q75 = valid.quantile(0.75)
+    min_val = valid.min()
+    max_val = valid.max()
+
+    def _interp_hex(start_hex, end_hex, intensity):
+        intensity = max(0, min(float(intensity), 1))
+        start_rgb = mcolors.to_rgb(start_hex)
+        end_rgb = mcolors.to_rgb(end_hex)
+        rgb = tuple(
+            start_rgb[i] + (end_rgb[i] - start_rgb[i]) * intensity
+            for i in range(3)
+        )
+        return mcolors.to_hex(rgb)
 
     styles = []
+    eps = 1e-9
 
     for v in col_num:
         if pd.isna(v):
             styles.append("")
             continue
 
-        intensity = min(abs(v) / max_abs, 1)
+        # Vidurinės reikšmės neakcentuojamos.
+        if q25 < v < q75:
+            styles.append("")
+            continue
 
-        if v < 0:
-            if intensity > 0.66:
-                styles.append("background-color: #fde2e2; color: #8a1f1f; font-weight: 800")
-            elif intensity > 0.33:
-                styles.append("background-color: #fff0f0; color: #9b2c2c; font-weight: 700")
-            else:
-                styles.append("background-color: #fff7f7; color: #7a2e2e")
-        elif v > 0:
-            if intensity > 0.66:
-                styles.append("background-color: #dff3e8; color: #14532d; font-weight: 800")
-            elif intensity > 0.33:
-                styles.append("background-color: #edf8f1; color: #166534; font-weight: 700")
-            else:
-                styles.append("background-color: #f6fbf8; color: #166534")
+        if v > 0 and max_val > q75:
+            raw = (v - q75) / max(max_val - q75, eps)
+            intensity = min(max(raw, 0), 1)
+            bg = _interp_hex("#f4fbf4", "#9bd29b", intensity)
+            color = "#12351d"
+
+        elif v < 0 and min_val < q25:
+            raw = (q25 - v) / max(q25 - min_val, eps)
+            intensity = min(max(raw, 0), 1)
+            bg = _interp_hex("#fbf4f4", "#e09a9a", intensity)
+            color = "#4a1111"
+
         else:
-            styles.append("background-color: #f8fafc; color: #334155")
+            styles.append("")
+            continue
+
+        font_weight = 500 + int(intensity * 250)
+        styles.append(
+            f"background-color: {bg} !important; "
+            f"color: {color} !important; "
+            f"font-weight: {font_weight} !important;"
+        )
 
     return styles
-
 def spalvinti_izvalga(val):
     spalva = IZVALGU_SPALVOS.get(val, "")
     return f"background-color: {spalva}; font-weight: bold" if spalva else ""
@@ -762,7 +805,7 @@ def spalvinti_izvalga(val):
 def render_lentele(df_: pd.DataFrame, caption: str):
     df_ = df_.copy()
     if "Pok.%" in df_.columns:
-        df_ = df_.sort_values(by="Pok.%", key=lambda x: x.abs(), ascending=False)
+        df_ = df_.sort_values(by="Pok.%", key=lambda x: pd.to_numeric(x, errors="coerce").abs(), ascending=False)
     cols = [
         "Trumpinys", "Bendrovė", "Atid.", "Paskutinė kaina", "Pok.%", "Apyvarta", "Kiekis",
         "Sand.", "Kategorija", "Naujiena", "Verslo žinios", "Įžvalgos",
@@ -771,7 +814,9 @@ def render_lentele(df_: pd.DataFrame, caption: str):
         if c not in df_.columns:
             df_[c] = ""
     df_ = df_[cols].copy()
-    df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce").apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+    # Paliekame Pok.% kaip skaitinį stulpelį, kad Styler.apply galėtų patikimai spalvinti.
+    # Rodymo formatavimas daromas žemiau per .format({"Pok.%": "{:.2f}"}).
+    df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce")
 
     return (
         df_.style
@@ -780,10 +825,10 @@ def render_lentele(df_: pd.DataFrame, caption: str):
             {"selector": "caption", "props": [("caption-side", "top"), ("font-weight", "bold"), ("font-size", "14px"), ("color", "#333"), ("padding", "8px")]},
             {"selector": "th", "props": [("background-color", "#f2f2f2"), ("font-weight", "bold"), ("text-align", "center")]},
             {"selector": "td", "props": [("text-align", "left"), ("font-size", "12px")]},
-            {"selector": "tr:nth-child(even)", "props": [("background-color", "#fafafa")]},
-            {"selector": "tr:nth-child(odd)", "props": [("background-color", "#ffffff")]},
+            {"selector": "tbody tr:nth-child(even) td", "props": [("background-color", "#fafafa")]},
+            {"selector": "tbody tr:nth-child(odd) td", "props": [("background-color", "#ffffff")]},
         ])
-        .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
+        .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Pok.%": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
         .apply(spalvinti_pokycio_abs_gradienta, subset=["Pok.%"])
         .map(spalvinti_izvalga, subset=["Įžvalgos"])
         .hide(axis="index")
@@ -794,16 +839,18 @@ def render_lentele(df_: pd.DataFrame, caption: str):
 def render_first_north(df_: pd.DataFrame, caption: str):
     df_ = df_.copy()
     if "Pok.%" in df_.columns:
-        df_ = df_.sort_values(by="Pok.%", key=lambda x: x.abs(), ascending=False)
+        df_ = df_.sort_values(by="Pok.%", key=lambda x: pd.to_numeric(x, errors="coerce").abs(), ascending=False)
     cols = [
         "Trumpinys", "Bendrovė", "Atid.", "Paskutinė kaina", "Pok.%", "Apyvarta", "Kiekis",
-        "Sand.", "Sąrašas/segmentas", "Nasdaq pranešimai",
+        "Sand.", "Sąrašas/segmentas", "Naujiena", "Verslo žinios",
     ]
     for c in cols:
         if c not in df_.columns:
             df_[c] = ""
     df_ = df_[cols].copy()
-    df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce").apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+    # Paliekame Pok.% kaip skaitinį stulpelį, kad Styler.apply galėtų patikimai spalvinti.
+    # Rodymo formatavimas daromas žemiau per .format({"Pok.%": "{:.2f}"}).
+    df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce")
 
     return (
         df_.style
@@ -812,13 +859,13 @@ def render_first_north(df_: pd.DataFrame, caption: str):
             {"selector": "caption", "props": [("caption-side", "top"), ("font-weight", "bold"), ("font-size", "14px"), ("color", "#333"), ("padding", "8px")]},
             {"selector": "th", "props": [("background-color", "#f2f2f2"), ("font-weight", "bold"), ("text-align", "center")]},
             {"selector": "td", "props": [("text-align", "left"), ("font-size", "12px")]},
-            {"selector": "tr:nth-child(even)", "props": [("background-color", "#fafafa")]},
-            {"selector": "tr:nth-child(odd)", "props": [("background-color", "#ffffff")]},
+            {"selector": "tbody tr:nth-child(even) td", "props": [("background-color", "#fafafa")]},
+            {"selector": "tbody tr:nth-child(odd) td", "props": [("background-color", "#ffffff")]},
         ])
-        .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
+        .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Pok.%": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
         .apply(spalvinti_pokycio_abs_gradienta, subset=["Pok.%"])
         .hide(axis="index")
-        .set_properties(subset=["Nasdaq pranešimai"], **{"white-space": "pre-line"})
+        .set_properties(subset=["Naujiena", "Verslo žinios"], **{"white-space": "pre-line"})
     )
 
 
@@ -1018,32 +1065,355 @@ def build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, st
 """
 
 
-def generate_report(excel_file, filename: str, start_date: date = None, end_date: date = None, progress=None) -> dict:
-    """
-    Pagrindinė funkcija Streamlit aplikacijai.
 
-    excel_file gali būti:
-    - Streamlit UploadedFile objektas;
-    - failo kelias;
-    - file-like objektas.
+def _date_from_any(value):
+    """Paverčia įvairias datos reikšmes į date arba None."""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return pd.to_datetime(value, errors="coerce").date()
+    except Exception:
+        return None
+
+
+def _source_has_successful_scrape_covering(source: str, start_date: date, end_date: date) -> bool:
     """
+    Patikrina market_news_scrape_log, ar pasirinktas intervalas jau buvo scrapintas.
+    Tai svarbu ir tais atvejais, kai tam laikotarpiui naujienų nebuvo: tada DB įrašų nėra,
+    bet logas leidžia nebescrapinti to paties intervalo vėl ir vėl.
+    """
+    try:
+        url = _supabase_rest_url("market_news_scrape_log")
+        params = {
+            "select": "date_from,date_to,status",
+            "source": f"eq.{source}",
+            "status": "eq.success",
+            "date_from": f"lte.{start_date}",
+            "date_to": f"gte.{end_date}",
+            "limit": "1",
+        }
+        with _http_client() as client:
+            response = client.get(url, headers=_supabase_headers(), params=params)
+            response.raise_for_status()
+            data = response.json() or []
+        return len(data) > 0
+    except Exception:
+        # Jei logų patikrinti nepavyko, geriau nesustabdyti ataskaitos ir naudoti atsarginę logiką.
+        return False
+
+
+def _source_has_recent_successful_scrape(source: str, start_date: date, end_date: date, max_age_hours: int = 6) -> bool:
+    """
+    Patikrina, ar gyvas laikotarpis neseniai jau buvo scrapintas.
+    Naudojamas tam, kad spaudžiant tas pačias datas programa neitų scrapinti kiekvieną kartą.
+
+    Reikalinga, kad market_news_scrape_log lentelėje būtų created_at stulpelis
+    su Supabase default now(). Jei created_at nėra, funkcija saugiai grąžina False.
+    """
+    try:
+        cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+        url = _supabase_rest_url("market_news_scrape_log")
+        params = {
+            "select": "date_from,date_to,status,created_at",
+            "source": f"eq.{source}",
+            "status": "eq.success",
+            "date_from": f"lte.{start_date}",
+            "date_to": f"gte.{end_date}",
+            "created_at": f"gte.{cutoff}",
+            "order": "created_at.desc",
+            "limit": "1",
+        }
+        with _http_client() as client:
+            response = client.get(url, headers=_supabase_headers(), params=params)
+            response.raise_for_status()
+            data = response.json() or []
+        return len(data) > 0
+    except Exception:
+        return False
+
+
+def _normalize_cached_news_columns(df_cached: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Supabase stulpelius paverčia į seną struktūrą, kurios laukia ataskaitos logika."""
+    if df_cached is None or df_cached.empty:
+        if source == "crib":
+            return pd.DataFrame(columns=[
+                "Bendrovė", "Bendrovė_norm", "Kategorija", "Naujiena", "Published_dt",
+                "Nuoroda", "Pilna_antraštė", "Pilnas_tekstas",
+            ])
+        if source == "vz":
+            return pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+        return pd.DataFrame()
+
+    df = df_cached.copy()
+
+    if source == "crib" and "source" in df.columns:
+        df = df.rename(columns={
+            "company": "Bendrovė",
+            "company_norm": "Bendrovė_norm",
+            "category": "Kategorija",
+            "title": "Pilna_antraštė",
+            "url": "Nuoroda",
+            "published_at": "Published_dt",
+            "content": "Pilnas_tekstas",
+        })
+        df["Published_dt"] = pd.to_datetime(df.get("Published_dt"), errors="coerce")
+        df["Naujiena"] = df.apply(
+            lambda r: (
+                f'<a href="{r.get("Nuoroda", "")}" target="_blank">'
+                f'{pd.to_datetime(r.get("Published_dt")).strftime("%Y-%m-%d %H:%M")} – {r.get("Pilna_antraštė", "")}</a>'
+                if str(r.get("Nuoroda", "")).strip() and pd.notna(r.get("Published_dt"))
+                else str(r.get("Pilna_antraštė", ""))
+            ),
+            axis=1,
+        )
+        if "Bendrovė_norm" not in df.columns or df["Bendrovė_norm"].fillna("").eq("").all():
+            df["Bendrovė_norm"] = df["Bendrovė"].astype(str).map(normalize)
+        return df
+
+    if source == "vz" and "source" in df.columns:
+        df = df.rename(columns={
+            "title": "Antraštė",
+            "url": "Nuoroda",
+            "published_at": "Data",
+            "content": "Pilnas_tekstas",
+        })
+        df["Data"] = pd.to_datetime(df.get("Data"), errors="coerce").dt.date
+        return df
+
+    return df
+
+
+def _load_cached_news_normalized(source: str, start_date: date, end_date: date) -> pd.DataFrame:
+    cached = load_news_df(source, start_date, end_date)
+    return _normalize_cached_news_columns(cached, source)
+
+
+def _merge_and_dedup_news(existing: pd.DataFrame, fresh: pd.DataFrame, source: str) -> pd.DataFrame:
+    frames = [x for x in [existing, fresh] if x is not None and not x.empty]
+    if not frames:
+        return _normalize_cached_news_columns(pd.DataFrame(), source)
+    out = pd.concat(frames, ignore_index=True)
+    if source == "crib":
+        if "Nuoroda" in out.columns:
+            out = out.drop_duplicates(subset=["Nuoroda"], keep="last")
+        else:
+            out = out.drop_duplicates()
+        if "Published_dt" in out.columns:
+            out["Published_dt"] = pd.to_datetime(out["Published_dt"], errors="coerce")
+            out = out.sort_values("Published_dt", ascending=False)
+    elif source == "vz":
+        if "Nuoroda" in out.columns:
+            out = out.drop_duplicates(subset=["Nuoroda"], keep="last")
+        else:
+            out = out.drop_duplicates()
+        if "Data" in out.columns:
+            out["Data"] = pd.to_datetime(out["Data"], errors="coerce").dt.date
+            out = out.sort_values("Data", ascending=False)
+    return out.reset_index(drop=True)
+
+
+def _scrape_news_source(source: str, scrape_func, start_date: date, end_date: date, df_stat: pd.DataFrame = None, progress=None) -> pd.DataFrame:
+    """Paleidzia atitinkamo saltinio scraperi ir grazina jo DataFrame."""
+    if source == "vz":
+        _, fresh = scrape_func(start_date, end_date, df_stat, progress=progress)
+        return fresh
+    return scrape_func(start_date, end_date, progress=progress)
+
+
+
+
+def _vz_scrape_cutoff_date() -> date:
+    """VŽ naujienas leidžiame scrapinti tik už paskutines 14 dienų."""
+    return date.today() - timedelta(days=14)
+
+
+def _can_scrape_vz_period(period_start: date, period_end: date) -> bool:
+    """True, jei bent dalis periodo patenka į paskutines 14 dienų."""
+    return period_end >= _vz_scrape_cutoff_date()
+
+def get_news_with_supabase_cache(source: str, start_date: date, end_date: date, scrape_func, df_stat: pd.DataFrame = None, progress=None) -> pd.DataFrame:
+    """
+    CRIB ir VŽ cache logika:
+
+    - Visada pirmiausia skaitoma Supabase DB.
+    - CRIB gali būti scrapinamas istorijai ir gyvoms dienoms pagal cache / log taisykles.
+    - VŽ NIEKADA nescrapinama už periodą, kurio pabaiga senesnė nei 14 dienų.
+      Tokiu atveju grąžinami tik DB esantys VŽ įrašai.
+    - Jei VŽ intervalas mišrus, sena dalis imama tik iš DB, o scrapinti leidžiama tik
+      nuo paskutinių 14 dienų ribos.
+    - Vakar ir šiandien laikomos "gyvomis" dienomis, bet jos atnaujinamos tik tada,
+      jei nėra neseno sėkmingo scrape log'o. Pagal nutylėjimą TTL = 6 valandos.
+    - Po galimo scrapinimo galutinis rezultatas grąžinamas iš Supabase DB.
+
+    Nasdaq statistika čia nedalyvauja ir į DB nerašoma.
+    """
+    if start_date is None or end_date is None:
+        return _normalize_cached_news_columns(pd.DataFrame(), source)
+
+    today = date.today()
+    live_start = today - timedelta(days=1)
+    live_refresh_hours = 6
+
+    cached_raw = load_news_df(source, start_date, end_date)
+    cached = _normalize_cached_news_columns(cached_raw, source)
+
+    # VŽ taisyklė: jei visas pasirinktas periodas senesnis nei 14 dienų,
+    # jokio VŽ scraping'o nedarome. Naudojame tik tai, kas jau yra DB.
+    if source == "vz" and not _can_scrape_vz_period(start_date, end_date):
+        return cached
+
+    # Jei VŽ periodas mišrus, senesnė nei 14 d. dalis nebus scrapinama.
+    # Gali būti scrapinama tik nuo vz_scrape_start_allowed iki end_date.
+    vz_scrape_start_allowed = _vz_scrape_cutoff_date() if source == "vz" else start_date
+
+    # Jei visas periodas istorinis, DB užtenka. Tušti istoriniai periodai
+    # nebescrapinami, jeigu scrape log rodo, kad jie jau buvo patikrinti.
+    if end_date < live_start:
+        if cached_raw is not None and not cached_raw.empty:
+            return cached
+        if _source_has_successful_scrape_covering(source, start_date, end_date):
+            return cached
+
+        scrape_start = max(start_date, vz_scrape_start_allowed)
+        scrape_end = end_date
+        if scrape_start <= scrape_end:
+            fresh = _scrape_news_source(
+                source,
+                scrape_func,
+                scrape_start,
+                scrape_end,
+                df_stat=df_stat,
+                progress=progress,
+            )
+            save_news_df(fresh, source)
+            log_scrape(source, scrape_start, scrape_end, "success", len(fresh) if fresh is not None else 0)
+        return _load_cached_news_normalized(source, start_date, end_date)
+
+    # Istorinė dalis iki užvakarykščios dienos.
+    historical_start = start_date
+    historical_end = min(end_date, live_start - timedelta(days=1))
+
+    if historical_start <= historical_end:
+        hist_cached_raw = load_news_df(source, historical_start, historical_end)
+        hist_has_rows = hist_cached_raw is not None and not hist_cached_raw.empty
+        hist_has_log = _source_has_successful_scrape_covering(source, historical_start, historical_end)
+
+        if not hist_has_rows and not hist_has_log:
+            scrape_start = max(historical_start, vz_scrape_start_allowed)
+            scrape_end = historical_end
+            if scrape_start <= scrape_end:
+                fresh_hist = _scrape_news_source(
+                    source,
+                    scrape_func,
+                    scrape_start,
+                    scrape_end,
+                    df_stat=df_stat,
+                    progress=progress,
+                )
+                save_news_df(fresh_hist, source)
+                log_scrape(source, scrape_start, scrape_end, "success", len(fresh_hist) if fresh_hist is not None else 0)
+
+    # Gyva dalis: vakar + šiandien. Ji atnaujinama tik kas live_refresh_hours val.
+    live_range_start = max(start_date, live_start, vz_scrape_start_allowed)
+    live_range_end = end_date
+
+    if live_range_start <= live_range_end:
+        live_cached_raw = load_news_df(source, live_range_start, live_range_end)
+        live_has_recent_scrape = _source_has_recent_successful_scrape(
+            source,
+            live_range_start,
+            live_range_end,
+            max_age_hours=live_refresh_hours,
+        )
+
+        # Jei gyvas periodas jau neseniai tikrintas, naudojame DB. Tai reiškia,
+        # kad spaudžiant tas pačias datas pakartotinai nebus einama į scraperį.
+        if not live_has_recent_scrape:
+            fresh_live = _scrape_news_source(
+                source,
+                scrape_func,
+                live_range_start,
+                live_range_end,
+                df_stat=df_stat,
+                progress=progress,
+            )
+            save_news_df(fresh_live, source)
+            log_scrape(source, live_range_start, live_range_end, "success", len(fresh_live) if fresh_live is not None else 0)
+        elif live_cached_raw is not None and not live_cached_raw.empty:
+            pass
+
+    return _load_cached_news_normalized(source, start_date, end_date)
+
+
+def build_vz_map_from_df(vz_df: pd.DataFrame, df_stat: pd.DataFrame) -> dict:
+    """Sukuria bendrovė -> VŽ nuoroda žemėlapį tiek iš šviežio scrape, tiek iš Supabase struktūros."""
+    vz_map = {}
+    if vz_df is None or vz_df.empty:
+        for imone in df_stat["Bendrovė"].dropna().unique():
+            vz_map[imone] = ""
+        return vz_map
+
+    title_col = "Antraštė" if "Antraštė" in vz_df.columns else "title"
+    url_col = "Nuoroda" if "Nuoroda" in vz_df.columns else "url"
+
+    for imone in df_stat["Bendrovė"].dropna().unique():
+        found = ""
+        for _, row in vz_df.iterrows():
+            title = row.get(title_col, "")
+            url = row.get(url_col, "")
+            if atitinka(imone, title):
+                found = f'<a href="{url}" target="_blank">{title}</a>' if str(url).strip() else str(title)
+                break
+        vz_map[imone] = found
+    return vz_map
+
+def generate_report(excel_file, filename: str, start_date: date = None, end_date: date = None, progress=None) -> dict:
     if progress:
         progress("Statistics: nuskaitomas Excel failas...")
+
     df = pd.read_excel(excel_file, sheet_name="VLN")
 
     file_start, file_end = extract_dates_from_filename(filename)
     start_date = start_date or file_start
     end_date = end_date or file_end
-    if start_date is None or end_date is None:
-        raise ValueError("Nepavyko nustatyti laikotarpio. Pasirinkite datas rankiniu būdu arba naudokite failo pavadinimą su YYYYMMDD_YYYYMMDD.")
 
-    # Antraštė visada formuojama pagal realiai pasirinktą laikotarpį.
-    # Failo pavadinimas gali būti sugeneruotas Nasdaq, todėl juo nepasikliaujame, kai datos paduotos iš UI.
+    if start_date is None or end_date is None:
+        raise ValueError(
+            "Nepavyko nustatyti laikotarpio. Pasirinkite datas rankiniu būdu "
+            "arba naudokite failo pavadinimą su YYYYMMDD_YYYYMMDD."
+        )
+
+    # Antraštė visada pagal realiai pasirinktą / perduotą laikotarpį.
     caption = f"Rinkos apžvalga ({start_date} – {end_date})"
 
-    df_news = scrape_crib_dom_lt(start_date, end_date, progress=progress)
-    vz_map, vz_df = vz_scrape_full(start_date, end_date, df, progress=progress)
-    df_nasdaq = scrape_nasdaq_vilnius_news_with_full_text(start_date, end_date, progress=progress)
+    if progress:
+        progress("Tikrinama Supabase naujienų bazė...")
+
+    # CRIB = Nasdaq / emitentų pranešimai iš CRIB. Naudojame DB cache ir scrapiname tik trūkstamą dalį.
+    df_news = get_news_with_supabase_cache(
+        "crib",
+        start_date,
+        end_date,
+        scrape_crib_dom_lt,
+        progress=progress,
+    )
+
+    # VŽ straipsniai. Taip pat naudojame DB cache ir scrapiname tik trūkstamą dalį.
+    vz_df = get_news_with_supabase_cache(
+        "vz",
+        start_date,
+        end_date,
+        vz_scrape_full,
+        df_stat=df,
+        progress=progress,
+    )
+    vz_map = build_vz_map_from_df(vz_df, df)
+
+    # Atskiro Nasdaq naujienų scraperio nebenaudojame, nes CRIB jau yra Nasdaq / emitentų pranešimų šaltinis.
+    df_nasdaq = pd.DataFrame(columns=[
+        "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
+        "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
+    ])
 
     if progress:
         progress("Formuojamos akcijų, obligacijų ir First North lentelės...")
@@ -1051,6 +1421,7 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df_akcijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Akcijos"])].copy()
     df_obligacijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Obligacijos"])].copy()
 
+    # Visose pagrindinėse lentelėse rodome CRIB ir VŽ.
     df_akcijos = sujungti_naujienas_keli(df_akcijos, df_news)
     df_obligacijos = sujungti_naujienas_keli(df_obligacijos, df_news)
     df_obligacijos = df_obligacijos[df_obligacijos["Naujiena"] != ""]
@@ -1061,22 +1432,28 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df_akcijos["Įžvalgos"] = df_akcijos.apply(ivertink_izvalga, axis=1)
     df_obligacijos["Įžvalgos"] = df_obligacijos.apply(ivertink_izvalga, axis=1)
 
-    df_first_north = df[df["Sąrašas/segmentas"].astype(str).str.contains("First North", case=False, na=False)].copy()
-    nasdaq_map = build_nasdaq_map_for_companies(df_first_north, df_nasdaq, max_items=5)
-    df_first_north["Nasdaq pranešimai"] = df_first_north["Bendrovė"].map(nasdaq_map).fillna("")
+    df_first_north = df[
+        df["Sąrašas/segmentas"].astype(str).str.contains("First North", case=False, na=False)
+    ].copy()
+    df_first_north = sujungti_naujienas_keli(df_first_north, df_news)
+    df_first_north["Verslo žinios"] = df_first_north["Bendrovė"].map(vz_map).fillna("")
+    # First North filtravimo funkcija tikrina stulpelį "Nasdaq pranešimai",
+    # todėl į jį dedame CRIB / emitentų pranešimus iš DB.
+    df_first_north["Nasdaq pranešimai"] = df_first_north["Naujiena"].fillna("")
     df_first_north = filter_traded_or_has_news(df_first_north)
 
+    # Bendra visų naujienų lentelė: CRIB + VŽ. Atskiro Nasdaq naujienų šaltinio nebėra.
     df_visos = sudeti_visas_naujienas_distinct(df, df_news, vz_df, df_nasdaq)
 
     styled_akcijos = render_lentele(df_akcijos, caption)
     styled_obligacijos = render_lentele(df_obligacijos, "Baltijos skolos VP sąrašas (obligacijos)")
     styled_first_north = render_first_north(
         df_first_north,
-        f"First North (prekiauta arba yra pranešimų) – Nasdaq Vilnius (tik antraštės) ({start_date} – {end_date})",
+        f"First North (prekiauta arba yra CRIB / VŽ naujienų) ({start_date} – {end_date})",
     )
     styled_visos = render_visos_naujienos(
         df_visos,
-        "Visos skirtingos naujienos (CRIB + VŽ + Nasdaq Baltic (Vilnius), pilnas tekstas)",
+        "Visos skirtingos naujienos (CRIB + VŽ, pilnas tekstas)",
     )
 
     html = build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos)
@@ -1102,23 +1479,13 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
 
 def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_dir="downloads", progress=None):
     """
-    Atsisiunčia Nasdaq Baltic statistikos Excel failą tiesiogiai per download endpoint'ą,
-    be Selenium / Chrome.
+    Atsisiunčia Nasdaq Baltic statistiką tiesiai iš download endpoint'o, be Selenium.
 
-    Naudojamas endpoint'as:
-        https://nasdaqbaltic.com/statistics/lt/statistics/download
-
-    Parametrai:
-        filter=1
-        start=YYYY-MM-DD
-        end=YYYY-MM-DD
-
-    Grąžina:
-        (excel_file_like, filename)
+    SVARBU:
+    - Nasdaq statistika nėra saugoma Supabase DB.
+    - Kiekvieną kartą ji parsisiunčiama pagal naudotojo pasirinktą start_date / end_date.
+    - Grąžinama kaip BytesIO objektas, kad app.py galėtų perduoti į generate_report().
     """
-    from io import BytesIO
-    from pathlib import Path
-
     def log(message):
         if progress:
             progress(message)
@@ -1130,9 +1497,8 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
 
     start_txt = start_date.strftime("%Y-%m-%d")
     end_txt = end_date.strftime("%Y-%m-%d")
-    filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
 
-    log(f"Nasdaq statistics: atsisiunčiami duomenys per API endpoint'ą ({start_txt} - {end_txt})...")
+    log(f"Atsisiunčiama Nasdaq Baltic statistika: {start_txt} – {end_txt}...")
 
     base_url = "https://nasdaqbaltic.com/statistics/lt/statistics/download"
     params = {
@@ -1140,74 +1506,27 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
         "start": start_txt,
         "end": end_txt,
     }
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        ),
-        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,*/*",
-        "Referer": "https://nasdaqbaltic.com/statistics/lt/statistics",
-    }
 
     try:
-        response = requests.get(
-            base_url,
-            params=params,
-            headers=headers,
-            verify=False,
-            timeout=60,
-        )
+        response = requests.get(base_url, params=params, verify=False, timeout=90)
         response.raise_for_status()
-    except requests.RequestException as exc:
+    except Exception as e:
         raise RuntimeError(
-            "Nepavyko atsisiųsti Nasdaq statistics failo per tiesioginį endpoint'ą. "
-            f"Laikotarpis: {start_txt} - {end_txt}. Klaida: {exc}"
-        ) from exc
+            "Nepavyko atsisiųsti Nasdaq Baltic statistikos per download endpoint'ą. "
+            f"Laikotarpis: {start_txt} – {end_txt}. Klaida: {e}"
+        )
 
     content = response.content or b""
-    if len(content) < 500:
-        preview = content[:300].decode("utf-8", errors="replace")
+    if len(content) < 1000:
         raise RuntimeError(
-            "Nasdaq grąžino per mažą failą arba klaidos tekstą vietoje Excel. "
-            f"Atsakymo pradžia: {preview!r}"
-        )
-
-    # Dažniausi Excel parašai: XLSX prasideda ZIP 'PK', senas XLS - D0 CF.
-    is_probably_excel = content[:2] == b"PK" or content[:4] == b"\xd0\xcf\x11\xe0"
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    if not is_probably_excel and "excel" not in content_type and "spreadsheet" not in content_type:
-        preview = content[:500].decode("utf-8", errors="replace")
-        raise RuntimeError(
-            "Nasdaq atsakymas nepanašus į Excel failą. "
-            f"Content-Type: {content_type!r}. Atsakymo pradžia: {preview!r}"
+            "Nasdaq Baltic grąžino per mažą / tuščią failą. "
+            f"Laikotarpis: {start_txt} – {end_txt}. Atsakymo pradžia: {content[:200]!r}"
         )
 
     excel_file = BytesIO(content)
+    filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
     excel_file.name = filename
     excel_file.seek(0)
 
-    # Greitas patikrinimas, kad pandas gali atidaryti failą.
-    try:
-        xls = pd.ExcelFile(excel_file)
-        sheet_names = xls.sheet_names
-        if not sheet_names:
-            raise ValueError("Excel faile nėra lapų.")
-        excel_file.seek(0)
-    except Exception as exc:
-        raise RuntimeError(
-            "Nasdaq failas atsisiųstas, bet nepavyko jo perskaityti kaip Excel. "
-            f"Klaida: {exc}"
-        ) from exc
-
-    # Išsaugome kopiją į downloads katalogą, kad būtų lengviau debug'inti Streamlit aplinkoje.
-    try:
-        download_path = Path(download_dir).resolve()
-        download_path.mkdir(parents=True, exist_ok=True)
-        (download_path / filename).write_bytes(content)
-    except Exception:
-        pass
-
-    log(f"Nasdaq statistics failas atsisiųstas: {filename}")
+    log(f"Nasdaq statistikos failas atsisiųstas: {filename}")
     return excel_file, filename
-
