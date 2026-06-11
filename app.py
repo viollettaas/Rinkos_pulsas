@@ -9,6 +9,7 @@ from rinkos_logika import (
     download_nasdaq_statistics_excel,
 )
 from emitentu_atranka import generate_emitentu_ataskaita
+from crib_update import update_crib_news
 
 
 st.set_page_config(
@@ -503,6 +504,25 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
     max-width: 100% !important;
 }
 
+
+.update-card {
+    margin-top: 18px;
+}
+
+.update-card .stButton > button {
+    background: rgba(59, 130, 246, 0.18) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(96, 165, 250, 0.55) !important;
+    border-radius: 14px !important;
+    height: 46px !important;
+    font-weight: 900 !important;
+    box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.14), 0 8px 20px rgba(0,0,0,0.16) !important;
+}
+
+.update-card .stButton > button:hover {
+    border-color: #7dd3fc !important;
+    box-shadow: 0 0 0 2px rgba(125, 211, 252, 0.25), 0 12px 26px rgba(0,0,0,0.22) !important;
+}
 </style>
 """
 
@@ -531,7 +551,7 @@ report_mode = "Emitentų atranka" if report_param == "emitentai" else "Rinkos ap
 
 with st.sidebar:
     rinkos_active = "active" if report_mode == "Rinkos apžvalga" else ""
-    emitentai_active = "active" if report_mode == "Emitentų pranešimai" else ""
+    emitentai_active = "active" if report_mode == "Emitentų atranka" else ""
     nav_html = f"""
         <div class="report-nav-title">
             <div class="report-nav-icon">📊</div>
@@ -554,11 +574,47 @@ with st.sidebar:
     """
     st.markdown(nav_html, unsafe_allow_html=True)
 
+    st.markdown('<div class="sidebar-card update-card">', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-card-title">🔄 Naujienų bazė</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sidebar-card-subtitle">Patikrina naujausius CRIB pranešimus ir į Supabase įrašo tik tuos, kurių dar nėra DB.</div>',
+        unsafe_allow_html=True,
+    )
+
+    update_news_btn = st.button(
+        "🔄 Atnaujinti duomenis",
+        use_container_width=True,
+        key="update_crib_news_btn",
+    )
+
+    if update_news_btn:
+        try:
+            with st.spinner("Tikrinami nauji CRIB pranešimai..."):
+                stats = update_crib_news(
+                    max_pages=20,
+                    stop_empty_pages=3,
+                    headless=True,
+                    progress=None,
+                )
+
+            st.session_state.report_result = None
+            st.session_state.emitentu_result = None
+
+            st.success(
+                f"Atnaujinta: naujai įrašyta {stats.get('records_inserted', 0)} pranešimų "
+                f"(patikrinta puslapių: {stats.get('pages_processed', 0)})."
+            )
+        except Exception as exc:
+            st.error("Nepavyko atnaujinti CRIB naujienų bazės.")
+            st.exception(exc)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 # ------------------------------------------------------------
 # EMITENTŲ ATRANKA: atskira ataskaita, naudojanti tą pačią Supabase market_news lentelę
 # ------------------------------------------------------------
-if report_mode == "Emitentų pranešimai":
+if report_mode == "Emitentų atranka":
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-card-title">🧾 Emitentų atranka</div>', unsafe_allow_html=True)
