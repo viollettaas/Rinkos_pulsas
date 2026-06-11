@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 from datetime import datetime, date
 
 import urllib3
+import requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.styles.stylesheet")
 
@@ -30,13 +31,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
 
 
 NASDAQ_NEWS_URL = "https://nasdaqbaltic.com/statistics/lt/news"
-
-KODO_VERSIJA = "2026-06-11_nasdaq_ssl_safe_v5"
 
 SEGMENTAI = {
     "Akcijos": ["Baltijos Papildomasis sąrašas", "Baltijos Oficialusis sąrašas"],
@@ -616,110 +614,10 @@ def _nasdaq_dt(row) -> pd.Timestamp:
     return pd.to_datetime(s, errors="coerce")
 
 
-def _click_nasdaq_next_page(driver):
-    """
-    Paspaudžia Nasdaq naujienų puslapiavimo mygtuką "Next".
-    Bandoma tiek paprastame DOM, tiek shadow DOM elementuose.
-    """
-    js = """
-    try {
-        const buttons = [];
-
-        // 1) mygtukai pagrindiniame DOM
-        buttons.push(...document.querySelectorAll('button, a'));
-
-        // 2) mygtukai shadow DOM viduje
-        const all = document.querySelectorAll('*');
-        for (const h of all) {
-            if (h.shadowRoot) {
-                buttons.push(...h.shadowRoot.querySelectorAll('button, a'));
-            }
-        }
-
-        for (const btn of buttons) {
-            const txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-            const aria = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
-            const title = (btn.getAttribute('title') || '').trim().toLowerCase();
-            const cls = (btn.getAttribute('class') || '').trim().toLowerCase();
-            const disabled = btn.disabled || btn.getAttribute('disabled') !== null || aria.includes('disabled');
-
-            if (disabled) continue;
-
-            const isNext =
-                aria.includes('next') ||
-                aria.includes('kitas') ||
-                title.includes('next') ||
-                title.includes('kitas') ||
-                txt.includes('next') ||
-                txt.includes('kitas') ||
-                txt.includes('chevron_right') ||
-                txt.includes('chevron right') ||
-                txt === '>' ||
-                txt === '›' ||
-                cls.includes('next');
-
-            if (isNext) {
-                btn.scrollIntoView({block: 'center'});
-                try {
-                    btn.click();
-                } catch(e) {
-                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-                }
-                return true;
-            }
-        }
-        return false;
-    } catch(e) {
-        return false;
-    }
-    """
-    try:
-        return bool(driver.execute_script(js))
-    except Exception:
-        return False
-
-
-def _first_nasdaq_row_signature(driver):
-    """Grąžina pirmos matomos eilutės tekstą, kad po click būtų galima patikrinti, ar puslapis pasikeitė."""
-    try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr, div.table-responsive table tbody tr, .table tbody tr, table tr")
-        rows = [r for r in rows if (r.text or "").strip()]
-        if not rows:
-            return ""
-        return re.sub(r"\s+", " ", rows[0].text.strip())
-    except Exception:
-        return ""
-
-
-def _wait_nasdaq_page_change(driver, old_signature, timeout=12):
-    """Laukia, kol po puslapiavimo pasikeis pirmos eilutės tekstas."""
-    started = time.time()
-    while time.time() - started < timeout:
-        time.sleep(0.6)
-        new_signature = _first_nasdaq_row_signature(driver)
-        if new_signature and new_signature != old_signature:
-            return True
-    return False
-
-
 def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, progress=None) -> pd.DataFrame:
-    """
-    Nasdaq Baltic naujienos:
-    - nustato laikotarpį pagal start_date / end_date;
-    - pažymi Vilnius;
-    - nuskaito ne tik pirmą, bet ir kitus puslapius;
-    - sustoja, kai nebelieka kito puslapio arba kai pasiektos senesnės nei start_date naujienos;
-    - atidaro kiekvieną pranešimą ir paima pilną tekstą.
-    """
     if progress:
-        progress("Nasdaq Baltic: renkami Vilniaus pranešimai pagal datas ir visus puslapius...")
-
+        progress("Nasdaq Baltic: renkami Vilniaus pranešimai ir pilni tekstai...")
     driver = _init_driver()
-    all_items = []
-    seen_urls = set()
-
     try:
         driver.get(NASDAQ_NEWS_URL)
         WebDriverWait(driver, 25).until(lambda d: d.execute_script("return document.readyState") == "complete")
@@ -732,74 +630,17 @@ def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, 
         _set_date_input(driver, "Nuo", start_date.strftime("%Y-%m-%d"))
         _set_date_input(driver, "Iki", end_date.strftime("%Y-%m-%d"))
         _click_search(driver)
-        time.sleep(1.5)
+        time.sleep(1.2)
 
-        page = 1
-        max_pages = 200
-
-        while page <= max_pages:
-            if progress:
-                progress(f"Nasdaq: apdorojamas puslapis {page}...")
-
-            items = _parse_news_rows(driver)
-            if not items:
-                break
-
-            df_page_all = pd.DataFrame(items)
-            df_page_all["__dt"] = df_page_all.apply(_nasdaq_dt, axis=1)
-            df_page_all = df_page_all.dropna(subset=["__dt"])
-
-            if df_page_all.empty:
-                break
-
-            # Įrašome tik nurodyto laikotarpio pranešimus.
-            df_page = df_page_all[
-                (df_page_all["__dt"].dt.date >= start_date) &
-                (df_page_all["__dt"].dt.date <= end_date)
-            ].copy()
-
-            for _, row in df_page.iterrows():
-                url = str(row.get("Nasdaq_nuoroda", "") or "").strip()
-
-                # Deduplikacija pagal URL, o jei URL nėra - pagal antraštę + datą.
-                if url:
-                    key = url
-                else:
-                    key = f"{row.get('__dt', '')}|{row.get('Nasdaq_antraštė', '')}"
-
-                if key in seen_urls:
-                    continue
-                seen_urls.add(key)
-                all_items.append(row.to_dict())
-
-            # Jei puslapio seniausia data jau ankstesnė nei start_date, toliau nebereikia eiti.
-            min_dt = df_page_all["__dt"].min()
-            if pd.notna(min_dt) and min_dt.date() < start_date:
-                break
-
-            old_signature = _first_nasdaq_row_signature(driver)
-            clicked = _click_nasdaq_next_page(driver)
-            if not clicked:
-                break
-
-            changed = _wait_nasdaq_page_change(driver, old_signature, timeout=12)
-            if not changed:
-                break
-
-            page += 1
-            time.sleep(0.8)
-
-        df_n = pd.DataFrame(all_items)
+        items = _parse_news_rows(driver)
+        df_n = pd.DataFrame(items)
         if df_n.empty:
             return pd.DataFrame(columns=[
                 "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
                 "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
             ])
 
-        df_n["__dt"] = pd.to_datetime(df_n["__dt"], errors="coerce")
-        df_n = df_n.dropna(subset=["__dt"])
-        df_n = df_n.sort_values("__dt", ascending=False).reset_index(drop=True)
-
+        df_n["__dt"] = df_n.apply(_nasdaq_dt, axis=1)
         cache = {}
         urls = df_n["Nasdaq_nuoroda"].fillna("").astype(str).unique().tolist()
         urls = [u.strip() for u in urls if u and u.strip().lower().startswith("http")]
@@ -823,9 +664,9 @@ def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, 
         df_n["Nasdaq_pilna_antraštė"] = df_n.apply(_get_cached_title, axis=1)
         df_n["Nasdaq_pilnas_tekstas"] = df_n.apply(_get_cached_text, axis=1)
         return df_n
-
     finally:
         driver.quit()
+
 
 def build_nasdaq_map_for_companies(df_first_north: pd.DataFrame, df_nasdaq_news: pd.DataFrame, max_items=5) -> dict:
     out = {}
@@ -1191,14 +1032,13 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df = pd.read_excel(excel_file, sheet_name="VLN")
 
     file_start, file_end = extract_dates_from_filename(filename)
-    # Jeigu datos paduotos iš Streamlit UI, visada naudojame jas.
-    # Failo pavadinimo datos naudojamos tik rankiniu režimu, kai UI datos nepaduotos.
     start_date = start_date or file_start
     end_date = end_date or file_end
     if start_date is None or end_date is None:
         raise ValueError("Nepavyko nustatyti laikotarpio. Pasirinkite datas rankiniu būdu arba naudokite failo pavadinimą su YYYYMMDD_YYYYMMDD.")
 
-    # Antraštė formuojama pagal realiai pasirinktą laikotarpį, o ne pagal Nasdaq sugeneruotą failo pavadinimą.
+    # Antraštė visada formuojama pagal realiai pasirinktą laikotarpį.
+    # Failo pavadinimas gali būti sugeneruotas Nasdaq, todėl juo nepasikliaujame, kai datos paduotos iš UI.
     caption = f"Rinkos apžvalga ({start_date} – {end_date})"
 
     df_news = scrape_crib_dom_lt(start_date, end_date, progress=progress)
@@ -1260,43 +1100,24 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     }
 
 
-
-def normalize_date_value(value: str) -> str:
-    """Normalizuoja datos laukų reikšmes į YYYY-MM-DD, jei įmanoma."""
-    value = (value or "").strip()
-    if not value:
-        return ""
-    m = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", value)
-    if m:
-        y, mo, d = m.groups()
-        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
-    m = re.search(r"(\d{1,2})[-./](\d{1,2})[-./](\d{4})", value)
-    if m:
-        d, mo, y = m.groups()
-        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
-    try:
-        dt = pd.to_datetime(value, errors="coerce")
-        if pd.notna(dt):
-            return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-    return value
-
 def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_dir="downloads", progress=None):
     """
-    Automatiškai atsisiunčia Nasdaq Baltic statistikos Excel failą iš:
-    https://nasdaqbaltic.com/statistics/lt/statistics
+    Atsisiunčia Nasdaq Baltic statistikos Excel failą tiesiogiai per download endpoint'ą,
+    be Selenium / Chrome.
 
-    SVARBU: datos į Nasdaq puslapį įrašomos ne tik per JS value pakeitimą,
-    bet ir per realius Selenium veiksmus + input/change/blur event'us. Taip
-    React/Angular tipo formos tikrai perskaičiuoja filtrus prieš Excel eksportą.
+    Naudojamas endpoint'as:
+        https://nasdaqbaltic.com/statistics/lt/statistics/download
+
+    Parametrai:
+        filter=1
+        start=YYYY-MM-DD
+        end=YYYY-MM-DD
 
     Grąžina:
         (excel_file_like, filename)
     """
     from io import BytesIO
     from pathlib import Path
-    from selenium.webdriver.common.keys import Keys
 
     def log(message):
         if progress:
@@ -1307,413 +1128,86 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
     if start_date > end_date:
         raise ValueError("Data 'Nuo' negali būti vėlesnė už datą 'Iki'.")
 
-    download_path = Path(download_dir).resolve()
-    download_path.mkdir(parents=True, exist_ok=True)
+    start_txt = start_date.strftime("%Y-%m-%d")
+    end_txt = end_date.strftime("%Y-%m-%d")
+    filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
 
-    for p in download_path.glob("*"):
-        try:
-            if p.is_file() and p.suffix.lower() in {".xlsx", ".xls", ".csv", ".crdownload", ".tmp"}:
-                p.unlink()
-        except Exception:
-            pass
+    log(f"Nasdaq statistics: atsisiunčiami duomenys per API endpoint'ą ({start_txt} - {end_txt})...")
 
-    log("Jungiamasi prie Nasdaq Baltic statistikos puslapio...")
-
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1600,1200")
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--ignore-ssl-errors=yes")
-    options.add_argument("--allow-insecure-localhost")
-    options.add_argument("--test-type")
-    options.add_argument("--disable-web-security")
-    options.set_capability("acceptInsecureCerts", True)
-    options.add_experimental_option("prefs", {
-        "download.default_directory": str(download_path),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "safebrowsing.enabled": True,
-        "profile.default_content_setting_values.automatic_downloads": 1,
-    })
-
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-
-    def set_date_input(label_text, value):
-        """
-        Nustato Nasdaq datos lauką tik vieno execute_script viduje.
-        WebElement neperduodamas kaip argumentas, todėl DOM perpiešimas nesukelia
-        stale element klaidos tarp elemento suradimo ir value pakeitimo.
-        Grąžina (ok, actual_value).
-        """
-        script = r"""
-        const labelText = String(arguments[0] || '').toLowerCase();
-        const val = String(arguments[1] || '');
-
-        function visible(el) {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-        }
-        function textOf(el) {
-            return ((el.innerText || el.textContent || '') + ' ' +
-                    (el.getAttribute('aria-label') || '') + ' ' +
-                    (el.getAttribute('placeholder') || '') + ' ' +
-                    (el.getAttribute('name') || '') + ' ' +
-                    (el.getAttribute('id') || '')).toLowerCase();
-        }
-        function roots() {
-            const out = [document];
-            for (const el of document.querySelectorAll('*')) {
-                if (el.shadowRoot) out.push(el.shadowRoot);
-            }
-            return out;
-        }
-        function findInput() {
-            for (const root of roots()) {
-                const inputs = Array.from(root.querySelectorAll('input'))
-                    .filter(i => visible(i) && !i.disabled && i.type !== 'hidden');
-
-                // 1) tiesioginis atitikimas pagal aria/placeholder/name/id
-                for (const inp of inputs) {
-                    const t = textOf(inp);
-                    if (t.includes(labelText)) return inp;
-                }
-
-                // 2) input prie matomo label/span/div teksto „Nuo“ / „Iki“
-                const labels = Array.from(root.querySelectorAll('label, span, div, p'))
-                    .filter(el => visible(el) && textOf(el).includes(labelText));
-                for (const lab of labels) {
-                    let cur = lab;
-                    for (let k = 0; k < 8 && cur; k++, cur = cur.parentElement) {
-                        const nearby = Array.from(cur.querySelectorAll('input'))
-                            .filter(i => visible(i) && !i.disabled && i.type !== 'hidden');
-                        if (nearby.length) return nearby[0];
-                    }
-                }
-            }
-            return null;
-        }
-        const el = findInput();
-        if (!el) return {ok:false, actual:'', reason:'input_not_found'};
-
-        el.scrollIntoView({block:'center'});
-        el.focus();
-
-        // React-friendly native setter.
-        const proto = Object.getPrototypeOf(el);
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value') ||
-                     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-        if (desc && desc.set) desc.set.call(el, val);
-        else el.value = val;
-
-        el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:val}));
-        el.dispatchEvent(new Event('change', {bubbles:true}));
-        el.dispatchEvent(new KeyboardEvent('keydown', {bubbles:true, key:'Enter'}));
-        el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'Enter'}));
-        el.blur();
-
-        return {ok:true, actual:el.value || '', reason:'set'};
-        """
-
-        last_actual = ""
-        last_reason = ""
-        for attempt in range(4):
-            try:
-                res = driver.execute_script(script, label_text, value) or {}
-                actual = normalize_date_value(res.get("actual", ""))
-                last_actual = actual
-                last_reason = res.get("reason", "")
-                if actual == value:
-                    return True, actual
-                time.sleep(0.6)
-            except StaleElementReferenceException:
-                time.sleep(0.8)
-            except Exception as e:
-                last_reason = str(e)
-                time.sleep(0.8)
-
-        # Atsarginis Selenium įvedimas: elementą ieškome iš naujo kiekviename bandyme.
-        xpaths = [
-            f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
-            f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
-            f"//input[contains(@placeholder, '{label_text}')]",
-            f"//input[contains(@aria-label, '{label_text}')]",
-        ]
-        for _ in range(3):
-            for xp in xpaths:
-                try:
-                    inp = WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH, xp)))
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-                    inp.click()
-                    inp.send_keys(Keys.CONTROL, "a")
-                    inp.send_keys(Keys.BACKSPACE)
-                    inp.send_keys(value)
-                    inp.send_keys(Keys.TAB)
-                    time.sleep(0.7)
-                    actual = normalize_date_value(inp.get_attribute("value") or "")
-                    if actual == value:
-                        return True, actual
-                    last_actual = actual
-                except StaleElementReferenceException:
-                    time.sleep(0.5)
-                    continue
-                except Exception:
-                    continue
-
-        return False, last_actual or last_reason
-
-    def click_button_by_text(texts, timeout=8):
-        lowered = [t.lower() for t in texts]
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            try:
-                clicked = driver.execute_script(
-                    r"""
-                    const wanted = arguments[0];
-                    function visible(el) {
-                        if (!el) return false;
-                        const r = el.getBoundingClientRect();
-                        const s = window.getComputedStyle(el);
-                        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-                    }
-                    function roots() {
-                        const out = [document];
-                        for (const el of document.querySelectorAll('*')) {
-                            if (el.shadowRoot) out.push(el.shadowRoot);
-                        }
-                        return out;
-                    }
-                    for (const root of roots()) {
-                        const els = Array.from(root.querySelectorAll('button, a, input[type="submit"]'));
-                        for (const el of els) {
-                            if (!visible(el) || el.disabled || el.getAttribute('disabled') !== null) continue;
-                            const txt = ((el.innerText || el.textContent || el.value || '') + ' ' +
-                                         (el.getAttribute('aria-label') || '') + ' ' +
-                                         (el.getAttribute('title') || '') + ' ' +
-                                         (el.getAttribute('class') || '')).toLowerCase();
-                            if (wanted.some(w => txt.includes(w))) {
-                                el.scrollIntoView({block:'center'});
-                                try { el.click(); } catch(e) { el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true})); }
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
-                    """,
-                    lowered,
-                )
-                if clicked:
-                    time.sleep(1.2)
-                    return True
-            except Exception:
-                pass
-            time.sleep(0.4)
-        return False
-
-    def visible_table_signature():
-        try:
-            return driver.execute_script(
-                r"""
-                const tables = Array.from(document.querySelectorAll('table'));
-                let best = '';
-                for (const t of tables) {
-                    const txt = (t.innerText || t.textContent || '').trim();
-                    if (txt.length > best.length) best = txt;
-                }
-                return best.slice(0, 2000);
-                """
-            ) or ""
-        except Exception:
-            return ""
+    base_url = "https://nasdaqbaltic.com/statistics/lt/statistics/download"
+    params = {
+        "filter": 1,
+        "start": start_txt,
+        "end": end_txt,
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,*/*",
+        "Referer": "https://nasdaqbaltic.com/statistics/lt/statistics",
+    }
 
     try:
-        try:
-            driver.execute_cdp_cmd("Page.setDownloadBehavior", {
-                "behavior": "allow",
-                "downloadPath": str(download_path),
-            })
-        except Exception:
-            pass
+        response = requests.get(
+            base_url,
+            params=params,
+            headers=headers,
+            verify=False,
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "Nepavyko atsisiųsti Nasdaq statistics failo per tiesioginį endpoint'ą. "
+            f"Laikotarpis: {start_txt} - {end_txt}. Klaida: {exc}"
+        ) from exc
 
-        def safe_get_nasdaq_statistics_page():
-            urls = [
-                "https://nasdaqbaltic.com/statistics/lt/statistics",
-                "https://www.nasdaqbaltic.com/statistics/lt/statistics",
-                "http://nasdaqbaltic.com/statistics/lt/statistics",
-                "http://www.nasdaqbaltic.com/statistics/lt/statistics",
-            ]
-            last_error = None
-            for url in urls:
-                for attempt in range(2):
-                    try:
-                        log(f"Bandoma atidaryti Nasdaq statistics puslapį: {url}")
-                        driver.get(url)
-                        WebDriverWait(driver, 40).until(
-                            lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"}
-                        )
-                        time.sleep(3)
-                        body_text = (driver.find_element(By.TAG_NAME, "body").text or "").strip()
-                        current = driver.current_url or ""
-                        if body_text or "nasdaqbaltic" in current.lower():
-                            return url
-                    except WebDriverException as e:
-                        last_error = e
-                        msg = str(e)
-                        if "ERR_SSL" in msg or "SSL" in msg or "CERT" in msg:
-                            time.sleep(2)
-                            continue
-                        time.sleep(1)
-                    except Exception as e:
-                        last_error = e
-                        time.sleep(1)
-            raise RuntimeError(
-                "Nepavyko atidaryti Nasdaq Baltic statistics puslapio dėl naršyklės / SSL / tinklo klaidos. "
-                "Patikrinkite, ar serverio aplinkoje leidžiamas prisijungimas prie nasdaqbaltic.com. "
-                f"Paskutinė klaida: {last_error}"
-            )
+    content = response.content or b""
+    if len(content) < 500:
+        preview = content[:300].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            "Nasdaq grąžino per mažą failą arba klaidos tekstą vietoje Excel. "
+            f"Atsakymo pradžia: {preview!r}"
+        )
 
-        safe_get_nasdaq_statistics_page()
+    # Dažniausi Excel parašai: XLSX prasideda ZIP 'PK', senas XLS - D0 CF.
+    is_probably_excel = content[:2] == b"PK" or content[:4] == b"\xd0\xcf\x11\xe0"
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if not is_probably_excel and "excel" not in content_type and "spreadsheet" not in content_type:
+        preview = content[:500].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            "Nasdaq atsakymas nepanašus į Excel failą. "
+            f"Content-Type: {content_type!r}. Atsakymo pradžia: {preview!r}"
+        )
 
-        for by, selector in [
-            (By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"),
-            (By.ID, "onetrust-accept-btn-handler"),
-            (By.XPATH, "//button[contains(., 'Sutinku') or contains(., 'Leisti') or contains(., 'Priimti') or contains(., 'Accept') or contains(., 'Allow')]") ,
-            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]") ,
-            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]") ,
-        ]:
-            try:
-                btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((by, selector)))
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.5)
-                break
-            except Exception:
-                pass
+    excel_file = BytesIO(content)
+    excel_file.name = filename
+    excel_file.seek(0)
 
-        start_txt = start_date.strftime("%Y-%m-%d")
-        end_txt = end_date.strftime("%Y-%m-%d")
-        log(f"Parenkamas Nasdaq statistikos laikotarpis: {start_txt} - {end_txt}")
-
-        ok_from, actual_from = set_date_input("Nuo", start_txt)
-        ok_to, actual_to = set_date_input("Iki", end_txt)
-
-        if not ok_from:
-            raise RuntimeError(f"Nepavyko patikimai nustatyti datos lauko 'Nuo'. Lauke liko: {actual_from!r}, reikėjo: {start_txt!r}.")
-        if not ok_to:
-            raise RuntimeError(f"Nepavyko patikimai nustatyti datos lauko 'Iki'. Lauke liko: {actual_to!r}, reikėjo: {end_txt!r}.")
-
-        log(f"Nasdaq formoje patvirtintos datos: Nuo {actual_from}, Iki {actual_to}")
-
-        # Pažymime Vilnius, jeigu toks filtras yra.
-        try:
-            driver.execute_script(
-                r"""
-                function visible(el) {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    const s = window.getComputedStyle(el);
-                    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-                }
-                const els = Array.from(document.querySelectorAll('label, span, div, input'));
-                for (const el of els) {
-                    const txt = ((el.innerText || el.textContent || el.value || '') + ' ' +
-                                (el.getAttribute('aria-label') || '') + ' ' +
-                                (el.getAttribute('name') || '')).toLowerCase();
-                    if (visible(el) && txt.includes('vilnius')) {
-                        el.scrollIntoView({block:'center'});
-                        try { el.click(); } catch(e) { el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true})); }
-                        break;
-                    }
-                }
-                """
-            )
-            time.sleep(0.5)
-        except Exception:
-            pass
-
-        old_sig = visible_table_signature()
-        clicked_search = click_button_by_text(["paieška", "ieškoti", "rodyti", "search", "show", "apply"], timeout=8)
-        if clicked_search:
-            # Laukiame, kol lentelė / rezultatai persikraus. Jei tekstas nepasikeičia, vis tiek duodame AJAX laiko.
-            try:
-                WebDriverWait(driver, 20).until(lambda d: visible_table_signature() != old_sig or len(visible_table_signature()) > 0)
-            except Exception:
-                pass
-            time.sleep(2.5)
-        else:
-            # Kai kuriuose puslapio variantuose filtrai pritaikomi automatiškai.
-            time.sleep(2.5)
-
-        # Dar kartą patikriname, kad prieš eksportą formoje liko pasirinktos datos.
-        ok_from, actual_from = set_date_input("Nuo", start_txt)
-        ok_to, actual_to = set_date_input("Iki", end_txt)
-        if not (ok_from and ok_to):
-            raise RuntimeError(f"Prieš eksportą datos nesutapo: Nuo={actual_from!r}, Iki={actual_to!r}.")
-
-        old_sig = visible_table_signature()
-        clicked_search = click_button_by_text(["paieška", "ieškoti", "rodyti", "search", "show", "apply"], timeout=5)
-        if clicked_search:
-            try:
-                WebDriverWait(driver, 20).until(lambda d: visible_table_signature() != old_sig or len(visible_table_signature()) > 0)
-            except Exception:
-                pass
-            time.sleep(2.0)
-
-        log("Spaudžiamas Excel atsisiuntimo mygtukas...")
-        before = {p.name for p in download_path.glob("*")}
-
-        clicked = click_button_by_text(["excel", "atsisiųsti", "download", "export"], timeout=12)
-
-        if not clicked:
-            raise RuntimeError(
-                "Nepavyko rasti arba paspausti Nasdaq statistikos atsisiuntimo mygtuko. "
-                "Gali reikėti patikslinti selektorius pagal realų Nasdaq puslapio HTML."
-            )
-
-        timeout_seconds = 90
-        started = time.time()
-        downloaded_file = None
-        while time.time() - started < timeout_seconds:
-            files = list(download_path.glob("*"))
-            partial = [p for p in files if p.suffix.lower() in {".crdownload", ".tmp"}]
-            complete = [
-                p for p in files
-                if p.is_file()
-                and p.name not in before
-                and p.suffix.lower() in {".xlsx", ".xls", ".csv"}
-                and p.stat().st_size > 0
-            ]
-            if complete and not partial:
-                downloaded_file = max(complete, key=lambda p: p.stat().st_mtime)
-                break
-            time.sleep(0.7)
-
-        if downloaded_file is None:
-            complete = [p for p in download_path.glob("*.xls*") if p.is_file() and p.stat().st_size > 0]
-            if complete:
-                downloaded_file = max(complete, key=lambda p: p.stat().st_mtime)
-
-        if downloaded_file is None:
-            raise TimeoutError("Nasdaq statistikos failas neatsisiuntė per nustatytą laiką.")
-
-        # Failo pavadinimą priskiriame pagal vartotojo pasirinktą periodą, ne pagal Nasdaq default vardą.
-        filename = f"statistics_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-
-        log(f"Failas atsisiųstas pagal pasirinktą periodą: {filename}")
-
-        with open(downloaded_file, "rb") as f:
-            content = f.read()
-
-        excel_file = BytesIO(content)
-        excel_file.name = filename
+    # Greitas patikrinimas, kad pandas gali atidaryti failą.
+    try:
+        xls = pd.ExcelFile(excel_file)
+        sheet_names = xls.sheet_names
+        if not sheet_names:
+            raise ValueError("Excel faile nėra lapų.")
         excel_file.seek(0)
-        return excel_file, filename
+    except Exception as exc:
+        raise RuntimeError(
+            "Nasdaq failas atsisiųstas, bet nepavyko jo perskaityti kaip Excel. "
+            f"Klaida: {exc}"
+        ) from exc
 
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+    # Išsaugome kopiją į downloads katalogą, kad būtų lengviau debug'inti Streamlit aplinkoje.
+    try:
+        download_path = Path(download_dir).resolve()
+        download_path.mkdir(parents=True, exist_ok=True)
+        (download_path / filename).write_bytes(content)
+    except Exception:
+        pass
+
+    log(f"Nasdaq statistics failas atsisiųstas: {filename}")
+    return excel_file, filename
+
