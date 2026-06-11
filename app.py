@@ -9,7 +9,7 @@ from rinkos_logika import (
     download_nasdaq_statistics_excel,
 )
 from emitentu_atranka import generate_emitentu_ataskaita
-from crib_update import update_crib_news
+from crib_update import update_crib_news, get_latest_crib_news_date
 
 
 st.set_page_config(
@@ -37,6 +37,9 @@ if "emitentu_result" not in st.session_state:
 
 if "emitentu_dates" not in st.session_state:
     st.session_state.emitentu_dates = None
+
+if "news_update_message" not in st.session_state:
+    st.session_state.news_update_message = None
 
 
 CSS = """
@@ -214,6 +217,22 @@ section[data-testid="stSidebar"] div[role="radiogroup"] label {
     font-weight: 700;
     margin-top: 12px;
     font-size: 13px;
+}
+
+.latest-news-date {
+    margin-top: 12px;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(157,190,230,0.22);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #cfe2ff !important;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.latest-news-date span {
+    color: #ffffff !important;
+    font-weight: 900;
 }
 
 /* Inputs */
@@ -581,6 +600,22 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    latest_crib_date = get_latest_crib_news_date()
+    if latest_crib_date is not None:
+        st.markdown(
+            f'<div class="latest-news-date">🕒 Paskutinė DB naujiena:<br><span>{latest_crib_date.strftime("%Y-%m-%d %H:%M")}</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="latest-news-date">🕒 Paskutinė DB naujiena:<br><span>nėra duomenų</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    if st.session_state.news_update_message:
+        st.success(st.session_state.news_update_message)
+        st.session_state.news_update_message = None
+
     update_news_btn = st.button(
         "🔄 Atnaujinti duomenis",
         use_container_width=True,
@@ -599,11 +634,11 @@ with st.sidebar:
 
             st.session_state.report_result = None
             st.session_state.emitentu_result = None
-
-            st.success(
+            st.session_state.news_update_message = (
                 f"Atnaujinta: naujai įrašyta {stats.get('records_inserted', 0)} pranešimų "
                 f"(patikrinta puslapių: {stats.get('pages_processed', 0)})."
             )
+            st.rerun()
         except Exception as exc:
             st.error("Nepavyko atnaujinti CRIB naujienų bazės.")
             st.exception(exc)
