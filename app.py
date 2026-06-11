@@ -558,7 +558,7 @@ with st.sidebar:
 # ------------------------------------------------------------
 # EMITENTŲ ATRANKA: atskira ataskaita, naudojanti tą pačią Supabase market_news lentelę
 # ------------------------------------------------------------
-if report_mode == "Emitentų atranka":
+if report_mode == "Emitentų pranešimai":
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-card-title">🧾 Emitentų atranka</div>', unsafe_allow_html=True)
