@@ -63,7 +63,7 @@ section[data-testid="stSidebar"] {
 }
 
 section[data-testid="stSidebar"] > div {
-    padding: 28px 18px 24px 18px;
+    padding: 14px 18px 22px 18px;
 }
 
 section[data-testid="stSidebar"] * {
@@ -71,9 +71,9 @@ section[data-testid="stSidebar"] * {
 }
 
 .sidebar-title {
-    font-size: 24px;
+    font-size: 20px;
     font-weight: 900;
-    margin-bottom: 24px;
+    margin-bottom: 12px;
 }
 
 .sidebar-card {
@@ -422,39 +422,39 @@ div[data-testid="metric-container"] div {
     gap: 12px;
     font-size: 25px;
     font-weight: 950;
-    margin: 4px 0 26px 0;
+    margin: 0 0 14px 0;
     letter-spacing: -0.2px;
 }
 .report-nav-icon {
-    width: 42px;
-    height: 42px;
-    border-radius: 12px;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
     background: rgba(255,255,255,0.16);
     display: flex;
     align-items: center;
     justify-content: center;
     box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18);
-    font-size: 23px;
+    font-size: 21px;
 }
 .report-nav {
     display: flex;
     flex-direction: column;
-    gap: 14px;
-    margin-bottom: 30px;
+    gap: 10px;
+    margin-bottom: 18px;
 }
 .report-nav a { text-decoration: none !important; }
 .report-nav-item {
     display: flex;
     align-items: center;
-    gap: 18px;
-    min-height: 72px;
-    padding: 0 22px;
-    border-radius: 18px;
+    gap: 14px;
+    min-height: 56px;
+    padding: 0 18px;
+    border-radius: 16px;
     background: rgba(255,255,255,0.055);
     border: 1px solid rgba(157,190,230,0.26);
     color: #ffffff !important;
     font-weight: 900;
-    font-size: 17px;
+    font-size: 16px;
     box-shadow: 0 10px 28px rgba(0,0,0,0.12);
     transition: all .18s ease;
 }
@@ -469,8 +469,8 @@ div[data-testid="metric-container"] div {
     box-shadow: 0 0 0 1px rgba(104,189,255,0.18), 0 0 22px rgba(104,189,255,0.26);
 }
 .report-nav-item .nav-icon {
-    font-size: 29px;
-    width: 34px;
+    font-size: 24px;
+    width: 28px;
     text-align: center;
     opacity: .95;
 }
@@ -525,7 +525,7 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
 
 
 .update-card {
-    margin-top: 18px;
+    margin-top: 8px;
 }
 
 .update-card .stButton > button {
@@ -542,6 +542,34 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
     border-color: #7dd3fc !important;
     box-shadow: 0 0 0 2px rgba(125, 211, 252, 0.25), 0 12px 26px rgba(0,0,0,0.22) !important;
 }
+
+.sidebar-section-title {
+    font-size: 16px;
+    font-weight: 950;
+    margin: 16px 0 8px 0;
+    letter-spacing: -0.1px;
+}
+.sidebar-section-subtitle {
+    color: #b8c9df !important;
+    font-size: 13px;
+    line-height: 1.45;
+    margin: 0 0 12px 0;
+}
+.news-db-block {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(157,190,230,0.20);
+}
+.datasource-block {
+    margin-top: 16px;
+}
+section[data-testid="stSidebar"] .stRadio {
+    margin-bottom: 8px !important;
+}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.45rem !important;
+}
+
 </style>
 """
 
@@ -593,10 +621,13 @@ with st.sidebar:
     """
     st.markdown(nav_html, unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-card update-card">', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-card-title">🔄 Naujienų bazė</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sidebar-card-subtitle">Patikrina naujausius CRIB pranešimus ir į Supabase įrašo tik tuos, kurių dar nėra DB.</div>',
+        """
+        <div class="news-db-block">
+            <div class="sidebar-section-title">🔄 Naujienų bazė</div>
+            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus ir į Supabase įrašo tik tuos, kurių dar nėra DB.</div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -643,7 +674,6 @@ with st.sidebar:
             st.error("Nepavyko atnaujinti CRIB naujienų bazės.")
             st.exception(exc)
 
-    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------
@@ -793,10 +823,14 @@ if report_mode == "Emitentų atranka":
     st.stop()
 
 with st.sidebar:
-    st.markdown('<div class="sidebar-title">⚙️ Nustatymai</div>', unsafe_allow_html=True)
-
-   ## st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-card-title">📌 Duomenų šaltinis</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="datasource-block">
+            <div class="sidebar-section-title">📌 Duomenų šaltinis</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     duomenu_saltinis = st.radio(
         "Pasirinkite duomenų gavimo būdą",
@@ -804,16 +838,14 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    ##st.markdown("</div>", unsafe_allow_html=True)
 
     uploaded_file = None
     filename = None
 
     if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
-        st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-card-title">📥 Nasdaq Baltic atsisiuntimas</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-section-title">📥 Nasdaq Baltic atsisiuntimas</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-card-subtitle">Pasirinkite laikotarpį. Programa pati atsisiųs Excel failą iš Nasdaq Baltic.</div>',
+            '<div class="sidebar-section-subtitle">Pasirinkite laikotarpį. Programa pati atsisiųs Excel failą iš Nasdaq Baltic.</div>',
             unsafe_allow_html=True,
         )
 
@@ -821,13 +853,11 @@ with st.sidebar:
         end_date = st.date_input("Iki", value=date.today())
 
         st.markdown('<div class="status-ok">✅ Automatinis atsisiuntimas įjungtas</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
     else:
-        st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-card-title">📄 Statistikos Excel failas</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-section-title">📄 Statistikos Excel failas</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-card-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx)</div>',
+            '<div class="sidebar-section-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx)</div>',
             unsafe_allow_html=True,
         )
 
@@ -878,7 +908,6 @@ with st.sidebar:
         else:
             st.markdown('<div class="status-ok">✅ Failas įkeltas</div>', unsafe_allow_html=True)
 
-        st.markdown("</div>", unsafe_allow_html=True)
 
         naudoti_rankines_datas = st.checkbox(
             "Datas įvesti rankiniu būdu",
