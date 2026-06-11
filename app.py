@@ -531,7 +531,7 @@ report_mode = "Emitentų atranka" if report_param == "emitentai" else "Rinkos ap
 
 with st.sidebar:
     rinkos_active = "active" if report_mode == "Rinkos apžvalga" else ""
-    emitentai_active = "active" if report_mode == "Emitentų atranka" else ""
+    emitentai_active = "active" if report_mode == "Emitentų pranešimai" else ""
     nav_html = f"""
         <div class="report-nav-title">
             <div class="report-nav-icon">📊</div>
