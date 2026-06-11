@@ -35,6 +35,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 NASDAQ_NEWS_URL = "https://nasdaqbaltic.com/statistics/lt/news"
 
+KODO_VERSIJA = "2026-06-11_nasdaq_dates_no_stale_v3"
+
 SEGMENTAI = {
     "Akcijos": ["Baltijos Papildomasis sąrašas", "Baltijos Oficialusis sąrašas"],
     "Obligacijos": ["Baltijos skolos VP sąrašas"],
@@ -1310,51 +1312,54 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
-    def js_find_date_input(label_text):
-        """Randa input pagal etiketę ir paprastame DOM, ir shadow DOM."""
-        return driver.execute_script(
-            r"""
-            const labelText = String(arguments[0] || '').toLowerCase();
+    def set_date_input(label_text, value):
+        """
+        Nustato Nasdaq datos lauką tik vieno execute_script viduje.
+        WebElement neperduodamas kaip argumentas, todėl DOM perpiešimas nesukelia
+        stale element klaidos tarp elemento suradimo ir value pakeitimo.
+        Grąžina (ok, actual_value).
+        """
+        script = r"""
+        const labelText = String(arguments[0] || '').toLowerCase();
+        const val = String(arguments[1] || '');
 
-            function visible(el) {
-                if (!el) return false;
-                const r = el.getBoundingClientRect();
-                const s = window.getComputedStyle(el);
-                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        }
+        function textOf(el) {
+            return ((el.innerText || el.textContent || '') + ' ' +
+                    (el.getAttribute('aria-label') || '') + ' ' +
+                    (el.getAttribute('placeholder') || '') + ' ' +
+                    (el.getAttribute('name') || '') + ' ' +
+                    (el.getAttribute('id') || '')).toLowerCase();
+        }
+        function roots() {
+            const out = [document];
+            for (const el of document.querySelectorAll('*')) {
+                if (el.shadowRoot) out.push(el.shadowRoot);
             }
-
-            function textOf(el) {
-                return ((el && (el.innerText || el.textContent)) || '').trim().toLowerCase();
-            }
-
-            function allRoots() {
-                const roots = [document];
-                const all = document.querySelectorAll('*');
-                for (const el of all) {
-                    if (el.shadowRoot) roots.push(el.shadowRoot);
-                }
-                return roots;
-            }
-
-            for (const root of allRoots()) {
+            return out;
+        }
+        function findInput() {
+            for (const root of roots()) {
                 const inputs = Array.from(root.querySelectorAll('input'))
                     .filter(i => visible(i) && !i.disabled && i.type !== 'hidden');
 
+                // 1) tiesioginis atitikimas pagal aria/placeholder/name/id
                 for (const inp of inputs) {
-                    const aria = (inp.getAttribute('aria-label') || '').toLowerCase();
-                    const placeholder = (inp.getAttribute('placeholder') || '').toLowerCase();
-                    const name = (inp.getAttribute('name') || '').toLowerCase();
-                    const id = (inp.getAttribute('id') || '').toLowerCase();
-                    if (aria.includes(labelText) || placeholder.includes(labelText) || name.includes(labelText) || id.includes(labelText)) {
-                        return inp;
-                    }
+                    const t = textOf(inp);
+                    if (t.includes(labelText)) return inp;
                 }
 
+                // 2) input prie matomo label/span/div teksto „Nuo“ / „Iki“
                 const labels = Array.from(root.querySelectorAll('label, span, div, p'))
                     .filter(el => visible(el) && textOf(el).includes(labelText));
                 for (const lab of labels) {
                     let cur = lab;
-                    for (let k = 0; k < 6 && cur; k++, cur = cur.parentElement) {
+                    for (let k = 0; k < 8 && cur; k++, cur = cur.parentElement) {
                         const nearby = Array.from(cur.querySelectorAll('input'))
                             .filter(i => visible(i) && !i.disabled && i.type !== 'hidden');
                         if (nearby.length) return nearby[0];
@@ -1362,94 +1367,75 @@ def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_
                 }
             }
             return null;
-            """,
-            label_text,
-        )
+        }
+        const el = findInput();
+        if (!el) return {ok:false, actual:'', reason:'input_not_found'};
 
-    def set_react_input_value(inp, value):
-        """Patikimai pakeičia input reikšmę React/Angular formoms."""
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-        time.sleep(0.2)
+        el.scrollIntoView({block:'center'});
+        el.focus();
 
-        # 1) Realus Selenium įvedimas.
-        try:
-            inp.click()
-            time.sleep(0.1)
-            inp.send_keys(Keys.CONTROL, "a")
-            inp.send_keys(Keys.BACKSPACE)
-            inp.send_keys(value)
-            inp.send_keys(Keys.TAB)
-            time.sleep(0.4)
-        except Exception:
-            pass
+        // React-friendly native setter.
+        const proto = Object.getPrototypeOf(el);
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value') ||
+                     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        if (desc && desc.set) desc.set.call(el, val);
+        else el.value = val;
 
-        # 2) Native setter + visi svarbūs event'ai.
-        driver.execute_script(
-            r"""
-            const el = arguments[0];
-            const val = arguments[1];
-            const proto = Object.getPrototypeOf(el);
-            const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-            if (desc && desc.set) {
-                desc.set.call(el, val);
-            } else {
-                el.value = val;
-            }
-            el.dispatchEvent(new Event('input', {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-            el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'Enter'}));
-            el.blur();
-            """,
-            inp,
-            value,
-        )
-        time.sleep(0.5)
+        el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:val}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+        el.dispatchEvent(new KeyboardEvent('keydown', {bubbles:true, key:'Enter'}));
+        el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'Enter'}));
+        el.blur();
 
-    def get_input_value(inp):
-        try:
-            return (inp.get_attribute("value") or "").strip()
-        except Exception:
-            return ""
+        return {ok:true, actual:el.value || '', reason:'set'};
+        """
 
-    def normalize_date_value(v):
-        v = (v or "").strip().replace("/", "-").replace(".", "-")
-        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", v)
-        if not m:
-            return v
-        y, mo, d = m.groups()
-        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        last_actual = ""
+        last_reason = ""
+        for attempt in range(4):
+            try:
+                res = driver.execute_script(script, label_text, value) or {}
+                actual = normalize_date_value(res.get("actual", ""))
+                last_actual = actual
+                last_reason = res.get("reason", "")
+                if actual == value:
+                    return True, actual
+                time.sleep(0.6)
+            except StaleElementReferenceException:
+                time.sleep(0.8)
+            except Exception as e:
+                last_reason = str(e)
+                time.sleep(0.8)
 
-    def set_date_input(label_text, value):
-        inp = js_find_date_input(label_text)
-        if inp is None:
-            # Atsarginiai XPath'ai paprastam DOM.
-            xpaths = [
-                f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
-                f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
-                f"//input[contains(@placeholder, '{label_text}')]",
-                f"//input[contains(@aria-label, '{label_text}')]",
-            ]
+        # Atsarginis Selenium įvedimas: elementą ieškome iš naujo kiekviename bandyme.
+        xpaths = [
+            f"//label[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+            f"//*[contains(normalize-space(.), '{label_text}')]/following::input[1]",
+            f"//input[contains(@placeholder, '{label_text}')]",
+            f"//input[contains(@aria-label, '{label_text}')]",
+        ]
+        for _ in range(3):
             for xp in xpaths:
                 try:
-                    inp = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, xp)))
-                    break
+                    inp = WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH, xp)))
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+                    inp.click()
+                    inp.send_keys(Keys.CONTROL, "a")
+                    inp.send_keys(Keys.BACKSPACE)
+                    inp.send_keys(value)
+                    inp.send_keys(Keys.TAB)
+                    time.sleep(0.7)
+                    actual = normalize_date_value(inp.get_attribute("value") or "")
+                    if actual == value:
+                        return True, actual
+                    last_actual = actual
+                except StaleElementReferenceException:
+                    time.sleep(0.5)
+                    continue
                 except Exception:
-                    inp = None
+                    continue
 
-        if inp is None:
-            return False, ""
-
-        set_react_input_value(inp, value)
-        actual = normalize_date_value(get_input_value(inp))
-        ok = actual == value
-
-        # Kartais komponentas pirmą kartą perrašo reikšmę - bandome antrą kartą.
-        if not ok:
-            set_react_input_value(inp, value)
-            actual = normalize_date_value(get_input_value(inp))
-            ok = actual == value
-
-        return ok, actual
+        return False, last_actual or last_reason
 
     def click_button_by_text(texts, timeout=8):
         lowered = [t.lower() for t in texts]
