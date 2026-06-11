@@ -561,7 +561,7 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
     border-top: 1px solid rgba(157,190,230,0.20);
 }
 .datasource-block {
-    margin-top: 16px;
+    margin-top: 14px;
 }
 section[data-testid="stSidebar"] .stRadio {
     margin-bottom: 8px !important;
@@ -823,6 +823,13 @@ if report_mode == "Emitentų atranka":
     st.stop()
 
 with st.sidebar:
+    run_btn = st.button(
+        "🚀 Generuoti ataskaitą",
+        type="primary",
+        use_container_width=True,
+        key="rinkos_run_btn",
+    )
+
     st.markdown(
         """
         <div class="datasource-block">
@@ -921,12 +928,6 @@ with st.sidebar:
         else:
             start_date = st.date_input("Nuo", value=date.today())
             end_date = st.date_input("Iki", value=date.today())
-
-    run_btn = st.button(
-        "🚀 Generuoti ataskaitą",
-        type="primary",
-        use_container_width=True,
-    )
 
 
 result = st.session_state.report_result
