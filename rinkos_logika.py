@@ -613,10 +613,110 @@ def _nasdaq_dt(row) -> pd.Timestamp:
     return pd.to_datetime(s, errors="coerce")
 
 
+def _click_nasdaq_next_page(driver):
+    """
+    Paspaudžia Nasdaq naujienų puslapiavimo mygtuką "Next".
+    Bandoma tiek paprastame DOM, tiek shadow DOM elementuose.
+    """
+    js = """
+    try {
+        const buttons = [];
+
+        // 1) mygtukai pagrindiniame DOM
+        buttons.push(...document.querySelectorAll('button, a'));
+
+        // 2) mygtukai shadow DOM viduje
+        const all = document.querySelectorAll('*');
+        for (const h of all) {
+            if (h.shadowRoot) {
+                buttons.push(...h.shadowRoot.querySelectorAll('button, a'));
+            }
+        }
+
+        for (const btn of buttons) {
+            const txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+            const aria = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
+            const title = (btn.getAttribute('title') || '').trim().toLowerCase();
+            const cls = (btn.getAttribute('class') || '').trim().toLowerCase();
+            const disabled = btn.disabled || btn.getAttribute('disabled') !== null || aria.includes('disabled');
+
+            if (disabled) continue;
+
+            const isNext =
+                aria.includes('next') ||
+                aria.includes('kitas') ||
+                title.includes('next') ||
+                title.includes('kitas') ||
+                txt.includes('next') ||
+                txt.includes('kitas') ||
+                txt.includes('chevron_right') ||
+                txt.includes('chevron right') ||
+                txt === '>' ||
+                txt === '›' ||
+                cls.includes('next');
+
+            if (isNext) {
+                btn.scrollIntoView({block: 'center'});
+                try {
+                    btn.click();
+                } catch(e) {
+                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
+                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                }
+                return true;
+            }
+        }
+        return false;
+    } catch(e) {
+        return false;
+    }
+    """
+    try:
+        return bool(driver.execute_script(js))
+    except Exception:
+        return False
+
+
+def _first_nasdaq_row_signature(driver):
+    """Grąžina pirmos matomos eilutės tekstą, kad po click būtų galima patikrinti, ar puslapis pasikeitė."""
+    try:
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr, div.table-responsive table tbody tr, .table tbody tr, table tr")
+        rows = [r for r in rows if (r.text or "").strip()]
+        if not rows:
+            return ""
+        return re.sub(r"\s+", " ", rows[0].text.strip())
+    except Exception:
+        return ""
+
+
+def _wait_nasdaq_page_change(driver, old_signature, timeout=12):
+    """Laukia, kol po puslapiavimo pasikeis pirmos eilutės tekstas."""
+    started = time.time()
+    while time.time() - started < timeout:
+        time.sleep(0.6)
+        new_signature = _first_nasdaq_row_signature(driver)
+        if new_signature and new_signature != old_signature:
+            return True
+    return False
+
+
 def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, progress=None) -> pd.DataFrame:
+    """
+    Nasdaq Baltic naujienos:
+    - nustato laikotarpį pagal start_date / end_date;
+    - pažymi Vilnius;
+    - nuskaito ne tik pirmą, bet ir kitus puslapius;
+    - sustoja, kai nebelieka kito puslapio arba kai pasiektos senesnės nei start_date naujienos;
+    - atidaro kiekvieną pranešimą ir paima pilną tekstą.
+    """
     if progress:
-        progress("Nasdaq Baltic: renkami Vilniaus pranešimai ir pilni tekstai...")
+        progress("Nasdaq Baltic: renkami Vilniaus pranešimai pagal datas ir visus puslapius...")
+
     driver = _init_driver()
+    all_items = []
+    seen_urls = set()
+
     try:
         driver.get(NASDAQ_NEWS_URL)
         WebDriverWait(driver, 25).until(lambda d: d.execute_script("return document.readyState") == "complete")
@@ -629,17 +729,74 @@ def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, 
         _set_date_input(driver, "Nuo", start_date.strftime("%Y-%m-%d"))
         _set_date_input(driver, "Iki", end_date.strftime("%Y-%m-%d"))
         _click_search(driver)
-        time.sleep(1.2)
+        time.sleep(1.5)
 
-        items = _parse_news_rows(driver)
-        df_n = pd.DataFrame(items)
+        page = 1
+        max_pages = 200
+
+        while page <= max_pages:
+            if progress:
+                progress(f"Nasdaq: apdorojamas puslapis {page}...")
+
+            items = _parse_news_rows(driver)
+            if not items:
+                break
+
+            df_page_all = pd.DataFrame(items)
+            df_page_all["__dt"] = df_page_all.apply(_nasdaq_dt, axis=1)
+            df_page_all = df_page_all.dropna(subset=["__dt"])
+
+            if df_page_all.empty:
+                break
+
+            # Įrašome tik nurodyto laikotarpio pranešimus.
+            df_page = df_page_all[
+                (df_page_all["__dt"].dt.date >= start_date) &
+                (df_page_all["__dt"].dt.date <= end_date)
+            ].copy()
+
+            for _, row in df_page.iterrows():
+                url = str(row.get("Nasdaq_nuoroda", "") or "").strip()
+
+                # Deduplikacija pagal URL, o jei URL nėra - pagal antraštę + datą.
+                if url:
+                    key = url
+                else:
+                    key = f"{row.get('__dt', '')}|{row.get('Nasdaq_antraštė', '')}"
+
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                all_items.append(row.to_dict())
+
+            # Jei puslapio seniausia data jau ankstesnė nei start_date, toliau nebereikia eiti.
+            min_dt = df_page_all["__dt"].min()
+            if pd.notna(min_dt) and min_dt.date() < start_date:
+                break
+
+            old_signature = _first_nasdaq_row_signature(driver)
+            clicked = _click_nasdaq_next_page(driver)
+            if not clicked:
+                break
+
+            changed = _wait_nasdaq_page_change(driver, old_signature, timeout=12)
+            if not changed:
+                break
+
+            page += 1
+            time.sleep(0.8)
+
+        df_n = pd.DataFrame(all_items)
         if df_n.empty:
             return pd.DataFrame(columns=[
                 "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
                 "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
             ])
 
-        df_n["__dt"] = df_n.apply(_nasdaq_dt, axis=1)
+        df_n["__dt"] = pd.to_datetime(df_n["__dt"], errors="coerce")
+        df_n = df_n.dropna(subset=["__dt"])
+        df_n = df_n.sort_values("__dt", ascending=False).reset_index(drop=True)
+
         cache = {}
         urls = df_n["Nasdaq_nuoroda"].fillna("").astype(str).unique().tolist()
         urls = [u.strip() for u in urls if u and u.strip().lower().startswith("http")]
@@ -663,9 +820,9 @@ def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, 
         df_n["Nasdaq_pilna_antraštė"] = df_n.apply(_get_cached_title, axis=1)
         df_n["Nasdaq_pilnas_tekstas"] = df_n.apply(_get_cached_text, axis=1)
         return df_n
+
     finally:
         driver.quit()
-
 
 def build_nasdaq_map_for_companies(df_first_north: pd.DataFrame, df_nasdaq_news: pd.DataFrame, max_items=5) -> dict:
     out = {}
