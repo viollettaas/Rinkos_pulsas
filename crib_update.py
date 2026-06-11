@@ -458,7 +458,51 @@ def load_existing_crib_keys(start_lookup: date = date(2023, 1, 1)) -> set:
     }
 
 
-def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None):
+
+def get_latest_crib_news_date():
+    """
+    Grąžina naujausios CRIB naujienos datą iš Supabase market_news lentelės.
+    Naudojama Streamlit mygtuko kortelėje, kad būtų matoma, iki kada DB atnaujinta.
+    """
+    try:
+        from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
+
+        url = _supabase_rest_url("market_news")
+        params = {
+            "select": "published_at,title,company,url",
+            "source": "eq.crib",
+            "published_at": "not.is.null",
+            "order": "published_at.desc",
+            "limit": "1",
+        }
+
+        with _http_client() as client:
+            response = client.get(url, headers=_supabase_headers(), params=params)
+            response.raise_for_status()
+            data = response.json() or []
+
+        if not data:
+            return None
+
+        latest = pd.to_datetime(data[0].get("published_at"), errors="coerce")
+        if pd.isna(latest):
+            return None
+        return latest.to_pydatetime()
+    except Exception:
+        # Atsarginis variantas, jeigu tiesioginė REST užklausa nepavyktų.
+        try:
+            df = load_news_df("crib", date(2023, 1, 1), date.today())
+            if df is None or df.empty or "published_at" not in df.columns:
+                return None
+            latest = pd.to_datetime(df["published_at"], errors="coerce").max()
+            if pd.isna(latest):
+                return None
+            return latest.to_pydatetime()
+        except Exception:
+            return None
+
+
+def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, stop_empty_pages: int = None):
     """
     Atnaujina CRIB naujienų bazę.
 
