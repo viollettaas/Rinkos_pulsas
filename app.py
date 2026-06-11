@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 from datetime import date
 import streamlit as st
+import streamlit.components.v1 as components
 
 from rinkos_logika import (
     generate_report,
     extract_dates_from_filename,
     download_nasdaq_statistics_excel,
 )
+from emitentu_atranka import generate_emitentu_ataskaita
 
 
 st.set_page_config(
@@ -29,6 +31,12 @@ if "uploader_key" not in st.session_state:
 if "uploaded_file_cache" not in st.session_state:
     st.session_state.uploaded_file_cache = None
 
+if "emitentu_result" not in st.session_state:
+    st.session_state.emitentu_result = None
+
+if "emitentu_dates" not in st.session_state:
+    st.session_state.emitentu_dates = None
+
 
 CSS = """
 <style>
@@ -40,6 +48,7 @@ CSS = """
     padding-top: 1.2rem;
     padding-left: 2rem;
     padding-right: 2rem;
+    max-width: 100% !important;
 }
 
 /* SIDEBAR */
@@ -384,6 +393,116 @@ div[data-testid="metric-container"] div {
     margin-top: 24px;
     font-weight: 700;
 }
+
+
+/* Custom report navigation */
+.report-nav-title {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 25px;
+    font-weight: 950;
+    margin: 4px 0 26px 0;
+    letter-spacing: -0.2px;
+}
+.report-nav-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.16);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18);
+    font-size: 23px;
+}
+.report-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin-bottom: 30px;
+}
+.report-nav a { text-decoration: none !important; }
+.report-nav-item {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    min-height: 72px;
+    padding: 0 22px;
+    border-radius: 18px;
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(157,190,230,0.26);
+    color: #ffffff !important;
+    font-weight: 900;
+    font-size: 17px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.12);
+    transition: all .18s ease;
+}
+.report-nav-item:hover {
+    background: rgba(30,120,220,0.18);
+    border-color: rgba(111,190,255,0.62);
+    transform: translateY(-1px);
+}
+.report-nav-item.active {
+    background: rgba(20,120,255,0.14);
+    border: 3px solid #68bdff;
+    box-shadow: 0 0 0 1px rgba(104,189,255,0.18), 0 0 22px rgba(104,189,255,0.26);
+}
+.report-nav-item .nav-icon {
+    font-size: 29px;
+    width: 34px;
+    text-align: center;
+    opacity: .95;
+}
+.report-nav-item.active .nav-icon { color: #68bdff !important; }
+section[data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child,
+section[data-testid="stSidebar"] div[role="radiogroup"] input[type="radio"] { display: none !important; }
+
+
+/* Kai šoninis meniu suskleistas - pagrindinė ataskaita išsiplečia per visą langą */
+section[data-testid="stSidebar"][aria-expanded="false"] {
+    min-width: 0rem !important;
+    max-width: 0rem !important;
+    width: 0rem !important;
+    transform: translateX(-100%) !important;
+    overflow: hidden !important;
+}
+
+section[data-testid="stSidebar"][aria-expanded="false"] > div {
+    display: none !important;
+    width: 0rem !important;
+    min-width: 0rem !important;
+    max-width: 0rem !important;
+    padding: 0 !important;
+}
+
+[data-testid="stSidebarCollapsedControl"] {
+    left: 0.8rem !important;
+    top: 0.8rem !important;
+    z-index: 999999 !important;
+}
+
+[data-testid="stAppViewContainer"] {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+[data-testid="stAppViewContainer"] .main,
+[data-testid="stAppViewContainer"] section.main {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+[data-testid="stAppViewContainer"] .block-container {
+    max-width: 100% !important;
+}
+
+.report-table-wrapper,
+.report-table-wrapper table {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
 </style>
 """
 
@@ -400,10 +519,192 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
+
+# ------------------------------------------------------------
+# ATASKAITOS PASIRINKIMAS
+# ------------------------------------------------------------
+report_param = st.query_params.get("report", "rinkos")
+if isinstance(report_param, list):
+    report_param = report_param[0] if report_param else "rinkos"
+
+report_mode = "Emitentų atranka" if report_param == "emitentai" else "Rinkos apžvalga"
+
+with st.sidebar:
+    rinkos_active = "active" if report_mode == "Rinkos apžvalga" else ""
+    emitentai_active = "active" if report_mode == "Emitentų atranka" else ""
+    nav_html = f"""
+        <div class="report-nav-title">
+            <div class="report-nav-icon">📊</div>
+            <div>Ataskaitos</div>
+        </div>
+        <div class="report-nav">
+            <a href="?report=rinkos" target="_self">
+                <div class="report-nav-item {rinkos_active}">
+                    <div class="nav-icon">📈</div>
+                    <div>Rinkos apžvalga</div>
+                </div>
+            </a>
+            <a href="?report=emitentai" target="_self">
+                <div class="report-nav-item {emitentai_active}">
+                    <div class="nav-icon">👥</div>
+                    <div>Emitentų atranka</div>
+                </div>
+            </a>
+        </div>
+    """
+    st.markdown(nav_html, unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------
+# EMITENTŲ ATRANKA: atskira ataskaita, naudojanti tą pačią Supabase market_news lentelę
+# ------------------------------------------------------------
+if report_mode == "Emitentų atranka":
+    with st.sidebar:
+        st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-card-title">🧾 Emitentų atranka</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-card-subtitle">CRIB naujienos imamos iš Supabase DB. Pasirinkite laikotarpį.</div>',
+            unsafe_allow_html=True,
+        )
+        emit_start_date = st.date_input("Nuo", value=date.today(), key="emitentu_start_date")
+        emit_end_date = st.date_input("Iki", value=date.today(), key="emitentu_end_date")
+        st.markdown('<div class="status-ok">✅ Naudojama market_news lentelė, source=crib</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        emit_run_btn = st.button(
+            "🚀 Generuoti emitentų atranką",
+            type="primary",
+            use_container_width=True,
+            key="emitentu_run_btn",
+        )
+
+    emit_result = st.session_state.emitentu_result
+
+    if emit_result is not None:
+        emit_html_bytes = emit_result["html"].encode("utf-8")
+        emit_out_name = (
+            f"emitentu_atranka_{emit_result['start_date'].strftime('%Y%m%d')}_"
+            f"{emit_result['end_date'].strftime('%Y%m%d')}.html"
+        )
+    else:
+        emit_html_bytes = None
+        emit_out_name = "emitentu_atranka.html"
+
+    hero_col, download_col = st.columns([5, 1.35])
+
+    with hero_col:
+        st.markdown(
+            """
+            <div class="hero-card">
+                <div class="hero-inner">
+                    <div class="hero-icon">🧾</div>
+                    <div>
+                        <h1 class="hero-title">Emitentų atranka</h1>
+                        <div class="hero-text">
+                            Ataskaita naudoja tas pačias CRIB / Nasdaq emitentų naujienas iš Supabase duomenų bazės,
+                            jas klasifikuoja pagal temas ir pateikia HTML peržiūrą su filtrais.
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with download_col:
+        st.markdown('<div class="hero-download">', unsafe_allow_html=True)
+        if emit_html_bytes is not None:
+            st.download_button(
+                label="⬇ Atsisiųsti HTML",
+                data=emit_html_bytes,
+                file_name=emit_out_name,
+                mime="text/html",
+                use_container_width=True,
+            )
+        else:
+            st.button("⬇ Atsisiųsti HTML", disabled=True, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    col1.metric("🗓️ Nuo", str(emit_start_date or "-"))
+    col2.metric("🗓️ Iki", str(emit_end_date or "-"))
+
+    st.markdown("---")
+
+    if emit_run_btn:
+        if emit_start_date is None or emit_end_date is None:
+            st.error("Pasirinkite datas.")
+            st.stop()
+
+        if emit_start_date > emit_end_date:
+            st.error("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
+            st.stop()
+
+        try:
+            with st.spinner("Kraunamos CRIB naujienos iš Supabase ir generuojama emitentų atranka..."):
+                generated_emit = generate_emitentu_ataskaita(
+                    start_date=emit_start_date,
+                    end_date=emit_end_date,
+                )
+
+            st.session_state.emitentu_result = generated_emit
+            st.session_state.emitentu_dates = (emit_start_date, emit_end_date)
+            st.rerun()
+
+        except Exception as exc:
+            st.exception(exc)
+            st.stop()
+
+    emit_result = st.session_state.emitentu_result
+
+    if emit_result is None:
+        st.markdown(
+            """
+            <div class="info-box">
+                ℹ️ Pasirinkite laikotarpį ir paspauskite „Generuoti emitentų atranką“.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    st.success(f"Rasta CRIB įrašų: {len(emit_result['df'])}")
+
+    tab1, tab2, tab3 = st.tabs([
+        "📊 Kategorijų santrauka",
+        "🧾 HTML ataskaita",
+        "📄 Duomenys",
+    ])
+
+    with tab1:
+        if emit_result["summary"].empty:
+            st.info("Pasirinktam laikotarpiui klasifikuotinų įrašų nerasta.")
+        else:
+            st.dataframe(emit_result["summary"], use_container_width=True, hide_index=True)
+
+    with tab2:
+        components.html(
+            emit_result["html"],
+            height=900,
+            scrolling=True,
+        )
+
+    with tab3:
+        df_show = emit_result["df"].copy()
+        if "categories" in df_show.columns:
+            df_show["categories"] = df_show["categories"].apply(
+                lambda x: "; ".join(x) if isinstance(x, (list, tuple)) else str(x)
+            )
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+    st.stop()
+
 with st.sidebar:
     st.markdown('<div class="sidebar-title">⚙️ Nustatymai</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+   ## st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-card-title">📌 Duomenų šaltinis</div>', unsafe_allow_html=True)
 
     duomenu_saltinis = st.radio(
@@ -412,7 +713,7 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    ##st.markdown("</div>", unsafe_allow_html=True)
 
     uploaded_file = None
     filename = None
