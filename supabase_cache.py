@@ -186,3 +186,47 @@ def log_scrape(source, date_from, date_to, status, records_found=0, error_messag
             raise RuntimeError(
                 f"Supabase log įrašymo klaida: {response.status_code} - {response.text}"
             )
+            def save_manager_transaction(row: dict):
+    url = _supabase_rest_url("manager_transactions")
+
+    with _http_client() as client:
+        response = client.post(
+            url,
+            headers={
+                **_supabase_headers(),
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            json=row,
+        )
+
+        if response.status_code in (200, 201, 204):
+            return True
+
+        raise RuntimeError(
+            f"Supabase vadovų sandorio įrašymo klaida: "
+            f"{response.status_code} - {response.text}"
+        )
+
+
+def load_manager_transactions_df(start_date: date, end_date: date) -> pd.DataFrame:
+    start_iso = f"{start_date}T00:00:00"
+    end_iso = f"{end_date}T23:59:59"
+
+    url = _supabase_rest_url("manager_transactions")
+
+    params = {
+        "select": "*",
+        "published_at": [f"gte.{start_iso}", f"lte.{end_iso}"],
+        "order": "published_at.desc",
+    }
+
+    with _http_client() as client:
+        response = client.get(
+            url,
+            headers=_supabase_headers(),
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    return pd.DataFrame(data or [])
