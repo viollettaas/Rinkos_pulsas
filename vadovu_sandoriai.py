@@ -104,22 +104,9 @@ def _show_tables(df: pd.DataFrame):
     detail_cols = [c for c in detail_cols if c in df.columns]
     st.dataframe(df[detail_cols], use_container_width=True, hide_index=True)
 
-    st.subheader("2. Santrauka pagal emitentą")
-    issuer_summary = (
-        df.groupby("issuer", dropna=False)
-        .agg(
-            pranesimu_sk=("pdf_url", "count"),
-            asmenu_sk=("person_name", pd.Series.nunique),
-            sandorio_bendra_verte=("transaction_value", "sum"),
-            veluojanciu_sk=("is_late_notification", "sum"),
-            vid_dienu_iki_pranesimo=("days_to_publish", "mean"),
-        )
-        .reset_index()
-        .sort_values(["pranesimu_sk", "sandorio_bendra_verte"], ascending=[False, False])
-    )
-    st.dataframe(issuer_summary, use_container_width=True, hide_index=True)
+  
 
-    st.subheader("3. Santrauka pagal asmenį")
+    st.subheader("2. Santrauka pagal asmenį")
     person_summary = (
         df.groupby(["issuer", "person_name"], dropna=False)
         .agg(
@@ -133,14 +120,6 @@ def _show_tables(df: pd.DataFrame):
     )
     st.dataframe(person_summary, use_container_width=True, hide_index=True)
 
-    st.subheader("4. Vėlavimo kontrolė")
-    delay_cols = [
-        "issuer", "person_name", "transaction_date_dt", "published_date",
-        "days_to_publish", "is_late_notification", "transaction_type", "pdf_url"
-    ]
-    delay_cols = [c for c in delay_cols if c in df.columns]
-    delay_df = df[delay_cols].sort_values("days_to_publish", ascending=False, na_position="last")
-    st.dataframe(delay_df, use_container_width=True, hide_index=True)
 
 
 def show_manager_transactions_page():
