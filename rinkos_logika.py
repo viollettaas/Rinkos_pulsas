@@ -385,17 +385,132 @@ def scrape_crib_dom_lt(start_date: date, end_date: date, progress=None) -> pd.Da
     return df_news
 
 
+
+def _clean_article_text(text: str) -> str:
+    text = re.sub(r"\r", "", text or "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def fetch_vz_article_fast(url: str):
+    """
+    Greitas VZ straipsnio pilno teksto paėmimas per requests.
+    Selenium naudojamas tik VZ sąrašui. Tai daug greičiau nei kiekvieną straipsnį
+    atidarinėti naujame Selenium tab'e.
+    """
+    if not url:
+        return "", ""
+
+    try:
+        response = requests.get(
+            url,
+            timeout=15,
+            verify=False,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "lt-LT,lt;q=0.9,en;q=0.8",
+            },
+        )
+        response.raise_for_status()
+    except Exception:
+        return "", ""
+
+    soup = BeautifulSoup(response.text or "", "html.parser")
+
+    for bad in soup.select("script, style, noscript, iframe, svg, form, nav, footer, header"):
+        bad.decompose()
+
+    title = ""
+    for sel in [
+        "h1",
+        "article h1",
+        "meta[property='og:title']",
+        "meta[name='twitter:title']",
+        ".vz-article__title",
+        ".article-title",
+    ]:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        if el.name == "meta":
+            title = (el.get("content") or "").strip()
+        else:
+            title = el.get_text(" ", strip=True)
+        if title:
+            break
+
+    selectors = [
+        "article",
+        "main article",
+        ".vz-article__content",
+        ".vz-article__body",
+        ".article-content",
+        ".article-body",
+        ".content",
+        "main",
+    ]
+
+    best_text = ""
+    for sel in selectors:
+        for el in soup.select(sel):
+            txt = el.get_text("\n", strip=True)
+            txt = _clean_article_text(txt)
+            if len(txt) > len(best_text):
+                best_text = txt
+
+    if not best_text:
+        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        best_text = _clean_article_text("\n\n".join([x for x in paragraphs if x]))
+
+    return title.strip(), best_text
+
+
+def _company_title_candidates(df_stat: pd.DataFrame) -> list:
+    if df_stat is None or df_stat.empty or "Bendrovė" not in df_stat.columns:
+        return []
+    return [str(x).strip() for x in df_stat["Bendrovė"].dropna().unique() if str(x).strip()]
+
+
+def _vz_title_matches_needed_companies(title: str, companies: list) -> bool:
+    if not companies:
+        return True
+    return any(atitinka(company, title) for company in companies)
+
+
 def vz_scrape_full(start_date, end_date, df_stat: pd.DataFrame, progress=None):
-    """VŽ: sąrašas + pilni tekstai. Grąžina (vz_map, vz_df)."""
+    """
+    VŽ: sąrašas + pilni tekstai tik reikalingoms įmonėms.
+
+    Greitinimas:
+    - Selenium naudojamas tik VŽ pradžios / sąrašo puslapiui.
+    - Detalūs straipsniai atsiunčiami per requests paraleliai.
+    - Pilnas tekstas traukiamas tik tiems straipsniams, kurių antraštė atitinka
+      bent vieną bendrovę iš statistikos failo.
+    - Rezultatas išlieka suderinamas su visa ataskaita: vz_df turi
+      Antraštė, Nuoroda, Data, Pilnas_tekstas, todėl pilni tekstai patenka į
+      „Visos naujienos“ ir HTML ataskaitą.
+    """
     if progress:
-        progress("VŽ: renkami straipsniai ir pilni tekstai...")
+        progress("VŽ: renkami straipsniai pagal reikalingas bendroves...")
+
+    companies = _company_title_candidates(df_stat)
+
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1600,1200")
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    list_items = []
+
     try:
         driver.get("https://www.vz.lt/")
         time.sleep(1)
@@ -405,44 +520,114 @@ def vz_scrape_full(start_date, end_date, df_stat: pd.DataFrame, progress=None):
                 EC.element_to_be_clickable((By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"))
             )
             accept_button.click()
-            time.sleep(1)
+            time.sleep(0.5)
         except Exception:
             pass
 
         try:
-            WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.articles")))
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article.vz-article"))
+            )
         except Exception:
             pass
 
-        items = []
-        for el in driver.find_elements(By.CSS_SELECTOR, "article.vz-article"):
+        articles = driver.find_elements(By.CSS_SELECTOR, "article.vz-article")
+        if progress:
+            progress(f"VŽ: sąraše rasta straipsnių: {len(articles)}")
+
+        seen_urls = set()
+        for el in articles:
             try:
-                antraste_el = el.find_element(By.CSS_SELECTOR, "div.vz-article__summary--description")
-                nuoroda = antraste_el.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
-                antraste = antraste_el.text.strip()
+                # Senas selektorius paliekamas, bet pridedame atsarginius variantus.
+                link_el = None
+                for selector in [
+                    "div.vz-article__summary--description a",
+                    ".vz-article__summary a",
+                    "a[href]",
+                ]:
+                    try:
+                        link_el = el.find_element(By.CSS_SELECTOR, selector)
+                        if link_el:
+                            break
+                    except Exception:
+                        pass
+
+                if not link_el:
+                    continue
+
+                nuoroda = link_el.get_attribute("href") or ""
+                antraste = (link_el.text or "").strip()
+
+                if not antraste:
+                    try:
+                        antraste = el.text.strip().split("\n")[0]
+                    except Exception:
+                        antraste = ""
+
+                if not nuoroda or nuoroda in seen_urls:
+                    continue
+
                 data_url = extract_date_from_url(nuoroda)
-                if data_url is not None and start_date <= data_url <= end_date:
-                    t, content = _open_new_tab_and_get(driver, nuoroda, timeout=20)
-                    if not t:
-                        t = antraste
-                    items.append({
-                        "Antraštė": t.strip(),
-                        "Nuoroda": nuoroda,
-                        "Data": data_url,
-                        "Pilnas_tekstas": content.strip(),
-                    })
+                if data_url is None or not (start_date <= data_url <= end_date):
+                    continue
+
+                # Svarbiausias greitinimas: pilną tekstą imame tik jei antraštė susijusi su įmonėmis.
+                if not _vz_title_matches_needed_companies(antraste, companies):
+                    continue
+
+                seen_urls.add(nuoroda)
+                list_items.append({
+                    "Antraštė": antraste,
+                    "Nuoroda": nuoroda,
+                    "Data": data_url,
+                })
             except Exception:
                 continue
     finally:
         driver.quit()
 
-    vz_df = pd.DataFrame(items)
-    if vz_df.empty:
+    if not list_items:
         return {}, pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
 
+    if progress:
+        progress(f"VŽ: atrinkta susijusių straipsnių: {len(list_items)}. Traukiami pilni tekstai...")
+
+    # Detalius straipsnius traukiame paraleliai per requests.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    by_url = {item["Nuoroda"]: item for item in list_items}
+    fetched = {}
+
+    max_workers = min(6, max(1, len(by_url)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(fetch_vz_article_fast, url): url
+            for url in by_url.keys()
+        }
+        for future in as_completed(future_map):
+            url = future_map[future]
+            try:
+                fetched[url] = future.result()
+            except Exception:
+                fetched[url] = ("", "")
+
+    items = []
+    for item in list_items:
+        url = item["Nuoroda"]
+        title_full, content = fetched.get(url, ("", ""))
+        title = title_full.strip() if title_full else item["Antraštė"]
+
+        items.append({
+            "Antraštė": title.strip(),
+            "Nuoroda": url,
+            "Data": item["Data"],
+            "Pilnas_tekstas": (content or "").strip(),
+        })
+
+    vz_df = pd.DataFrame(items)
+
     vz_map = {}
-    imones = df_stat["Bendrovė"].dropna().unique()
-    for imone in imones:
+    for imone in companies:
         found = ""
         for _, row in vz_df.iterrows():
             if atitinka(imone, row.get("Antraštė", "")):
@@ -451,7 +636,6 @@ def vz_scrape_full(start_date, end_date, df_stat: pd.DataFrame, progress=None):
         vz_map[imone] = found
 
     return vz_map, vz_df
-
 
 def _safe_click(driver, by, selector, timeout=10):
     el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
