@@ -386,6 +386,46 @@ def scrape_crib_dom_lt(start_date: date, end_date: date, progress=None) -> pd.Da
 
 
 
+
+def _shorten_plain_text(text: str, max_len: int = 58) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip(" ,.;:-") + "..."
+
+
+def shorten_news_html(value, max_len: int = 58) -> str:
+    """
+    Trumpina naujienų antraštes pagrindinėse lentelėse, bet palieka nuorodas.
+
+    Svarbu: pilnas tekstas ir pilnos antraštės lieka df_visos / HTML skiltyje
+    „Visos naujienos“. Ši funkcija naudojama tik pagrindinių lentelių rodymui.
+    """
+    if value is None or pd.isna(value):
+        return ""
+
+    raw = str(value).strip()
+    if not raw:
+        return ""
+
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    out_lines = []
+
+    for line in lines:
+        # Jei eilutėje yra HTML nuoroda, sutrumpiname tik matomą tekstą.
+        href_match = re.search(r'href=["\']([^"\']+)["\']', line, flags=re.I)
+        text_no_html = re.sub(r"<[^>]+>", "", line).strip()
+        short_text = _shorten_plain_text(text_no_html, max_len=max_len)
+
+        if href_match:
+            href = href_match.group(1)
+            out_lines.append(f'<a href="{href}" target="_blank">{short_text}</a>')
+        else:
+            out_lines.append(short_text)
+
+    return "\n".join(out_lines)
+
+
 def _clean_article_text(text: str) -> str:
     text = re.sub(r"\r", "", text or "")
     text = re.sub(r"[ \t]+", " ", text)
@@ -998,6 +1038,14 @@ def render_lentele(df_: pd.DataFrame, caption: str):
         if c not in df_.columns:
             df_[c] = ""
     df_ = df_[cols].copy()
+
+    # Pagrindinėse lentelėse rodome sutrumpintas antraštes, kad naujienų
+    # stulpeliai neišplėstų visos lentelės. Pilni tekstai lieka skiltyje
+    # „Visos naujienos“ ir HTML ataskaitoje.
+    for news_col in ["Naujiena", "Verslo žinios"]:
+        if news_col in df_.columns:
+            df_[news_col] = df_[news_col].apply(lambda x: shorten_news_html(x, max_len=58))
+
     # Paliekame Pok.% kaip skaitinį stulpelį, kad Styler.apply galėtų patikimai spalvinti.
     # Rodymo formatavimas daromas žemiau per .format({"Pok.%": "{:.2f}"}).
     df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce")
@@ -1032,6 +1080,14 @@ def render_first_north(df_: pd.DataFrame, caption: str):
         if c not in df_.columns:
             df_[c] = ""
     df_ = df_[cols].copy()
+
+    # Pagrindinėse lentelėse rodome sutrumpintas antraštes, kad naujienų
+    # stulpeliai neišplėstų visos lentelės. Pilni tekstai lieka skiltyje
+    # „Visos naujienos“ ir HTML ataskaitoje.
+    for news_col in ["Naujiena", "Verslo žinios"]:
+        if news_col in df_.columns:
+            df_[news_col] = df_[news_col].apply(lambda x: shorten_news_html(x, max_len=58))
+
     # Paliekame Pok.% kaip skaitinį stulpelį, kad Styler.apply galėtų patikimai spalvinti.
     # Rodymo formatavimas daromas žemiau per .format({"Pok.%": "{:.2f}"}).
     df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce")
