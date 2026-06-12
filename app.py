@@ -608,7 +608,7 @@ with st.sidebar:
     vadovai_active = "active" if report_mode == "Vadovų sandoriai" else ""
     nav_html = f"""
         <div class="report-nav-title">
-            <div class="report-nav-icon">📊</div>
+            <div class="report-nav-icon">🏦</div>
             <div>Ataskaitos</div>
         </div>
         <div class="report-nav">
