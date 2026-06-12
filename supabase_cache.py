@@ -186,7 +186,9 @@ def log_scrape(source, date_from, date_to, status, records_found=0, error_messag
             raise RuntimeError(
                 f"Supabase log įrašymo klaida: {response.status_code} - {response.text}"
             )
-            def save_manager_transaction(row: dict):
+
+
+def save_manager_transaction(row: dict):
     url = _supabase_rest_url("manager_transactions")
 
     with _http_client() as client:
