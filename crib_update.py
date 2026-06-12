@@ -14,7 +14,8 @@ Logika:
 - eina nuo naujausiu CRIB puslapiu;
 - nuskaito pranesimus, atidaro detalius puslapius ir paima pilna teksta;
 - saugo i ta pacia Supabase lentele market_news per save_news_df(..., "crib");
-- dublikatai ignoruojami per unique_key logika supabase_cache.py;
+- jei pranesimo kategorija yra „Pranešimai apie vadovų sandorius“, papildomai nuskaito PDF priedus ir saugo i manager_transactions;
+- dublikatai ignoruojami per unique_key logika supabase_cache.py ir pdf_url manager_transactions lenteleje;
 - sustoja, kai keli puslapiai is eiles neirase nieko naujo, arba pasiekia max_pages.
 """
 
@@ -43,6 +44,13 @@ from selenium.common.exceptions import StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 
 from supabase_cache import save_news_df, load_news_df, log_scrape
+
+# Naudojame jau paruošta vadovų sandorių PDF nuskaitymo logiką.
+# Funkcija pati praleidžia PDF, kurie jau yra manager_transactions lentelėje.
+try:
+    from backfill_manager_transactions_from_crib import save_manager_transactions_from_crib_selenium
+except Exception:
+    save_manager_transactions_from_crib_selenium = None
 
 
 NEXT_BUTTON_HOST_ID = "pagination"
@@ -334,6 +342,69 @@ def make_news_label(row):
     return label
 
 
+
+
+def is_manager_transactions_category(value: str) -> bool:
+    text = str(value or "").lower()
+    return (
+        "pranešimai apie vadovų sandorius" in text
+        or "pranesimai apie vadovu sandorius" in text
+        or "notifications on transactions concluded by managers" in text
+    )
+
+
+def process_manager_transactions_for_records(driver, records, progress=None):
+    """
+    Iš naujai rastų CRIB pranešimų atrenka kategoriją
+    „Pranešimai apie vadovų sandorius“ ir į manager_transactions
+    įrašo visus PDF priedus.
+
+    Ši funkcija naudojama tik update_crib_news() metu, t. y. paspaudus
+    Streamlit mygtuką „Atnaujinti duomenis“.
+    """
+    stats = {
+        "manager_messages_processed": 0,
+        "manager_transactions_saved": 0,
+        "manager_transactions_errors": 0,
+    }
+
+    if not records:
+        return stats
+
+    if save_manager_transactions_from_crib_selenium is None:
+        _notify(
+            progress,
+            "Vadovų sandorių PDF modulis nerastas, todėl manager_transactions neatnaujinta.",
+        )
+        return stats
+
+    for r in records:
+        category = str(r.get("Kategorija") or "")
+        url = str(r.get("Nuoroda") or "").strip()
+        published_at = r.get("Published_dt")
+
+        if not url:
+            continue
+
+        if not is_manager_transactions_category(category):
+            continue
+
+        stats["manager_messages_processed"] += 1
+        _notify(progress, f"Nuskaitomi vadovų sandorių PDF: {url}")
+
+        try:
+            saved = save_manager_transactions_from_crib_selenium(
+                driver=driver,
+                crib_url=url,
+                published_at=published_at,
+            )
+            stats["manager_transactions_saved"] += int(saved or 0)
+        except Exception as exc:
+            stats["manager_transactions_errors"] += 1
+            _notify(progress, f"Vadovų sandorių PDF klaida: {exc}")
+
+    return stats
+
 def click_next_in_shadow_pagination(driver, host_id=NEXT_BUTTON_HOST_ID):
     js = f"""
     try {{
@@ -514,7 +585,7 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
     - detalius puslapius atidaro tik naujiems pranešimams, todėl atnaujinimas yra greitesnis.
 
     Returns:
-        dict su pages_processed, records_found, records_inserted, new_candidates.
+        dict su pages_processed, records_found, records_inserted, new_candidates, manager_transactions_saved.
     """
     existing_keys = load_existing_crib_keys()
 
@@ -522,6 +593,9 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
     total_found = 0
     total_inserted = 0
     total_new_candidates = 0
+    total_manager_messages_processed = 0
+    total_manager_transactions_saved = 0
+    total_manager_transactions_errors = 0
     page = 1
     reached_existing = False
 
@@ -589,6 +663,12 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
 
             found = len(df_page)
             inserted = 0
+            manager_stats = {
+                "manager_messages_processed": 0,
+                "manager_transactions_saved": 0,
+                "manager_transactions_errors": 0,
+            }
+
             if found > 0:
                 inserted = save_news_df(df_page, "crib")
                 try:
@@ -600,9 +680,21 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
                 for _, row in df_page.iterrows():
                     existing_keys.add(_make_existing_key_from_crib_row(row))
 
+                # Papildomas žingsnis: jei tarp naujų CRIB pranešimų yra
+                # „Pranešimai apie vadovų sandorius“, iškart nuskaitome jų PDF
+                # ir išsaugome manager_transactions lentelėje.
+                manager_stats = process_manager_transactions_for_records(
+                    driver=driver,
+                    records=records,
+                    progress=progress,
+                )
+
             total_found += len(rows_basic)
             total_new_candidates += found
             total_inserted += inserted
+            total_manager_messages_processed += manager_stats.get("manager_messages_processed", 0)
+            total_manager_transactions_saved += manager_stats.get("manager_transactions_saved", 0)
+            total_manager_transactions_errors += manager_stats.get("manager_transactions_errors", 0)
 
             # Jei šiame puslapyje jau pasiekėme pirmą DB esantį pranešimą, toliau neiname.
             if reached_existing:
@@ -625,6 +717,9 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
             "records_found": total_found,
             "records_inserted": total_inserted,
             "new_candidates": total_new_candidates,
+            "manager_messages_processed": total_manager_messages_processed,
+            "manager_transactions_saved": total_manager_transactions_saved,
+            "manager_transactions_errors": total_manager_transactions_errors,
         }
 
     except Exception as e:
