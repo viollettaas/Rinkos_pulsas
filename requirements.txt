@@ -9,3 +9,5 @@ urllib3
 supabase
 bs4 
 pdfplumber
+beautifulsoup4
+httpx
