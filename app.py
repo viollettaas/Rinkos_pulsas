@@ -10,6 +10,7 @@ from rinkos_logika import (
 )
 from emitentu_atranka import generate_emitentu_ataskaita
 from crib_update import update_crib_news, get_latest_crib_news_date
+from vadovu_sandoriai import show_manager_transactions_page
 
 
 st.set_page_config(
@@ -594,11 +595,17 @@ report_param = st.query_params.get("report", "rinkos")
 if isinstance(report_param, list):
     report_param = report_param[0] if report_param else "rinkos"
 
-report_mode = "Emitentų atranka" if report_param == "emitentai" else "Rinkos apžvalga"
+if report_param == "emitentai":
+    report_mode = "Emitentų atranka"
+elif report_param == "vadovai":
+    report_mode = "Vadovų sandoriai"
+else:
+    report_mode = "Rinkos apžvalga"
 
 with st.sidebar:
     rinkos_active = "active" if report_mode == "Rinkos apžvalga" else ""
     emitentai_active = "active" if report_mode == "Emitentų atranka" else ""
+    vadovai_active = "active" if report_mode == "Vadovų sandoriai" else ""
     nav_html = f"""
         <div class="report-nav-title">
             <div class="report-nav-icon">📊</div>
@@ -615,6 +622,12 @@ with st.sidebar:
                 <div class="report-nav-item {emitentai_active}">
                     <div class="nav-icon">👥</div>
                     <div>Emitentų atranka</div>
+                </div>
+            </a>
+            <a href="?report=vadovai" target="_self">
+                <div class="report-nav-item {vadovai_active}">
+                    <div class="nav-icon">👔</div>
+                    <div>Vadovų sandoriai</div>
                 </div>
             </a>
         </div>
@@ -674,6 +687,14 @@ with st.sidebar:
             st.error("Nepavyko atnaujinti CRIB naujienų bazės.")
             st.exception(exc)
 
+
+
+# ------------------------------------------------------------
+# VADOVŲ SANDORIAI: atskira ataskaita, naudojanti Supabase manager_transactions lentelę
+# ------------------------------------------------------------
+if report_mode == "Vadovų sandoriai":
+    show_manager_transactions_page()
+    st.stop()
 
 
 # ------------------------------------------------------------
