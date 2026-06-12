@@ -8,3 +8,4 @@ numpy
 urllib3
 supabase
 bs4 
+pdfplumber
