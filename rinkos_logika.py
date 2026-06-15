@@ -69,13 +69,40 @@ def report_caption_from_filename(filename: str) -> str:
 
 
 def normalize(text: str) -> str:
+    """
+    Normalizuoja bendrovių pavadinimus naujienų priskyrimui.
+
+    Pataisyta First North logikai:
+    - panaikinamos lietuviškos raidės;
+    - pašalinamos teisinės formos ir dažni bendriniai žodžiai;
+    - suvienodinami tarpai ir skyryba.
+    """
     if not isinstance(text, str):
         return ""
+
     text = text.lower()
-    text = re.sub(r"(group|grupė|bankas)", "", text)
-    text = re.sub(r"\b(uab|ab|as)\b", "", text)
-    text = re.sub(r"[^\w\s]", "", text)
+
+    replacements = {
+        "ą": "a",
+        "č": "c",
+        "ę": "e",
+        "ė": "e",
+        "į": "i",
+        "š": "s",
+        "ų": "u",
+        "ū": "u",
+        "ž": "z",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"\b(group|grupe|bankas)\b", " ", text)
+    text = re.sub(r"\b(uab|ab|as|ou|asa|plc|hf|sia)\b", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
     return text.strip()
+
 
 
 def atitinka(pavadinimas: str, antraste: str) -> bool:
@@ -936,13 +963,43 @@ def _to_num(series: pd.Series) -> pd.Series:
 
 
 def filter_traded_or_has_news(df_fn: pd.DataFrame) -> pd.DataFrame:
+    """
+    First North lentelėje paliekame įrašą, jei:
+    - buvo prekyba; arba
+    - yra CRIB naujiena; arba
+    - yra VŽ naujiena; arba
+    - yra Nasdaq pranešimai.
+    """
+    if df_fn is None or df_fn.empty:
+        return df_fn
+
     apyv = _to_num(df_fn.get("Apyvarta", pd.Series([0] * len(df_fn))))
     sand = _to_num(df_fn.get("Sand.", pd.Series([0] * len(df_fn))))
     kiek = _to_num(df_fn.get("Kiekis", pd.Series([0] * len(df_fn))))
     traded = (apyv > 0) | (sand > 0) | (kiek > 0)
-    news_txt = df_fn.get("Nasdaq pranešimai", pd.Series([""] * len(df_fn))).fillna("").astype(str).str.strip()
-    has_news = news_txt != ""
+
+    naujiena_txt = (
+        df_fn.get("Naujiena", pd.Series([""] * len(df_fn)))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    vz_txt = (
+        df_fn.get("Verslo žinios", pd.Series([""] * len(df_fn)))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    nasdaq_txt = (
+        df_fn.get("Nasdaq pranešimai", pd.Series([""] * len(df_fn)))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    has_news = (naujiena_txt != "") | (vz_txt != "") | (nasdaq_txt != "")
     return df_fn[traded | has_news].copy()
+
 
 
 def spalvinti_pokycio_abs_gradienta(col):
@@ -1124,12 +1181,136 @@ def ivertink_izvalga(row):
 
 
 def sujungti_naujienas_keli(df_imones: pd.DataFrame, df_news: pd.DataFrame) -> pd.DataFrame:
+    """
+    Priskiria CRIB naujienas bendrovėms.
+
+    Pataisyta First North problema:
+    - jei iš Supabase atėjęs Bendrovė_norm tuščias, jis perskaičiuojamas iš Bendrovė;
+    - lyginama ne tik pagal Bendrovė_norm, bet ir pagal antraštę / HTML tekstą;
+    - taikomas lankstesnis fuzzy matching, nes First North emitentų pavadinimai
+      statistikos faile ir CRIB pranešimuose dažnai skiriasi.
+    """
     df_out = df_imones.copy()
+
+    if "Bendrovė" not in df_out.columns:
+        df_out["Naujiena"] = ""
+        df_out["Kategorija"] = ""
+        return df_out
+
     df_out["Bendrovė_norm"] = df_out["Bendrovė"].astype(str).map(normalize)
+
     if df_news is None or df_news.empty:
         df_out["Naujiena"] = ""
         df_out["Kategorija"] = ""
         return df_out
+
+    news = df_news.copy()
+
+    for col in ["Bendrovė", "Bendrovė_norm", "Kategorija", "Naujiena", "Pilna_antraštė", "Pilnas_tekstas", "Nuoroda"]:
+        if col not in news.columns:
+            news[col] = ""
+
+    news["Bendrovė"] = news["Bendrovė"].fillna("").astype(str).str.strip()
+    news["Bendrovė_norm"] = news["Bendrovė_norm"].fillna("").astype(str).str.strip()
+
+    # Svarbu seniems DB įrašams: jei company_norm tuščias, perskaičiuojame.
+    empty_norm = news["Bendrovė_norm"].eq("")
+    news.loc[empty_norm, "Bendrovė_norm"] = (
+        news.loc[empty_norm, "Bendrovė"]
+        .astype(str)
+        .map(normalize)
+    )
+
+    # Papildomi tekstai atitikimui pagal antraštę, jei bendrovės pavadinimas skiriasi.
+    news["__match_text"] = (
+        news["Bendrovė"].fillna("").astype(str) + " " +
+        news["Bendrovė_norm"].fillna("").astype(str) + " " +
+        news["Naujiena"].fillna("").astype(str) + " " +
+        news["Pilna_antraštė"].fillna("").astype(str)
+    )
+
+    naujienos_list = []
+    kategorijos_list = []
+
+    for _, row in df_out.iterrows():
+        bendrove = str(row.get("Bendrovė", "")).strip()
+        key = normalize(bendrove)
+
+        matched_idx = []
+
+        for idx, n in news.iterrows():
+            news_company = str(n.get("Bendrovė", "")).strip()
+            news_key = normalize(news_company) or normalize(str(n.get("Bendrovė_norm", "")))
+            match_text = str(n.get("__match_text", ""))
+            match_text_norm = normalize(match_text)
+
+            match = False
+
+            if key and news_key:
+                if key in news_key or news_key in key:
+                    match = True
+                elif SequenceMatcher(None, key, news_key).ratio() >= 0.68:
+                    match = True
+
+            # Papildomas First North saugiklis: kai CRIB bendrovės laukelis / normalizacija nesutampa,
+            # tikriname, ar įmonės pavadinimas sutampa su antrašte ar nuorodos tekstu.
+            if not match and bendrove and match_text:
+                if atitinka(bendrove, match_text):
+                    match = True
+                elif key and match_text_norm and (key in match_text_norm):
+                    match = True
+
+            if match:
+                matched_idx.append(idx)
+
+        if matched_idx:
+            subset = news.loc[matched_idx].copy()
+
+            # Jei yra data, rodome naujausius viršuje.
+            if "Published_dt" in subset.columns:
+                subset["__dt_sort"] = pd.to_datetime(subset["Published_dt"], errors="coerce")
+                subset = subset.sort_values("__dt_sort", ascending=False)
+
+            joined_news_items = []
+            seen_news = set()
+
+            for _, n in subset.iterrows():
+                item = str(n.get("Naujiena", "")).strip()
+                if not item:
+                    title = str(n.get("Pilna_antraštė", "")).strip()
+                    url = str(n.get("Nuoroda", "")).strip()
+                    if title and url:
+                        item = f'<a href="{url}" target="_blank">{title}</a>'
+                    elif title:
+                        item = title
+
+                dedup_key = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", item)).strip().lower()
+                if item and dedup_key not in seen_news:
+                    seen_news.add(dedup_key)
+                    joined_news_items.append(item)
+
+            joined_news = "\n".join(joined_news_items)
+
+            seen_cats = set()
+            ordered_cats = []
+            for c in subset["Kategorija"].fillna("").tolist():
+                c = str(c).strip()
+                if c and c not in seen_cats:
+                    seen_cats.add(c)
+                    ordered_cats.append(c)
+            joined_cats = ", ".join(ordered_cats)
+
+        else:
+            joined_news = ""
+            joined_cats = ""
+
+        naujienos_list.append(joined_news)
+        kategorijos_list.append(joined_cats)
+
+    df_out["Naujiena"] = naujienos_list
+    df_out["Kategorija"] = kategorijos_list
+    return df_out
+
 
     news_keys = df_news["Bendrovė_norm"].dropna().unique().tolist()
     naujienos_list, kategorijos_list = [], []
