@@ -24,6 +24,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.styles.stylesheet")
 
 import pandas as pd
+from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
@@ -867,17 +868,28 @@ def _nasdaq_dt(row) -> pd.Timestamp:
     return pd.to_datetime(s, errors="coerce")
 
 
+
 def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, progress=None) -> pd.DataFrame:
     """
-    Atskirai scrapina Nasdaq Baltic naujienų puslapį First North daliai.
+    Nuskaito Nasdaq Baltic naujienas iš https://nasdaqbaltic.com/statistics/lt/news.
 
-    Svarbu:
-    - naudojamas https://nasdaqbaltic.com/statistics/lt/news;
-    - paliekamos tik tos eilutės, kurių stulpelis „Įmonė“ yra Nasdaq Vilnius;
-    - tai nėra CRIB cache dalis, nes čia reikalingas būtent Nasdaq Baltic naujienų sąrašas.
+    Naudojama First North daliai:
+    - nustatomas laikotarpis;
+    - pažymima Vilniaus rinka;
+    - paliekami tik Nasdaq Vilnius pranešimai;
+    - paimama antraštė, nuoroda ir, jei įmanoma, pilnas tekstas.
     """
+    empty_cols = [
+        "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda",
+        "Nasdaq_bendrovė", "Birža", "Kalba",
+        "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
+    ]
+
     if progress:
-        progress("Nasdaq Baltic: renkami tik Nasdaq Vilnius pranešimai First North daliai...")
+        progress("Nasdaq Baltic: renkami Nasdaq Vilnius pranešimai...")
+
+    start_ts = pd.to_datetime(start_date)
+    end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
     driver = _init_driver()
     try:
@@ -887,48 +899,55 @@ def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, 
         )
         _try_accept_cookies(driver)
 
-        # Bandome pažymėti Vilniaus filtrą, bet papildomai vis tiek filtruojame
-        # pagal stulpelį „Įmonė“ == Nasdaq Vilnius, nes puslapis gali grąžinti
-        # skirtingų kalbų / rinkų eilutes.
         ok_vln = _tick_vilnius_checkbox(driver)
         if progress and not ok_vln:
-            progress("Nasdaq: nepavyko patikimai pažymėti 'Vilnius' filtro, taikomas papildomas filtravimas pagal įmonę.")
+            progress("Nasdaq: nepavyko patikimai pažymėti 'Vilnius' filtro, papildomai filtruojama pagal lentelę.")
 
         _set_date_input(driver, "Nuo", start_date.strftime("%Y-%m-%d"))
         _set_date_input(driver, "Iki", end_date.strftime("%Y-%m-%d"))
         _click_search(driver)
-        time.sleep(1.2)
+        time.sleep(1.5)
 
         items = _parse_news_rows(driver)
         df_n = pd.DataFrame(items)
-
-        base_cols = [
-            "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda",
-            "Nasdaq_bendrovė", "Birža", "Kalba",
-            "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
-        ]
-
         if df_n.empty:
-            return pd.DataFrame(columns=base_cols)
+            return pd.DataFrame(columns=empty_cols)
 
-        # Paliekame tik Nasdaq Vilnius eilutes.
-        df_n["Nasdaq_bendrovė"] = df_n["Nasdaq_bendrovė"].fillna("").astype(str).str.strip()
-        df_n = df_n[
-            df_n["Nasdaq_bendrovė"].str.contains("Nasdaq Vilnius", case=False, na=False)
-        ].copy()
-
-        if df_n.empty:
-            return pd.DataFrame(columns=base_cols)
+        for col in empty_cols:
+            if col not in df_n.columns:
+                df_n[col] = ""
 
         df_n["__dt"] = df_n.apply(_nasdaq_dt, axis=1)
+        df_n["__dt"] = pd.to_datetime(df_n["__dt"], errors="coerce")
+
         df_n = df_n[
             df_n["__dt"].notna()
-            & (df_n["__dt"].dt.date >= start_date)
-            & (df_n["__dt"].dt.date <= end_date)
+            & (df_n["__dt"] >= start_ts)
+            & (df_n["__dt"] <= end_ts)
         ].copy()
 
         if df_n.empty:
-            return pd.DataFrame(columns=base_cols)
+            return pd.DataFrame(columns=empty_cols)
+
+        # Tik Nasdaq Vilnius. Puslapyje dažniausiai ši reikšmė būna stulpelyje „Įmonė“.
+        company_txt = df_n["Nasdaq_bendrovė"].fillna("").astype(str).str.lower()
+        exchange_txt = df_n["Birža"].fillna("").astype(str).str.upper()
+        title_txt = df_n["Nasdaq_antraštė"].fillna("").astype(str).str.lower()
+
+        mask_vilnius = (
+            company_txt.str.contains("nasdaq vilnius", na=False)
+            | company_txt.str.contains("vilnius", na=False)
+            | exchange_txt.eq("VLN")
+            | title_txt.str.contains("nasdaq vilnius", na=False)
+        )
+
+        df_n = df_n[mask_vilnius].copy()
+
+        if df_n.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        if progress:
+            progress(f"Nasdaq Baltic: rasta Nasdaq Vilnius pranešimų: {len(df_n)}")
 
         cache = {}
         urls = df_n["Nasdaq_nuoroda"].fillna("").astype(str).unique().tolist()
@@ -953,153 +972,44 @@ def scrape_nasdaq_vilnius_news_with_full_text(start_date: date, end_date: date, 
         df_n["Nasdaq_pilna_antraštė"] = df_n.apply(_get_cached_title, axis=1)
         df_n["Nasdaq_pilnas_tekstas"] = df_n.apply(_get_cached_text, axis=1)
 
-        return df_n[base_cols].reset_index(drop=True)
-
+        return df_n[empty_cols].sort_values("__dt", ascending=False).reset_index(drop=True)
     finally:
         driver.quit()
 
-
-def build_first_north_market_news_html(df_nasdaq_news: pd.DataFrame, max_items=10) -> str:
-    """
-    Sudeda bendras First North / Nasdaq Vilnius naujienas į vieną HTML tekstą.
-    Naudojama First North lentelėje, kai naujiena yra rinkos lygmens ir nėra
-    priskirta konkrečiam emitentui.
-    """
-    if df_nasdaq_news is None or df_nasdaq_news.empty:
-        return ""
-
-    news = df_nasdaq_news.copy()
-    for col in ["Nasdaq_antraštė", "Nasdaq_pilna_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė"]:
-        if col not in news.columns:
-            news[col] = ""
-
-    news = news[
-        news["Nasdaq_bendrovė"].fillna("").astype(str).str.contains("Nasdaq Vilnius", case=False, na=False)
-    ].copy()
-
-    if news.empty:
-        return ""
-
-    title_text = (
-        news["Nasdaq_antraštė"].fillna("").astype(str)
-        + " "
-        + news["Nasdaq_pilna_antraštė"].fillna("").astype(str)
-    )
-
-    news = news[
-        title_text.str.contains("First North", case=False, na=False)
-    ].copy()
-
-    if news.empty:
-        return ""
-
-    if "__dt" in news.columns:
-        news = news.sort_values("__dt", ascending=False)
-
-    hits = []
-    seen = set()
-
-    for _, r in news.iterrows():
-        title = str(r.get("Nasdaq_pilna_antraštė", "") or r.get("Nasdaq_antraštė", "")).strip()
-        url = str(r.get("Nasdaq_nuoroda", "") or "").strip()
-        if not title:
-            continue
-
-        key = (url or normalize(title)).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if url:
-            hits.append(f'<a href="{url}" target="_blank">{title}</a>')
-        else:
-            hits.append(title)
-
-        if len(hits) >= max_items:
-            break
-
-    return "\n".join(hits)
-
-
 def build_nasdaq_map_for_companies(df_first_north: pd.DataFrame, df_nasdaq_news: pd.DataFrame, max_items=5) -> dict:
-    """
-    Sukuria First North emitentas -> Nasdaq Baltic pranešimai žemėlapį.
-
-    Šaltinis: Nasdaq Baltic naujienų puslapis.
-    Filtras: tik eilutės, kurių „Įmonė“ yra Nasdaq Vilnius.
-    """
     out = {}
-
-    if df_first_north is None or df_first_north.empty:
-        return out
-
-    for b in df_first_north["Bendrovė"].dropna().unique():
-        out[b] = ""
-
     if df_nasdaq_news is None or df_nasdaq_news.empty:
+        for b in df_first_north["Bendrovė"].dropna().unique():
+            out[b] = ""
         return out
 
     news = df_nasdaq_news.copy()
-
-    for col in [
-        "Nasdaq_antraštė", "Nasdaq_pilna_antraštė", "Nasdaq_nuoroda",
-        "Nasdaq_bendrovė", "Nasdaq_pilnas_tekstas",
-    ]:
-        if col not in news.columns:
-            news[col] = ""
-
-    news = news[
-        news["Nasdaq_bendrovė"].fillna("").astype(str).str.contains("Nasdaq Vilnius", case=False, na=False)
-    ].copy()
-
-    if news.empty:
-        return out
-
-    news["__title"] = (
-        news["Nasdaq_antraštė"].fillna("").astype(str)
-        + " "
-        + news["Nasdaq_pilna_antraštė"].fillna("").astype(str)
-    ).str.strip()
-
-    news["__full_text"] = (
-        news["__title"]
-        + " "
-        + news["Nasdaq_pilnas_tekstas"].fillna("").astype(str).str[:1000]
-    )
+    news["__title"] = news["Nasdaq_antraštė"].fillna("").astype(str)
+    news["__company"] = news["Nasdaq_bendrovė"].fillna("").astype(str)
 
     for bendrove in df_first_north["Bendrovė"].dropna().unique():
         hits = []
-        seen = set()
-
         for _, r in news.iterrows():
-            title = str(r.get("Nasdaq_pilna_antraštė", "") or r.get("Nasdaq_antraštė", "")).strip()
-            full_text = str(r.get("__full_text", "")).strip()
-            url = str(r.get("Nasdaq_nuoroda", "") or "").strip()
+            title = r["__title"]
+            comp = r["__company"]
+            if atitinka(bendrove, title) or atitinka(bendrove, comp):
+                url = (r.get("Nasdaq_nuoroda") or "").strip()
+                t = (r.get("Nasdaq_antraštė") or "").strip()
+                if not t:
+                    continue
+                if url:
+                    hits.append(f'<a href="{url}" target="_blank">{t}</a>')
+                else:
+                    hits.append(t)
 
-            if not title:
-                continue
-
-            # Konkrečiam emitentui priskiriame tik tada, kai antraštė / tekstas
-            # panašus į bendrovės pavadinimą. Bendros First North naujienos
-            # tvarkomos atskirai per build_first_north_market_news_html().
-            if not (atitinka(bendrove, title) or atitinka(bendrove, full_text)):
-                continue
-
-            key = (url or normalize(title)).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-
-            if url:
-                hits.append(f'<a href="{url}" target="_blank">{title}</a>')
-            else:
-                hits.append(title)
-
-            if len(hits) >= max_items:
-                break
-
-        out[bendrove] = "\n".join(hits)
-
+        seen = set()
+        hits_unique = []
+        for h in hits:
+            key = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", h)).strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                hits_unique.append(h)
+        out[bendrove] = "\n".join(hits_unique[:max_items])
     return out
 
 
@@ -1107,45 +1017,32 @@ def _to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0)
 
 
+
 def filter_traded_or_has_news(df_fn: pd.DataFrame) -> pd.DataFrame:
-    """
-    First North lentelėje paliekame įrašą, jei:
-    - buvo prekyba; arba
-    - yra CRIB naujiena; arba
-    - yra VŽ naujiena; arba
-    - yra Nasdaq pranešimai.
-    """
     if df_fn is None or df_fn.empty:
         return df_fn
 
     apyv = _to_num(df_fn.get("Apyvarta", pd.Series([0] * len(df_fn))))
     sand = _to_num(df_fn.get("Sand.", pd.Series([0] * len(df_fn))))
     kiek = _to_num(df_fn.get("Kiekis", pd.Series([0] * len(df_fn))))
+
     traded = (apyv > 0) | (sand > 0) | (kiek > 0)
 
     naujiena_txt = (
         df_fn.get("Naujiena", pd.Series([""] * len(df_fn)))
-        .fillna("")
-        .astype(str)
-        .str.strip()
+        .fillna("").astype(str).str.strip()
     )
     vz_txt = (
         df_fn.get("Verslo žinios", pd.Series([""] * len(df_fn)))
-        .fillna("")
-        .astype(str)
-        .str.strip()
+        .fillna("").astype(str).str.strip()
     )
     nasdaq_txt = (
         df_fn.get("Nasdaq pranešimai", pd.Series([""] * len(df_fn)))
-        .fillna("")
-        .astype(str)
-        .str.strip()
+        .fillna("").astype(str).str.strip()
     )
 
     has_news = (naujiena_txt != "") | (vz_txt != "") | (nasdaq_txt != "")
     return df_fn[traded | has_news].copy()
-
-
 
 def spalvinti_pokycio_abs_gradienta(col):
     """
@@ -1244,7 +1141,7 @@ def render_lentele(df_: pd.DataFrame, caption: str):
     # Pagrindinėse lentelėse rodome sutrumpintas antraštes, kad naujienų
     # stulpeliai neišplėstų visos lentelės. Pilni tekstai lieka skiltyje
     # „Visos naujienos“ ir HTML ataskaitoje.
-    for news_col in ["Naujiena", "Nasdaq pranešimai", "Verslo žinios"]:
+    for news_col in ["Naujiena", "Verslo žinios"]:
         if news_col in df_.columns:
             df_[news_col] = df_[news_col].apply(lambda x: shorten_news_html(x, max_len=58))
 
@@ -1270,28 +1167,24 @@ def render_lentele(df_: pd.DataFrame, caption: str):
     )
 
 
+
 def render_first_north(df_: pd.DataFrame, caption: str):
     df_ = df_.copy()
     if "Pok.%" in df_.columns:
         df_ = df_.sort_values(by="Pok.%", key=lambda x: pd.to_numeric(x, errors="coerce").abs(), ascending=False)
     cols = [
         "Trumpinys", "Bendrovė", "Atid.", "Paskutinė kaina", "Pok.%", "Apyvarta", "Kiekis",
-        "Sand.", "Sąrašas/segmentas", "Naujiena", "Nasdaq pranešimai", "Verslo žinios",
+        "Sand.", "Sąrašas/segmentas", "Nasdaq pranešimai", "Naujiena", "Verslo žinios",
     ]
     for c in cols:
         if c not in df_.columns:
             df_[c] = ""
     df_ = df_[cols].copy()
 
-    # Pagrindinėse lentelėse rodome sutrumpintas antraštes, kad naujienų
-    # stulpeliai neišplėstų visos lentelės. Pilni tekstai lieka skiltyje
-    # „Visos naujienos“ ir HTML ataskaitoje.
-    for news_col in ["Naujiena", "Nasdaq pranešimai", "Verslo žinios"]:
+    for news_col in ["Nasdaq pranešimai", "Naujiena", "Verslo žinios"]:
         if news_col in df_.columns:
             df_[news_col] = df_[news_col].apply(lambda x: shorten_news_html(x, max_len=58))
 
-    # Paliekame Pok.% kaip skaitinį stulpelį, kad Styler.apply galėtų patikimai spalvinti.
-    # Rodymo formatavimas daromas žemiau per .format({"Pok.%": "{:.2f}"}).
     df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce")
 
     return (
@@ -1307,9 +1200,8 @@ def render_first_north(df_: pd.DataFrame, caption: str):
         .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Pok.%": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
         .apply(spalvinti_pokycio_abs_gradienta, subset=["Pok.%"])
         .hide(axis="index")
-        .set_properties(subset=["Naujiena", "Nasdaq pranešimai", "Verslo žinios"], **{"white-space": "pre-line"})
+        .set_properties(subset=["Nasdaq pranešimai", "Naujiena", "Verslo žinios"], **{"white-space": "pre-line"})
     )
-
 
 def ivertink_izvalga(row):
     if abs(row.get("Pok.%", 0)) > 3 and row.get("Apyvarta", 0) > 100000 and row.get("Kiekis", 0) > 20000:
@@ -1698,8 +1590,9 @@ def _source_has_recent_successful_scrape(source: str, start_date: date, end_date
         return False
 
 
+
 def _normalize_cached_news_columns(df_cached: pd.DataFrame, source: str) -> pd.DataFrame:
-    """Supabase stulpelius paverčia į seną struktūrą, kurios laukia ataskaitos logika."""
+    """Supabase stulpelius paverčia į struktūrą, kurios laukia ataskaitos logika."""
     if df_cached is None or df_cached.empty:
         if source == "crib":
             return pd.DataFrame(columns=[
@@ -1708,6 +1601,11 @@ def _normalize_cached_news_columns(df_cached: pd.DataFrame, source: str) -> pd.D
             ])
         if source == "vz":
             return pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+        if source == "nasdaq":
+            return pd.DataFrame(columns=[
+                "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
+                "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
+            ])
         return pd.DataFrame()
 
     df = df_cached.copy()
@@ -1746,8 +1644,28 @@ def _normalize_cached_news_columns(df_cached: pd.DataFrame, source: str) -> pd.D
         df["Data"] = pd.to_datetime(df.get("Data"), errors="coerce").dt.date
         return df
 
-    return df
+    if source == "nasdaq" and "source" in df.columns:
+        df = df.rename(columns={
+            "company": "Nasdaq_bendrovė",
+            "category": "Kategorija",
+            "title": "Nasdaq_pilna_antraštė",
+            "url": "Nasdaq_nuoroda",
+            "published_at": "__dt",
+            "content": "Nasdaq_pilnas_tekstas",
+        })
+        df["__dt"] = pd.to_datetime(df.get("__dt"), errors="coerce")
+        df["Nasdaq_antraštė"] = df.get("Nasdaq_pilna_antraštė", "").fillna("").astype(str)
+        df["Nasdaq_bendrovė"] = df.get("Nasdaq_bendrovė", "").fillna("").astype(str)
+        df["Diena"] = df["__dt"].dt.strftime("%Y-%m-%d").fillna("")
+        df["Laikas"] = df["__dt"].dt.strftime("%H:%M").fillna("")
+        df["Birža"] = "VLN"
+        df["Kalba"] = ""
+        return df[[
+            "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
+            "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
+        ]]
 
+    return df
 
 def _load_cached_news_normalized(source: str, start_date: date, end_date: date) -> pd.DataFrame:
     cached = load_news_df(source, start_date, end_date)
@@ -1775,6 +1693,14 @@ def _merge_and_dedup_news(existing: pd.DataFrame, fresh: pd.DataFrame, source: s
         if "Data" in out.columns:
             out["Data"] = pd.to_datetime(out["Data"], errors="coerce").dt.date
             out = out.sort_values("Data", ascending=False)
+    elif source == "nasdaq":
+        if "Nasdaq_nuoroda" in out.columns:
+            out = out.drop_duplicates(subset=["Nasdaq_nuoroda"], keep="last")
+        else:
+            out = out.drop_duplicates()
+        if "__dt" in out.columns:
+            out["__dt"] = pd.to_datetime(out["__dt"], errors="coerce")
+            out = out.sort_values("__dt", ascending=False)
     return out.reset_index(drop=True)
 
 
@@ -1933,6 +1859,7 @@ def build_vz_map_from_df(vz_df: pd.DataFrame, df_stat: pd.DataFrame) -> dict:
         vz_map[imone] = found
     return vz_map
 
+
 def generate_report(excel_file, filename: str, start_date: date = None, end_date: date = None, progress=None) -> dict:
     if progress:
         progress("Statistics: nuskaitomas Excel failas...")
@@ -1949,13 +1876,11 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
             "arba naudokite failo pavadinimą su YYYYMMDD_YYYYMMDD."
         )
 
-    # Antraštė visada pagal realiai pasirinktą / perduotą laikotarpį.
     caption = f"Rinkos apžvalga ({start_date} – {end_date})"
 
     if progress:
         progress("Tikrinama Supabase naujienų bazė...")
 
-    # CRIB = Nasdaq / emitentų pranešimai iš CRIB. Naudojame DB cache ir scrapiname tik trūkstamą dalį.
     df_news = get_news_with_supabase_cache(
         "crib",
         start_date,
@@ -1964,7 +1889,6 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
         progress=progress,
     )
 
-    # VŽ straipsniai. Taip pat naudojame DB cache ir scrapiname tik trūkstamą dalį.
     vz_df = get_news_with_supabase_cache(
         "vz",
         start_date,
@@ -1975,11 +1899,12 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     )
     vz_map = build_vz_map_from_df(vz_df, df)
 
-    # First North daliai papildomai naudojame Nasdaq Baltic naujienų puslapį,
-    # nes First North rinkos pranešimai ten matomi pagal „Įmonė“ = Nasdaq Vilnius.
-    df_nasdaq = scrape_nasdaq_vilnius_news_with_full_text(
+    # First North pranešimai imami iš Nasdaq Baltic News puslapio ir saugomi Supabase kaip source='nasdaq'.
+    df_nasdaq = get_news_with_supabase_cache(
+        "nasdaq",
         start_date,
         end_date,
+        scrape_nasdaq_vilnius_news_with_full_text,
         progress=progress,
     )
 
@@ -1989,7 +1914,6 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df_akcijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Akcijos"])].copy()
     df_obligacijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Obligacijos"])].copy()
 
-    # Visose pagrindinėse lentelėse rodome CRIB ir VŽ.
     df_akcijos = sujungti_naujienas_keli(df_akcijos, df_news)
     df_obligacijos = sujungti_naujienas_keli(df_obligacijos, df_news)
     df_obligacijos = df_obligacijos[df_obligacijos["Naujiena"] != ""]
@@ -2004,38 +1928,28 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
         df["Sąrašas/segmentas"].astype(str).str.contains("First North", case=False, na=False)
     ].copy()
 
-    # CRIB pranešimai, jeigu jų yra pagal emitento pavadinimą.
     df_first_north = sujungti_naujienas_keli(df_first_north, df_news)
-
-    # VŽ pranešimai.
     df_first_north["Verslo žinios"] = df_first_north["Bendrovė"].map(vz_map).fillna("")
 
-    # Nasdaq Baltic naujienos First North daliai: tik „Nasdaq Vilnius“ eilutės.
-    nasdaq_map = build_nasdaq_map_for_companies(df_first_north, df_nasdaq)
-    first_north_market_news = build_first_north_market_news_html(df_nasdaq)
-
+    nasdaq_map = build_nasdaq_map_for_companies(
+        df_first_north,
+        df_nasdaq,
+    )
     df_first_north["Nasdaq pranešimai"] = df_first_north["Bendrovė"].map(nasdaq_map).fillna("")
-
-    # Jei yra rinkos lygmens First North pranešimas iš Nasdaq Vilnius, rodome jį
-    # tiems First North instrumentams, kuriems nėra konkretaus emitento pranešimo.
-    if first_north_market_news:
-        empty_nasdaq = df_first_north["Nasdaq pranešimai"].fillna("").astype(str).str.strip().eq("")
-        df_first_north.loc[empty_nasdaq, "Nasdaq pranešimai"] = first_north_market_news
 
     df_first_north = filter_traded_or_has_news(df_first_north)
 
-    # Bendra visų naujienų lentelė: CRIB + VŽ. Atskiro Nasdaq naujienų šaltinio nebėra.
     df_visos = sudeti_visas_naujienas_distinct(df, df_news, vz_df, df_nasdaq)
 
     styled_akcijos = render_lentele(df_akcijos, caption)
     styled_obligacijos = render_lentele(df_obligacijos, "Baltijos skolos VP sąrašas (obligacijos)")
     styled_first_north = render_first_north(
         df_first_north,
-        f"First North (prekiauta arba yra CRIB / VŽ naujienų) ({start_date} – {end_date})",
+        f"First North (prekiauta arba yra Nasdaq Vilnius / CRIB / VŽ naujienų) ({start_date} – {end_date})",
     )
     styled_visos = render_visos_naujienos(
         df_visos,
-        "Visos skirtingos naujienos (CRIB + VŽ, pilnas tekstas)",
+        "Visos skirtingos naujienos (CRIB + VŽ + Nasdaq Vilnius, pilnas tekstas)",
     )
 
     html = build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos)
@@ -2057,7 +1971,6 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
         "styled_visos": styled_visos,
         "html": html,
     }
-
 
 def download_nasdaq_statistics_excel(start_date: date, end_date: date, download_dir="downloads", progress=None):
     """
