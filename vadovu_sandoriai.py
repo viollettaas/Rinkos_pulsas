@@ -9,18 +9,11 @@ import streamlit as st
 from supabase_cache import load_manager_transactions_df, load_crib_news_df
 
 
-# ============================================================
-# DPL / UŽDAROJO LAIKOTARPIO LOGIKA
-# ============================================================
-
 ANNUAL_PATTERNS = [
     r"\bmetin(?:ė|e|is|io|ių|ės)\b",
-    r"\bmetin(?:is|ė)\s+pranešim",
-    r"\bmetin(?:ės|ė|iai|iu?)\s+finansin",
-    r"\baudituot",
-    r"\baudited\b",
     r"\bannual\s+report\b",
-    r"\byear[- ]end\b",
+    r"\baudited\b",
+    r"\baudituot",
 ]
 
 HALF_YEAR_PATTERNS = [
@@ -28,9 +21,7 @@ HALF_YEAR_PATTERNS = [
     r"\bšešių\s+m[ėe]nesių\b",
     r"\bpusme(?:čio|tis|tį|čiui)\b",
     r"\bhalf[- ]year\b",
-    r"\bhalf[- ]yearly\b",
     r"\bsemi[- ]annual\b",
-    r"\binterim\s+report\b",
     r"\b6\s*months\b",
     r"\bsix\s+months\b",
 ]
@@ -46,8 +37,6 @@ EXCLUDE_PATTERNS = [
     r"\bpreliminar",
     r"\bprognoz",
     r"\bdividend",
-    r"\bšaukia\b",
-    r"\bsušauk",
 ]
 
 
@@ -62,53 +51,64 @@ def _matches_any(text: str, patterns: list[str]) -> bool:
 def _classify_financial_report(row) -> str:
     category = _norm_text(row.get("category", ""))
     title = _norm_text(row.get("title", ""))
-
     text = f"{category} {title}"
 
     if _matches_any(text, EXCLUDE_PATTERNS):
         return ""
 
-    is_annual_category = "metin" in category
-    is_interim_category = "tarpin" in category
-
-    if is_annual_category and _matches_any(text, ANNUAL_PATTERNS):
+    if "metin" in category and _matches_any(text, ANNUAL_PATTERNS):
         return "Metinė"
 
-    if is_interim_category and _matches_any(text, HALF_YEAR_PATTERNS):
+    if "tarpin" in category and _matches_any(text, HALF_YEAR_PATTERNS):
         return "Pusmečio / 6 mėn."
 
     return ""
 
 
-def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tikisi CRIB naujienų dataframe su stulpeliais:
-    issuer, category, title, published_at arba published_date, crib_url.
-    """
+def normalize_crib_news_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    if news_df is None or news_df.empty:
+    df = df.copy()
+
+    rename_map = {
+        "company_name": "issuer",
+        "company": "issuer",
+        "issuer_name": "issuer",
+        "headline": "title",
+        "name": "title",
+        "news_title": "title",
+        "published_date": "published_at",
+        "date": "published_at",
+        "url": "crib_url",
+        "link": "crib_url",
+    }
+
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    for col in ["issuer", "category", "title", "published_at", "crib_url"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
+
+
+def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
+    news_df = normalize_crib_news_columns(news_df)
+
+    if news_df.empty:
         return pd.DataFrame()
 
     df = news_df.copy()
 
-    for col in ["issuer", "category", "title", "crib_url"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    if "published_at" not in df.columns and "published_date" not in df.columns:
-        return pd.DataFrame()
-
-    date_col = "published_at" if "published_at" in df.columns else "published_date"
-
     df["report_published_date"] = pd.to_datetime(
-        df[date_col],
+        df["published_at"],
         errors="coerce",
         utc=True,
     ).dt.date
 
-    df["issuer"] = df["issuer"].fillna("").astype(str).str.strip()
-    df["category"] = df["category"].fillna("").astype(str).str.strip()
-    df["title"] = df["title"].fillna("").astype(str).str.strip()
+    for col in ["issuer", "category", "title", "crib_url"]:
+        df[col] = df[col].fillna("").astype(str).str.strip()
 
     df["dpl_report_type"] = df.apply(_classify_financial_report, axis=1)
 
@@ -145,69 +145,83 @@ def add_dpl_check_to_transactions(
     dpl_periods_df: pd.DataFrame,
 ) -> pd.DataFrame:
     if transactions_df is None or transactions_df.empty:
-        return transactions_df
+        return pd.DataFrame()
 
     df = transactions_df.copy()
 
     df["is_dpl_period"] = False
     df["dpl_report_type"] = ""
     df["dpl_report_date"] = pd.NaT
+    df["dpl_start_date"] = pd.NaT
+    df["dpl_end_date"] = pd.NaT
     df["dpl_days_to_report"] = pd.NA
     df["dpl_report_title"] = ""
     df["dpl_report_url"] = ""
 
-    if dpl_periods_df is None or dpl_periods_df.empty:
-        return df
+    if dpl_periods_df is not None and not dpl_periods_df.empty:
+        periods = dpl_periods_df.copy()
 
-    periods = dpl_periods_df.copy()
-
-    periods["issuer_key"] = (
-        periods["issuer"].fillna("").astype(str).str.lower().str.strip()
-    )
-    df["issuer_key"] = (
-        df["issuer"].fillna("").astype(str).str.lower().str.strip()
-    )
-
-    for idx, row in df.iterrows():
-        issuer = row.get("issuer_key", "")
-        trade_date = row.get("transaction_date_dt")
-
-        if not issuer or pd.isna(trade_date):
-            continue
-
-        matches = periods[
-            (periods["issuer_key"] == issuer)
-            & (periods["dpl_start_date"] <= trade_date)
-            & (periods["dpl_end_date"] >= trade_date)
-        ].copy()
-
-        if matches.empty:
-            continue
-
-        matches["days_to_report"] = matches["report_published_date"].apply(
-            lambda x: (x - trade_date).days
+        periods["issuer_key"] = (
+            periods["issuer"].fillna("").astype(str).str.lower().str.strip()
+        )
+        df["issuer_key"] = (
+            df["issuer"].fillna("").astype(str).str.lower().str.strip()
         )
 
-        match = matches.sort_values("days_to_report").iloc[0]
+        for idx, row in df.iterrows():
+            issuer = row.get("issuer_key", "")
+            trade_date = row.get("transaction_date_dt")
 
-        df.at[idx, "is_dpl_period"] = True
-        df.at[idx, "dpl_report_type"] = match["dpl_report_type"]
-        df.at[idx, "dpl_report_date"] = match["report_published_date"]
-        df.at[idx, "dpl_days_to_report"] = match["days_to_report"]
-        df.at[idx, "dpl_report_title"] = match["title"]
-        df.at[idx, "dpl_report_url"] = match["crib_url"]
+            if not issuer or pd.isna(trade_date):
+                continue
 
-    df.drop(columns=["issuer_key"], inplace=True, errors="ignore")
+            matches = periods[
+                (periods["issuer_key"] == issuer)
+                & (periods["dpl_start_date"] <= trade_date)
+                & (periods["dpl_end_date"] >= trade_date)
+            ].copy()
+
+            if matches.empty:
+                continue
+
+            matches["days_to_report"] = matches["report_published_date"].apply(
+                lambda x: (x - trade_date).days
+            )
+
+            match = matches.sort_values("days_to_report").iloc[0]
+
+            df.at[idx, "is_dpl_period"] = True
+            df.at[idx, "dpl_report_type"] = match["dpl_report_type"]
+            df.at[idx, "dpl_report_date"] = match["report_published_date"]
+            df.at[idx, "dpl_start_date"] = match["dpl_start_date"]
+            df.at[idx, "dpl_end_date"] = match["dpl_end_date"]
+            df.at[idx, "dpl_days_to_report"] = match["days_to_report"]
+            df.at[idx, "dpl_report_title"] = match["title"]
+            df.at[idx, "dpl_report_url"] = match["crib_url"]
+
+        df.drop(columns=["issuer_key"], inplace=True, errors="ignore")
+
+    df["DPL"] = df["is_dpl_period"].apply(lambda x: "Taip" if x else "Ne")
+    df["DPL tipas"] = df["dpl_report_type"].fillna("")
+    df["DPL pradžia"] = df["dpl_start_date"]
+    df["DPL pabaiga"] = df["dpl_end_date"]
+    df["Ataskaitos paskelbimo data"] = df["dpl_report_date"]
+    df["DPL dienų iki ataskaitos"] = df["dpl_days_to_report"]
+    df["Susijusi ataskaita"] = df["dpl_report_title"].fillna("")
+    df["Ataskaitos nuoroda"] = df["dpl_report_url"].fillna("")
+
+    df["DPL paaiškinimas"] = df.apply(
+        lambda r: (
+            f"Sandoris sudarytas DPL laikotarpiu: {r['dpl_days_to_report']} k. d. iki "
+            f"{str(r['dpl_report_type']).lower()} ataskaitos paskelbimo "
+            f"({r['dpl_report_date']}). DPL: {r['dpl_start_date']}–{r['dpl_end_date']}."
+            if r["is_dpl_period"]
+            else "Sandorio data nepatenka į identifikuotus metinės arba pusmečio / 6 mėn. ataskaitos DPL laikotarpius."
+        ),
+        axis=1,
+    )
 
     return df
-
-
-# ============================================================
-# VADOVŲ SANDORIŲ PARUOŠIMAS
-# ============================================================
-
-def _to_date_series(series):
-    return pd.to_datetime(series, errors="coerce", utc=True).dt.date
 
 
 def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -260,10 +274,6 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# STREAMLIT UI
-# ============================================================
-
 def _apply_multiselect_filter(df: pd.DataFrame, col: str, label: str) -> pd.DataFrame:
     if col not in df.columns:
         return df
@@ -279,26 +289,10 @@ def _apply_multiselect_filter(df: pd.DataFrame, col: str, label: str) -> pd.Data
 
 def _show_summary_cards(df: pd.DataFrame):
     total = len(df)
-    issuers = (
-        df["issuer"].replace("", pd.NA).dropna().nunique()
-        if "issuer" in df.columns
-        else 0
-    )
-    persons = (
-        df["person_name"].replace("", pd.NA).dropna().nunique()
-        if "person_name" in df.columns
-        else 0
-    )
-    late = (
-        int(df["is_late_notification"].sum())
-        if "is_late_notification" in df.columns
-        else 0
-    )
-    dpl = (
-        int(df["is_dpl_period"].sum())
-        if "is_dpl_period" in df.columns
-        else 0
-    )
+    issuers = df["issuer"].replace("", pd.NA).dropna().nunique()
+    persons = df["person_name"].replace("", pd.NA).dropna().nunique()
+    late = int(df["is_late_notification"].sum())
+    dpl = int(df["is_dpl_period"].sum())
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Pranešimų / PDF", total)
@@ -312,18 +306,20 @@ def _show_tables(df: pd.DataFrame):
     st.subheader("1. Detali vadovų sandorių lentelė")
 
     detail_cols = [
+        "DPL",
+        "DPL paaiškinimas",
+        "DPL tipas",
+        "DPL pradžia",
+        "DPL pabaiga",
+        "Ataskaitos paskelbimo data",
+        "DPL dienų iki ataskaitos",
+        "Susijusi ataskaita",
+        "Ataskaitos nuoroda",
+
         "published_date",
         "transaction_date_dt",
         "days_to_publish",
         "is_late_notification",
-
-        "is_dpl_period",
-        "dpl_report_type",
-        "dpl_report_date",
-        "dpl_days_to_report",
-        "dpl_report_title",
-        "dpl_report_url",
-
         "issuer",
         "person_name",
         "person_role",
@@ -350,23 +346,19 @@ def _show_tables(df: pd.DataFrame):
 
     st.subheader("2. Santrauka pagal asmenį")
 
-    agg_dict = {
-        "pranesimu_sk": ("pdf_url", "count"),
-        "sandorio_bendra_verte": ("transaction_value", "sum"),
-        "veluojanciu_sk": ("is_late_notification", "sum"),
-        "vid_dienu_iki_pranesimo": ("days_to_publish", "mean"),
-    }
-
-    if "is_dpl_period" in df.columns:
-        agg_dict["dpl_sandoriu_sk"] = ("is_dpl_period", "sum")
-
     person_summary = (
         df.groupby(["issuer", "person_name"], dropna=False)
-        .agg(**agg_dict)
+        .agg(
+            pranesimu_sk=("pdf_url", "count"),
+            sandorio_bendra_verte=("transaction_value", "sum"),
+            veluojanciu_sk=("is_late_notification", "sum"),
+            dpl_sandoriu_sk=("is_dpl_period", "sum"),
+            vid_dienu_iki_pranesimo=("days_to_publish", "mean"),
+        )
         .reset_index()
         .sort_values(
-            ["pranesimu_sk", "sandorio_bendra_verte"],
-            ascending=[False, False],
+            ["dpl_sandoriu_sk", "pranesimu_sk", "sandorio_bendra_verte"],
+            ascending=[False, False, False],
         )
     )
 
@@ -387,8 +379,8 @@ def show_manager_transactions_page():
                     <h1 class="hero-title">Vadovų sandoriai</h1>
                     <div class="hero-text">
                         CRIB kategorijos „Pranešimai apie vadovų sandorius“ PDF dokumentai.
-                        Lentelėje papildomai skaičiuojamas dienų skaičius nuo sandorio datos
-                        iki pranešimo paskelbimo ir tikrinama, ar sandoris vyko DPL laikotarpiu.
+                        Lentelėje papildomai tikrinama, ar sandoris vyko DPL laikotarpiu
+                        prieš metinės arba pusmečio / 6 mėn. ataskaitos paskelbimą.
                     </div>
                 </div>
             </div>
@@ -435,8 +427,6 @@ def show_manager_transactions_page():
         st.info("Pasirinktu laikotarpiu vadovų sandorių duomenų nėra.")
         st.stop()
 
-    # Ieškome CRIB metinių ir pusmečio ataskaitų plačiau,
-    # nes sandoris gali būti prieš vėliau paskelbtą ataskaitą.
     news_start_date = manager_start_date - timedelta(days=370)
     news_end_date = manager_end_date + timedelta(days=370)
 
@@ -445,12 +435,50 @@ def show_manager_transactions_page():
         news_end_date,
     )
 
+    crib_news_df = normalize_crib_news_columns(crib_news_df)
     dpl_periods_df = prepare_dpl_periods_df(crib_news_df)
 
     df = add_dpl_check_to_transactions(
         df,
         dpl_periods_df,
     )
+
+    with st.expander("DPL diagnostika", expanded=False):
+        st.write(
+            "CRIB naujienų eilučių sk.:",
+            0 if crib_news_df is None else len(crib_news_df),
+        )
+        st.write(
+            "Identifikuotų metinių / pusmečio ataskaitų sk.:",
+            len(dpl_periods_df),
+        )
+
+        st.write("CRIB naujienų stulpeliai:")
+        st.write(list(crib_news_df.columns) if crib_news_df is not None else [])
+
+        if dpl_periods_df.empty:
+            st.warning(
+                "DPL ataskaitų nerasta. Patikrink, ar CRIB naujienose yra "
+                "category, title, issuer ir published_at stulpeliai, taip pat ar "
+                "kategorijos/antraštės atitinka metinę arba pusmečio / 6 mėn. informaciją."
+            )
+        else:
+            st.dataframe(
+                dpl_periods_df[
+                    [
+                        "issuer",
+                        "dpl_report_type",
+                        "report_published_date",
+                        "dpl_start_date",
+                        "dpl_end_date",
+                        "category",
+                        "title",
+                        "crib_url",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     _show_summary_cards(df)
 
@@ -524,7 +552,7 @@ def show_manager_transactions_page():
     st.download_button(
         "⬇ Atsisiųsti CSV",
         data=df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="vadovu_sandoriai.csv",
+        file_name="vadovu_sandoriai_su_dpl.csv",
         mime="text/csv",
         use_container_width=True,
     )
