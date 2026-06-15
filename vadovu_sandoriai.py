@@ -6,27 +6,61 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from supabase_cache import load_manager_transactions_df, load_crib_news_df
+from supabase_cache import load_manager_transactions_df, load_news_df
+
+
+def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
+    df = load_news_df("crib", start_date, end_date)
+
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "issuer",
+                "issuer_norm",
+                "category",
+                "title",
+                "published_at",
+                "crib_url",
+                "content",
+            ]
+        )
+
+    df = df.copy()
+
+    df["issuer"] = df.get("company", "").fillna("").astype(str).str.strip()
+    df["issuer_norm"] = df.get("company_norm", "").fillna("").astype(str).str.strip()
+    df["category"] = df.get("category", "").fillna("").astype(str).str.strip()
+    df["title"] = df.get("title", "").fillna("").astype(str).str.strip()
+    df["published_at"] = df.get("published_at", None)
+    df["crib_url"] = df.get("url", "").fillna("").astype(str).str.strip()
+    df["content"] = df.get("content", "").fillna("").astype(str).str.strip()
+
+    return df[
+        [
+            "issuer",
+            "issuer_norm",
+            "category",
+            "title",
+            "published_at",
+            "crib_url",
+            "content",
+        ]
+    ]
 
 
 ANNUAL_PATTERNS = [
-    r"\bmetin(?:ė|e|is|io|ių|ės|ę)\b",
-    r"\bmetin(?:is|ė)\s+pranešim",
-    r"\bmetin(?:ės|ė|iai|iu?)\s+finansin",
-    r"\baudituot",
-    r"\baudited\b",
+    r"\bmetin",
     r"\bannual\s+report\b",
-    r"\byear[- ]end\b",
+    r"\baudited\b",
+    r"\baudituot",
 ]
 
 HALF_YEAR_PATTERNS = [
     r"\b6\s*m[ėe]n",
     r"\bšešių\s+m[ėe]nesių\b",
-    r"\bpusme(?:čio|tis|tį|čiui|čiojo)\b",
+    r"\bpusme",
     r"\bhalf[- ]year\b",
-    r"\bhalf[- ]yearly\b",
     r"\bsemi[- ]annual\b",
-    r"\binterim\s+report\b",
     r"\b6\s*months\b",
     r"\bsix\s+months\b",
 ]
@@ -38,14 +72,10 @@ EXCLUDE_PATTERNS = [
     r"\bq3\b",
     r"\bI\s+ketv",
     r"\bIII\s+ketv",
-    r"\b1\s+ketv",
-    r"\b3\s+ketv",
-    r"\bketvirčio\b",
+    r"\bketvir",
     r"\bpreliminar",
     r"\bprognoz",
     r"\bdividend",
-    r"\bšaukia\b",
-    r"\bsušauk",
 ]
 
 
@@ -76,48 +106,15 @@ def _classify_financial_report(row) -> str:
     return ""
 
 
-def normalize_crib_news_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
+    if news_df is None or news_df.empty:
         return pd.DataFrame()
 
-    df = df.copy()
-
-    rename_map = {
-        "company": "issuer",
-        "company_name": "issuer",
-        "issuer_name": "issuer",
-        "Bendrovė": "issuer",
-        "Kategorija": "category",
-        "headline": "title",
-        "name": "title",
-        "news_title": "title",
-        "Naujiena": "title",
-        "Pilna_antraštė": "title",
-        "published_date": "published_at",
-        "date": "published_at",
-        "Published_dt": "published_at",
-        "url": "crib_url",
-        "link": "crib_url",
-        "Nuoroda": "crib_url",
-        "Pilnas_tekstas": "content",
-    }
-
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    df = news_df.copy()
 
     for col in ["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"]:
         if col not in df.columns:
             df[col] = ""
-
-    return df
-
-
-def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
-    news_df = normalize_crib_news_columns(news_df)
-
-    if news_df.empty:
-        return pd.DataFrame()
-
-    df = news_df.copy()
 
     df["report_published_date"] = pd.to_datetime(
         df["published_at"],
@@ -356,11 +353,7 @@ def _show_tables(df: pd.DataFrame):
 
     detail_cols = [c for c in detail_cols if c in df.columns]
 
-    st.dataframe(
-        df[detail_cols],
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df[detail_cols], use_container_width=True, hide_index=True)
 
     st.subheader("2. Santrauka pagal asmenį")
 
@@ -380,11 +373,7 @@ def _show_tables(df: pd.DataFrame):
         )
     )
 
-    st.dataframe(
-        person_summary,
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(person_summary, use_container_width=True, hide_index=True)
 
 
 def show_manager_transactions_page():
@@ -445,8 +434,6 @@ def show_manager_transactions_page():
     news_end_date = manager_end_date + timedelta(days=370)
 
     crib_news_df = load_crib_news_df(news_start_date, news_end_date)
-    crib_news_df = normalize_crib_news_columns(crib_news_df)
-
     dpl_periods_df = prepare_dpl_periods_df(crib_news_df)
 
     df = add_dpl_check_to_transactions(df, dpl_periods_df)
