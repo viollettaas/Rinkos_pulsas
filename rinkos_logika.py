@@ -1186,18 +1186,19 @@ def render_first_north(df_: pd.DataFrame, caption: str):
     if "Pok.%" in df_.columns:
         df_ = df_.sort_values(by="Pok.%", key=lambda x: pd.to_numeric(x, errors="coerce").abs(), ascending=False)
 
-    # First North lentelėje rodome būtent Nasdaq Baltic / Nasdaq Vilnius pranešimus.
+    # First North lentelėje rodome ir VŽ, ir Nasdaq Baltic / Nasdaq Vilnius pranešimus.
     cols = [
         "Trumpinys", "Bendrovė", "Atid.", "Paskutinė kaina", "Pok.%", "Apyvarta", "Kiekis",
-        "Sand.", "Sąrašas/segmentas", "Nasdaq pranešimai",
+        "Sand.", "Sąrašas/segmentas", "Nasdaq pranešimai", "Verslo žinios",
     ]
     for c in cols:
         if c not in df_.columns:
             df_[c] = ""
     df_ = df_[cols].copy()
 
-    if "Nasdaq pranešimai" in df_.columns:
-        df_["Nasdaq pranešimai"] = df_["Nasdaq pranešimai"].apply(lambda x: shorten_news_html(x, max_len=58))
+    for news_col in ["Nasdaq pranešimai", "Verslo žinios"]:
+        if news_col in df_.columns:
+            df_[news_col] = df_[news_col].apply(lambda x: shorten_news_html(x, max_len=58))
 
     df_["Pok.%"] = pd.to_numeric(df_["Pok.%"], errors="coerce")
 
@@ -1214,7 +1215,7 @@ def render_first_north(df_: pd.DataFrame, caption: str):
         .format({"Atid.": "{:.2f}", "Paskutinė kaina": "{:.2f}", "Pok.%": "{:.2f}", "Apyvarta": "{:.2f}", "Kiekis": "{:.0f}", "Sand.": "{:.0f}"})
         .apply(spalvinti_pokycio_abs_gradienta, subset=["Pok.%"])
         .hide(axis="index")
-        .set_properties(subset=["Nasdaq pranešimai"], **{"white-space": "pre-line"})
+        .set_properties(subset=["Nasdaq pranešimai", "Verslo žinios"], **{"white-space": "pre-line"})
     )
 
 def ivertink_izvalga(row):
@@ -1959,7 +1960,7 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     styled_obligacijos = render_lentele(df_obligacijos, "Baltijos skolos VP sąrašas (obligacijos)")
     styled_first_north = render_first_north(
         df_first_north,
-        f"First North (prekiauta arba yra pranešimų) – Nasdaq Vilnius ({start_date} – {end_date})",
+        f"First North (prekiauta arba yra VŽ / Nasdaq Vilnius pranešimų) ({start_date} – {end_date})",
     )
     styled_visos = render_visos_naujienos(
         df_visos,
