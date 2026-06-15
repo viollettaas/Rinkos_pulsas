@@ -10,18 +10,23 @@ from supabase_cache import load_manager_transactions_df, load_crib_news_df
 
 
 ANNUAL_PATTERNS = [
-    r"\bmetin(?:ė|e|is|io|ių|ės)\b",
-    r"\bannual\s+report\b",
-    r"\baudited\b",
+    r"\bmetin(?:ė|e|is|io|ių|ės|ę)\b",
+    r"\bmetin(?:is|ė)\s+pranešim",
+    r"\bmetin(?:ės|ė|iai|iu?)\s+finansin",
     r"\baudituot",
+    r"\baudited\b",
+    r"\bannual\s+report\b",
+    r"\byear[- ]end\b",
 ]
 
 HALF_YEAR_PATTERNS = [
     r"\b6\s*m[ėe]n",
     r"\bšešių\s+m[ėe]nesių\b",
-    r"\bpusme(?:čio|tis|tį|čiui)\b",
+    r"\bpusme(?:čio|tis|tį|čiui|čiojo)\b",
     r"\bhalf[- ]year\b",
+    r"\bhalf[- ]yearly\b",
     r"\bsemi[- ]annual\b",
+    r"\binterim\s+report\b",
     r"\b6\s*months\b",
     r"\bsix\s+months\b",
 ]
@@ -33,10 +38,14 @@ EXCLUDE_PATTERNS = [
     r"\bq3\b",
     r"\bI\s+ketv",
     r"\bIII\s+ketv",
+    r"\b1\s+ketv",
+    r"\b3\s+ketv",
     r"\bketvirčio\b",
     r"\bpreliminar",
     r"\bprognoz",
     r"\bdividend",
+    r"\bšaukia\b",
+    r"\bsušauk",
 ]
 
 
@@ -51,7 +60,9 @@ def _matches_any(text: str, patterns: list[str]) -> bool:
 def _classify_financial_report(row) -> str:
     category = _norm_text(row.get("category", ""))
     title = _norm_text(row.get("title", ""))
-    text = f"{category} {title}"
+    content = _norm_text(row.get("content", ""))
+
+    text = f"{category} {title} {content[:1000]}"
 
     if _matches_any(text, EXCLUDE_PATTERNS):
         return ""
@@ -72,21 +83,28 @@ def normalize_crib_news_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     rename_map = {
-        "company_name": "issuer",
         "company": "issuer",
+        "company_name": "issuer",
         "issuer_name": "issuer",
+        "Bendrovė": "issuer",
+        "Kategorija": "category",
         "headline": "title",
         "name": "title",
         "news_title": "title",
+        "Naujiena": "title",
+        "Pilna_antraštė": "title",
         "published_date": "published_at",
         "date": "published_at",
+        "Published_dt": "published_at",
         "url": "crib_url",
         "link": "crib_url",
+        "Nuoroda": "crib_url",
+        "Pilnas_tekstas": "content",
     }
 
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    for col in ["issuer", "category", "title", "published_at", "crib_url"]:
+    for col in ["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -107,7 +125,7 @@ def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
         utc=True,
     ).dt.date
 
-    for col in ["issuer", "category", "title", "crib_url"]:
+    for col in ["issuer", "issuer_norm", "category", "title", "crib_url", "content"]:
         df[col] = df[col].fillna("").astype(str).str.strip()
 
     df["dpl_report_type"] = df.apply(_classify_financial_report, axis=1)
@@ -129,6 +147,7 @@ def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
     return df[
         [
             "issuer",
+            "issuer_norm",
             "dpl_report_type",
             "report_published_date",
             "dpl_start_date",
@@ -138,6 +157,10 @@ def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
             "crib_url",
         ]
     ].drop_duplicates()
+
+
+def _issuer_key(value) -> str:
+    return str(value or "").lower().strip()
 
 
 def add_dpl_check_to_transactions(
@@ -161,12 +184,8 @@ def add_dpl_check_to_transactions(
     if dpl_periods_df is not None and not dpl_periods_df.empty:
         periods = dpl_periods_df.copy()
 
-        periods["issuer_key"] = (
-            periods["issuer"].fillna("").astype(str).str.lower().str.strip()
-        )
-        df["issuer_key"] = (
-            df["issuer"].fillna("").astype(str).str.lower().str.strip()
-        )
+        periods["issuer_key"] = periods["issuer"].apply(_issuer_key)
+        df["issuer_key"] = df["issuer"].apply(_issuer_key)
 
         for idx, row in df.iterrows():
             issuer = row.get("issuer_key", "")
@@ -315,7 +334,6 @@ def _show_tables(df: pd.DataFrame):
         "DPL dienų iki ataskaitos",
         "Susijusi ataskaita",
         "Ataskaitos nuoroda",
-
         "published_date",
         "transaction_date_dt",
         "days_to_publish",
@@ -416,11 +434,7 @@ def show_manager_transactions_page():
         st.error("Data „nuo“ negali būti vėlesnė už datą „iki“.")
         st.stop()
 
-    raw_df = load_manager_transactions_df(
-        manager_start_date,
-        manager_end_date,
-    )
-
+    raw_df = load_manager_transactions_df(manager_start_date, manager_end_date)
     df = prepare_manager_transactions_df(raw_df)
 
     if df.empty:
@@ -430,37 +444,24 @@ def show_manager_transactions_page():
     news_start_date = manager_start_date - timedelta(days=370)
     news_end_date = manager_end_date + timedelta(days=370)
 
-    crib_news_df = load_crib_news_df(
-        news_start_date,
-        news_end_date,
-    )
-
+    crib_news_df = load_crib_news_df(news_start_date, news_end_date)
     crib_news_df = normalize_crib_news_columns(crib_news_df)
+
     dpl_periods_df = prepare_dpl_periods_df(crib_news_df)
 
-    df = add_dpl_check_to_transactions(
-        df,
-        dpl_periods_df,
-    )
+    df = add_dpl_check_to_transactions(df, dpl_periods_df)
 
     with st.expander("DPL diagnostika", expanded=False):
-        st.write(
-            "CRIB naujienų eilučių sk.:",
-            0 if crib_news_df is None else len(crib_news_df),
-        )
-        st.write(
-            "Identifikuotų metinių / pusmečio ataskaitų sk.:",
-            len(dpl_periods_df),
-        )
-
+        st.write("CRIB naujienų eilučių sk.:", len(crib_news_df))
+        st.write("Identifikuotų metinių / pusmečio ataskaitų sk.:", len(dpl_periods_df))
         st.write("CRIB naujienų stulpeliai:")
-        st.write(list(crib_news_df.columns) if crib_news_df is not None else [])
+        st.write(list(crib_news_df.columns))
 
         if dpl_periods_df.empty:
             st.warning(
-                "DPL ataskaitų nerasta. Patikrink, ar CRIB naujienose yra "
-                "category, title, issuer ir published_at stulpeliai, taip pat ar "
-                "kategorijos/antraštės atitinka metinę arba pusmečio / 6 mėn. informaciją."
+                "DPL ataskaitų nerasta. Patikrink, ar market_news lentelėje yra CRIB "
+                "naujienų su kategorijomis „Metinė informacija“ ir „Tarpinė informacija“, "
+                "taip pat ar antraštėse yra metinės arba pusmečio / 6 mėn. ataskaitos požymių."
             )
         else:
             st.dataframe(
