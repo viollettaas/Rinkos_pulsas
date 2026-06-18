@@ -18,6 +18,7 @@ from emitentu_atranka import generate_emitentu_ataskaita
 from crib_update import update_crib_news, get_latest_crib_news_date
 from supabase_cache import save_news_df, load_news_df
 from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
+from vz_update import update_vz_news_fast
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -936,17 +937,23 @@ with st.sidebar:
                         vz_note = f" VŽ neatnaujinta: nepavyko išsaugoti emitentų sąrašo DB ({save_issuer_exc})."
 
             if df_issuers_for_vz is not None and not df_issuers_for_vz.empty:
-                # VŽ scraperis žiūri tik pirmą VŽ puslapį, todėl datos naudojamos plačiai,
-                # kad būtų paimti ir senesni pirmame puslapyje esantys straipsniai.
-                vz_start = date(2023, 1, 1)
-                vz_end = date.today()
-                with st.spinner("Tikrinamas pirmas VŽ puslapis pagal DB emitentų sąrašą..."):
-                    vz_df = vz_scrape_first_page_fast(
-                        df_issuers_for_vz,
+                with st.spinner("Greitai tikrinamas pirmas VŽ puslapis pagal DB emitentų sąrašą..."):
+                    vz_stats = update_vz_news_fast(
+                        df_issuers=df_issuers_for_vz,
+                        existing_url_limit=800,
+                        max_articles=80,
                         progress=None,
                     )
-                    vz_found = len(vz_df) if vz_df is not None else 0
-                    vz_inserted = save_news_df(vz_df, "vz") if vz_df is not None and not vz_df.empty else 0
+                    vz_found = int(vz_stats.get("found", 0) or 0)
+                    vz_inserted = int(vz_stats.get("inserted", 0) or 0)
+                    vz_checked = int(vz_stats.get("checked", 0) or 0)
+                    vz_skipped_existing = int(vz_stats.get("skipped_existing", 0) or 0)
+                    vz_matched = int(vz_stats.get("matched", 0) or 0)
+                    vz_note += (
+                        f" VŽ patikrinta {vz_checked} straipsnių, "
+                        f"aktualių naujų kandidatų {vz_matched}, "
+                        f"jau DB buvo {vz_skipped_existing}."
+                    )
             elif not vz_note:
                 vz_note = " VŽ neatnaujinta: DB nėra emitentų sąrašo. Sugeneruokite rinkos ataskaitą, kad sąrašas būtų išsaugotas DB."
 
