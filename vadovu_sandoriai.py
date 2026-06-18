@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -101,31 +102,57 @@ def _post_manager_transaction(row: dict) -> bool:
         raise RuntimeError(f"Supabase manager_transactions įrašymo klaida: {resp.status_code} - {resp.text}")
 
 
+def _collapse_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _parse_number(value: str, as_int: bool = False):
+    if value is None:
+        return None
+    s = str(value).strip()
+    m = re.search(r"[-+]?\d[\d\s.,]*", s)
+    if not m:
+        return None
+    num = m.group(0).replace(" ", "")
+    # LT dokumentuose dešimtainis skirtukas dažniausiai kablelis, tūkstančių - tarpas.
+    if "," in num and "." in num:
+        # jei abu yra, laikome paskutinį skirtuką dešimtainiu
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "").replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    else:
+        num = num.replace(",", ".")
+    try:
+        val = float(num)
+        return int(round(val)) if as_int else val
+    except Exception:
+        return None
+
+
+def _regex_value(text: str, pattern: str) -> str:
+    m = re.search(pattern, text or "", flags=re.I | re.S)
+    if not m:
+        return ""
+    return _collapse_ws(m.group(1))
+
+
 def _text_after_label(text: str, labels, max_len: int = 160) -> str:
+    """Atsarginis bendras label parseris. Naudojamas tik jei specifinis MAR formos parseris neranda lauko."""
     if not text:
         return ""
     for label in labels:
-        pattern = rf"{label}\s*[:\-]?\s*(.+)"
-        m = re.search(pattern, text, flags=re.I)
+        pattern = rf"(?:^|\n|\s){label}\s*[:\-]?\s*(.+?)(?=\n[a-z]\)|\n\d\.|\n[A-ZĄČĘĖĮŠŲŪŽ][^\n]{{0,80}}\s*[:\-]?|$)"
+        m = re.search(pattern, text, flags=re.I | re.S)
         if m:
-            value = m.group(1).strip()
-            value = re.split(r"\n|\r|\s{3,}", value)[0].strip()
+            value = _collapse_ws(m.group(1))
             return value[:max_len]
     return ""
 
 
 def _extract_number_after(text: str, labels) -> float | None:
     raw = _text_after_label(text, labels, max_len=80)
-    if not raw:
-        return None
-    m = re.search(r"[-+]?\d[\d\s.,]*", raw)
-    if not m:
-        return None
-    s = m.group(0).replace(" ", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
+    return _parse_number(raw)
 
 
 def _extract_date_from_text(text: str):
@@ -144,109 +171,97 @@ def _extract_date_from_text(text: str):
     return None
 
 
-def _extract_pdf_text(pdf_url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(pdf_url, headers=headers, timeout=45, verify=False)
-    resp.raise_for_status()
-    content = resp.content or b""
-    if len(content) < 100:
-        return ""
-    text_parts = []
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page in pdf.pages[:6]:
-            try:
-                text_parts.append(page.extract_text() or "")
-            except Exception:
-                pass
-    return "\n".join(text_parts).strip()
-
-
-def _extract_pdf_links_from_crib_page(driver, crib_url: str) -> list[str]:
-    driver.get(crib_url)
-    try:
-        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"})
-    except Exception:
-        pass
-
-    links = []
-    try:
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-    except Exception:
-        soup = None
-
-    if soup is not None:
-        for a in soup.find_all("a"):
-            href = (a.get("href") or "").strip()
-            txt = a.get_text(" ", strip=True).lower()
-            if not href:
-                continue
-            full = urljoin(crib_url, href)
-            low = full.lower()
-            if ".pdf" in low or "download" in low or "attachment" in low or "getfile" in low or "file" in low or "pdf" in txt:
-                links.append(full)
-
-    # Shadow DOM / custom elements fallback.
-    try:
-        hrefs = driver.execute_script(
-            """
-            const out = [];
-            function scan(root){
-              root.querySelectorAll('a[href], nef-link[href]').forEach(a => out.push(a.href || a.getAttribute('href')));
-              root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) scan(el.shadowRoot); });
-            }
-            scan(document);
-            return out;
-            """
-        ) or []
-        for href in hrefs:
-            full = urljoin(crib_url, str(href or "").strip())
-            low = full.lower()
-            if full and (".pdf" in low or "download" in low or "attachment" in low or "getfile" in low):
-                links.append(full)
-    except Exception:
-        pass
-
-    clean = []
-    seen = set()
-    for u in links:
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        clean.append(u)
-    return clean
-
-
 def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None) -> dict:
-    issuer = _text_after_label(text, [
-        r"Emitento pavadinimas", r"Emitentas", r"Issuer name", r"Name of the issuer",
-    ])
-    person = _text_after_label(text, [
-        r"Vadovo vardas ir pavardė", r"Asmens vardas ir pavardė", r"Name of the person", r"Person name",
-    ])
-    role = _text_after_label(text, [
-        r"Pareigos", r"Statusas", r"Position", r"Function", r"Role",
-    ])
-    isin = _text_after_label(text, [r"ISIN", r"Finansinės priemonės identifikavimo kodas", r"Identification code"])
-    instrument = _text_after_label(text, [
-        r"Finansinės priemonės pavadinimas", r"Priemonės pavadinimas", r"Financial instrument", r"Instrument",
-    ])
-    transaction_type = _text_after_label(text, [
-        r"Sandorio pobūdis", r"Sandorio rūšis", r"Nature of the transaction", r"Transaction type",
-    ])
-    venue = _text_after_label(text, [
-        r"Sandorio vieta", r"Prekybos vieta", r"Place of the transaction", r"Trading venue", r"Venue",
-    ])
+    """
+    Specifinis MAR vadovų sandorių pranešimo parseris.
 
-    price = _extract_number_after(text, [r"Kaina", r"Price"])
-    quantity = _extract_number_after(text, [r"Kiekis", r"Volume", r"Quantity"])
-    transaction_date = None
-    date_label_value = _text_after_label(text, [
-        r"Sandorio data", r"Transaction date", r"Date of transaction",
-    ], max_len=80)
-    if date_label_value:
-        transaction_date = _extract_date_from_text(date_label_value)
-    if not transaction_date:
-        transaction_date = _extract_date_from_text(text)
+    Kodėl reikėjo taisyti:
+    ankstesnė logika ieškojo paprastų žymių, pvz. „Pavadinimas“, „Kaina“, „Kiekis“.
+    MAR formoje tokios žymės kartojasi keliose sekcijose, todėl buvo paimamos ne tos reikšmės:
+    asmuo/emitentas likdavo tušti, role gaudavo etiketę, ISIN turėjo „kodas:“ prefixą,
+    o kaina/kiekis buvo supainioti. Čia laukai ištraukiami pagal formos sekcijas 1, 2, 3 ir 4.
+    """
+    text = text or ""
+
+    person = _regex_value(
+        text,
+        r"1\..*?a\)\s*Pavadinimas\s+(.+?)\s+2\.",
+    )
+
+    role = _regex_value(
+        text,
+        r"Pareigos\s*/\s*statusas\s+(.+?)\s+b\)\s*Pirminis",
+    )
+
+    issuer = _regex_value(
+        text,
+        r"3\..*?a\)\s*Pavadinimas\s+(.+?)\s+b\)\s*LEI",
+    )
+
+    transaction_type = _regex_value(
+        text,
+        r"b\)\s*Sandorio pobūdis\s+(.+?)\s+c\)\s*Kaina",
+    )
+
+    venue = _regex_value(
+        text,
+        r"f\)\s*Sandorio vieta\s+(.+?)\s*$",
+    )
+
+    transaction_date = _regex_value(
+        text,
+        r"e\)\s*Sandorio data\s+(\d{4}[-.]\d{2}[-.]\d{2})",
+    ) or _extract_date_from_text(text)
+
+    isin_match = re.search(r"(?:ISIN\s*kodas\s*:\s*)?\b([A-Z]{2}[A-Z0-9]{10})\b", text, flags=re.I)
+    isin = isin_match.group(1).upper() if isin_match else ""
+
+    instrument_block = _regex_value(
+        text,
+        r"a\)\s*Finansinės priemonės\s+(.+?)\s+b\)\s*Sandorio pobūdis",
+    )
+    instrument = re.sub(
+        r"aprašymas, priemonės|rūšis|Identifikavimo kodas|ISIN\s*kodas\s*:\s*[A-Z0-9]+",
+        " ",
+        instrument_block,
+        flags=re.I,
+    )
+    instrument = _collapse_ws(instrument)
+
+    price = None
+    quantity = None
+
+    # Standartinė lentelė: Kaina Kiekis / 1,66 EUR 78 718
+    pq = re.search(
+        r"Kaina\s+Kiekis\s+([\d\s]+(?:[,.]\d+)?)\s*EUR\s+([\d\s]+)",
+        text,
+        flags=re.I,
+    )
+    if pq:
+        price = _parse_number(pq.group(1))
+        quantity = _parse_number(pq.group(2), as_int=True)
+
+    # Atsarginis variantas iš apibendrintos informacijos.
+    if quantity is None:
+        q = re.search(r"Akcijų\s+kiekis\s*:\s*([\d\s]+)", text, flags=re.I)
+        if q:
+            quantity = _parse_number(q.group(1), as_int=True)
+    if price is None:
+        pr = re.search(r"Vienos\s+akcijos\s+kaina\s+([\d\s]+(?:[,.]\d+)?)\s*EUR", text, flags=re.I)
+        if pr:
+            price = _parse_number(pr.group(1))
+
+    # Atsarginiai bendri labeliai, jei forma būtų ne lietuviška / kitokia.
+    if not person:
+        person = _text_after_label(text, [r"Vadovo vardas ir pavardė", r"Asmens vardas ir pavardė", r"Name of the person", r"Person name"])
+    if not issuer:
+        issuer = _text_after_label(text, [r"Emitento pavadinimas", r"Issuer name", r"Name of the issuer"])
+    if not role:
+        role = _text_after_label(text, [r"Pareigos / statusas", r"Pareigos", r"Statusas", r"Position", r"Function", r"Role"])
+    if not transaction_type:
+        transaction_type = _text_after_label(text, [r"Sandorio pobūdis", r"Sandorio rūšis", r"Nature of the transaction", r"Transaction type"])
+    if not venue:
+        venue = _text_after_label(text, [r"Sandorio vieta", r"Prekybos vieta", r"Place of the transaction", r"Trading venue", r"Venue"])
 
     published_iso = None
     try:
@@ -267,12 +282,34 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
         "price": price,
         "quantity": quantity,
         "venue": venue,
-        "parse_status": "parsed_basic" if text else "pdf_text_empty",
+        "parse_status": "parsed_mar_form" if text else "pdf_text_empty",
         "price_quantity_note": "",
         "pdf_url": pdf_url,
         "crib_url": crib_url,
         "raw_text": text[:12000] if text else "",
     }
+
+
+def _manager_transaction_already_saved_by_signature(row: dict) -> bool:
+    """Apsauga nuo to paties PDF įrašymo du kartus, kai CRIB pateikia kelias nuorodas į tą patį failą."""
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {
+            "select": "id,pdf_url",
+            "crib_url": f"eq.{row.get('crib_url', '')}",
+            "issuer": f"eq.{row.get('issuer', '')}",
+            "person_name": f"eq.{row.get('person_name', '')}",
+            "transaction_date": f"eq.{row.get('transaction_date', '')}",
+            "isin": f"eq.{row.get('isin', '')}",
+            "limit": "1",
+        }
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            return bool(resp.json() or [])
+    except Exception:
+        return False
 
 
 def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None) -> int:
@@ -295,6 +332,8 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
         try:
             text = _extract_pdf_text(pdf_url)
             row = _parse_manager_transaction_pdf_text(text, pdf_url=pdf_url, crib_url=crib_url, published_at=published_at)
+            if _manager_transaction_already_saved_by_signature(row):
+                continue
             if _post_manager_transaction(row):
                 saved += 1
         except Exception:
