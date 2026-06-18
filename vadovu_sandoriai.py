@@ -194,6 +194,16 @@ def _is_empty_db_value(value) -> bool:
     return False
 
 
+def _looks_like_valid_isin(value) -> bool:
+    """Tikras ISIN turi prasidėti valstybės kodu ir turėti 12 simbolių.
+    Šis patikrinimas neleidžia ISIN lauke palikti tokių žodžių kaip VADOVAUJAMAS.
+    """
+    if _is_empty_db_value(value):
+        return False
+    s = str(value).strip().upper()
+    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", s)) and s[:2] in {"LT", "LV", "EE"}
+
+
 def _is_bad_existing_value(col: str, value) -> bool:
     """Ar DB reikšmė nėra tuščia, bet aiškiai blogai nuskaityta ir ją reikia perrašyti."""
     if _is_empty_db_value(value):
@@ -202,7 +212,7 @@ def _is_bad_existing_value(col: str, value) -> bool:
     s_l = s.lower()
 
     if col == "isin":
-        return not bool(re.fullmatch(r"(?:LT|LV|EE)[A-Z0-9]{10}", s, flags=re.I))
+        return not _looks_like_valid_isin(s)
 
     if col in {"issuer", "person_name"}:
         bad_tokens = ["/ vardas", "pavardė", "pavarde", "vadovaujamas", "pareigas einančio"]
@@ -589,16 +599,27 @@ def _clean_instrument(value: str) -> str:
 
 
 def _extract_isin(text: str) -> str:
+    """Griežtas ISIN ištraukimas.
+
+    Ankstesnė logika su re.I leisdavo paimti 12 raidžių žodžius, pvz.
+    VADOVAUJAMAS. Dabar pirmiausia ieškome tik po aiškaus ISIN labelio,
+    o atsarginiu atveju leidžiame tik Baltijos ISIN prefiksus LT/LV/EE.
+    """
     if not text:
         return ""
-    # Pirmiausia ieškome aiškaus ISIN labelio. Tai neleidžia klaidingai paimti žodžio VADOVAUJAMAS.
-    m = re.search(r"ISIN\s*kodas\s*[:\-]?\s*([A-Z]{2}[A-Z0-9]{10})", text, flags=re.I)
-    if m:
-        return m.group(1).upper()
-    # Baltijos ISIN atsarginis variantas.
-    m = re.search(r"\b((?:LT|LV|EE)[A-Z0-9]{10})\b", text, flags=re.I)
-    if m:
-        return m.group(1).upper()
+
+    patterns = [
+        r"ISIN\s*(?:kodas|code)?\s*[:\-]?\s*((?:LT|LV|EE)[A-Z0-9]{10})",
+        r"Identifikavimo\s+kodas\s*(?:ISIN\s*kodas)?\s*[:\-]?\s*((?:LT|LV|EE)[A-Z0-9]{10})",
+        r"\b((?:LT|LV|EE)[A-Z0-9]{10})\b",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            isin = m.group(1).upper().strip()
+            if _looks_like_valid_isin(isin):
+                return isin
     return ""
 
 
@@ -665,6 +686,8 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     venue = _collapse_ws(re.sub(r"(?:Pagal|Under the power|Vadovaujamas pareigas|pasiraš).*", "", venue or "", flags=re.I | re.S))
 
     isin = _extract_isin(text)
+    if isin and not _looks_like_valid_isin(isin):
+        isin = ""
 
     instrument_block = _regex_value(text, r"a\)\s*Finansinės priemonės\s+(.+?)\s+b\)\s*Sandorio pobūdis")
     if not instrument_block:
@@ -891,13 +914,16 @@ def _load_bad_manager_transactions(limit: int = 200) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
 
+    isin_series = df["isin"].fillna("").astype(str).str.strip()
+    bad_isin = isin_series.eq("") | (~isin_series.apply(_looks_like_valid_isin))
+
     mask = (
         df["pdf_url"].fillna("").astype(str).str.strip().ne("")
         & (
             df["issuer"].fillna("").astype(str).str.strip().eq("")
             | df["person_name"].fillna("").astype(str).str.strip().eq("")
             | df["transaction_date"].fillna("").astype(str).str.strip().eq("")
-            | df["isin"].fillna("").astype(str).str.strip().eq("")
+            | bad_isin
             | df["parse_status"].fillna("").astype(str).isin(["pdf_parse_error", "pdf_text_empty", "parsed_incomplete", "pdf_parse_empty_after_retry"])
         )
     )
