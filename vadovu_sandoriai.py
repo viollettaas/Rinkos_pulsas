@@ -1307,40 +1307,88 @@ def _issuer_key(value) -> str:
 
 
 def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prideda DPL patikrą prie vadovų sandorių.
+
+    Pataisyta: pandas naujesnėse versijose nebeleidžia į datetime64 stulpelį
+    tiesiogiai įrašyti datetime.date reikšmės. Todėl DPL datos laikomos kaip
+    object/date, o ne kaip datetime64[ns]. Tai pašalina klaidą:
+    TypeError: Invalid value 'YYYY-MM-DD' for dtype datetime64[ns].
+    """
     if transactions_df is None or transactions_df.empty:
         return pd.DataFrame()
+
     df = transactions_df.copy()
+
+    # Šiuos stulpelius sąmoningai kuriame kaip object, nes vėliau įrašome datetime.date.
     df["is_dpl_period"] = False
     df["dpl_report_type"] = ""
-    df["dpl_report_date"] = pd.NaT
-    df["dpl_start_date"] = pd.NaT
-    df["dpl_end_date"] = pd.NaT
-    df["dpl_days_to_report"] = pd.NA
+    df["dpl_report_date"] = pd.Series([None] * len(df), index=df.index, dtype="object")
+    df["dpl_start_date"] = pd.Series([None] * len(df), index=df.index, dtype="object")
+    df["dpl_end_date"] = pd.Series([None] * len(df), index=df.index, dtype="object")
+    df["dpl_days_to_report"] = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
     df["dpl_report_title"] = ""
     df["dpl_report_url"] = ""
+
+    def _to_date_obj(value):
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        try:
+            return pd.to_datetime(value, errors="coerce").date()
+        except Exception:
+            return value
+
     if dpl_periods_df is not None and not dpl_periods_df.empty:
         periods = dpl_periods_df.copy()
+
         periods["issuer_key"] = periods["issuer"].apply(_issuer_key)
         df["issuer_key"] = df["issuer"].apply(_issuer_key)
+
+        # Užtikriname vienodą datų tipą palyginimui.
+        for col in ["dpl_start_date", "dpl_end_date", "report_published_date"]:
+            if col in periods.columns:
+                periods[col] = periods[col].apply(_to_date_obj)
+
         for idx, row in df.iterrows():
             issuer = row.get("issuer_key", "")
-            trade_date = row.get("transaction_date_dt")
-            if not issuer or pd.isna(trade_date):
+            trade_date = _to_date_obj(row.get("transaction_date_dt"))
+
+            if not issuer or trade_date is None:
                 continue
-            matches = periods[(periods["issuer_key"] == issuer) & (periods["dpl_start_date"] <= trade_date) & (periods["dpl_end_date"] >= trade_date)].copy()
+
+            matches = periods[
+                (periods["issuer_key"] == issuer)
+                & (periods["dpl_start_date"].notna())
+                & (periods["dpl_end_date"].notna())
+                & (periods["dpl_start_date"] <= trade_date)
+                & (periods["dpl_end_date"] >= trade_date)
+            ].copy()
+
             if matches.empty:
                 continue
-            matches["days_to_report"] = matches["report_published_date"].apply(lambda x: (x - trade_date).days)
+
+            matches["days_to_report"] = matches["report_published_date"].apply(
+                lambda x: (x - trade_date).days if x is not None else pd.NA
+            )
+
             match = matches.sort_values("days_to_report").iloc[0]
+
             df.at[idx, "is_dpl_period"] = True
-            df.at[idx, "dpl_report_type"] = match["dpl_report_type"]
-            df.at[idx, "dpl_report_date"] = match["report_published_date"]
-            df.at[idx, "dpl_start_date"] = match["dpl_start_date"]
-            df.at[idx, "dpl_end_date"] = match["dpl_end_date"]
-            df.at[idx, "dpl_days_to_report"] = match["days_to_report"]
-            df.at[idx, "dpl_report_title"] = match["title"]
-            df.at[idx, "dpl_report_url"] = match["crib_url"]
+            df.at[idx, "dpl_report_type"] = str(match.get("dpl_report_type", "") or "")
+            df.at[idx, "dpl_report_date"] = _to_date_obj(match.get("report_published_date"))
+            df.at[idx, "dpl_start_date"] = _to_date_obj(match.get("dpl_start_date"))
+            df.at[idx, "dpl_end_date"] = _to_date_obj(match.get("dpl_end_date"))
+            df.at[idx, "dpl_days_to_report"] = match.get("days_to_report", pd.NA)
+            df.at[idx, "dpl_report_title"] = str(match.get("title", "") or "")
+            df.at[idx, "dpl_report_url"] = str(match.get("crib_url", "") or "")
+
         df.drop(columns=["issuer_key"], inplace=True, errors="ignore")
+
     df["DPL"] = df["is_dpl_period"].apply(lambda x: "Taip" if x else "Ne")
     df["DPL tipas"] = df["dpl_report_type"].fillna("")
     df["DPL pradžia"] = df["dpl_start_date"]
@@ -1349,6 +1397,7 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
     df["DPL dienų iki ataskaitos"] = df["dpl_days_to_report"]
     df["Susijusi ataskaita"] = df["dpl_report_title"].fillna("")
     df["Ataskaitos nuoroda"] = df["dpl_report_url"].fillna("")
+
     df["DPL paaiškinimas"] = df.apply(
         lambda r: (
             f"Sandoris sudarytas DPL laikotarpiu: {r['dpl_days_to_report']} k. d. iki "
@@ -1359,8 +1408,8 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
         ),
         axis=1,
     )
-    return df
 
+    return df
 
 def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
