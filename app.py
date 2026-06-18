@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from datetime import date
+from datetime import date, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -7,10 +7,15 @@ from rinkos_logika import (
     generate_report,
     extract_dates_from_filename,
     download_nasdaq_statistics_excel,
+    vz_scrape_full,
 )
 from emitentu_atranka import generate_emitentu_ataskaita
 from crib_update import update_crib_news, get_latest_crib_news_date
-from vadovu_sandoriai import show_manager_transactions_page
+from supabase_cache import save_news_df
+try:
+    from vadovu_sandoriai import show_manager_transactions_page
+except Exception:
+    show_manager_transactions_page = None
 
 
 st.set_page_config(
@@ -608,7 +613,7 @@ with st.sidebar:
     vadovai_active = "active" if report_mode == "Vadovų sandoriai" else ""
     nav_html = f"""
         <div class="report-nav-title">
-            <div class="report-nav-icon">🏦</div>
+            <div class="report-nav-icon">📊</div>
             <div>Ataskaitos</div>
         </div>
         <div class="report-nav">
@@ -638,7 +643,7 @@ with st.sidebar:
         """
         <div class="news-db-block">
             <div class="sidebar-section-title">🔄 Naujienų bazė</div>
-            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus ir į Supabase įrašo tik tuos, kurių dar nėra DB.</div>
+            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus ir, jei yra paskutinės rinkos ataskaitos emitentų sąrašas, atnaujina VŽ straipsnius pagal tuos emitentus.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -668,6 +673,12 @@ with st.sidebar:
 
     if update_news_btn:
         try:
+            crib_inserted = 0
+            crib_pages = 0
+            vz_inserted = 0
+            vz_found = 0
+            vz_note = ""
+
             with st.spinner("Tikrinami nauji CRIB pranešimai..."):
                 stats = update_crib_news(
                     max_pages=20,
@@ -675,26 +686,41 @@ with st.sidebar:
                     headless=True,
                     progress=None,
                 )
+                crib_inserted = int(stats.get("records_inserted", 0) or 0)
+                crib_pages = int(stats.get("pages_processed", 0) or 0)
+
+            df_stat_for_vz = None
+            if st.session_state.report_result is not None:
+                df_stat_for_vz = st.session_state.report_result.get("df_raw")
+
+            if df_stat_for_vz is not None and not df_stat_for_vz.empty:
+                vz_start = date.today() - timedelta(days=14)
+                vz_end = date.today()
+                with st.spinner("Tikrinami nauji VŽ straipsniai pagal paskutinės ataskaitos emitentus..."):
+                    _, vz_df = vz_scrape_full(
+                        vz_start,
+                        vz_end,
+                        df_stat_for_vz,
+                        progress=None,
+                    )
+                    vz_found = len(vz_df) if vz_df is not None else 0
+                    vz_inserted = save_news_df(vz_df, "vz") if vz_df is not None and not vz_df.empty else 0
+            else:
+                vz_note = " VŽ neatnaujinta: pirmiausia sugeneruokite rinkos ataskaitą, kad būtų emitentų sąrašas."
 
             st.session_state.report_result = None
             st.session_state.emitentu_result = None
             st.session_state.news_update_message = (
-                f"Atnaujinta: naujai įrašyta {stats.get('records_inserted', 0)} pranešimų "
-                f"(patikrinta puslapių: {stats.get('pages_processed', 0)})."
+                f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
+                f"(patikrinta puslapių: {crib_pages}); "
+                f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
+                f"{vz_note}"
             )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko atnaujinti CRIB naujienų bazės.")
+            st.error("Nepavyko atnaujinti naujienų bazės.")
             st.exception(exc)
 
-
-
-# ------------------------------------------------------------
-# VADOVŲ SANDORIAI: atskira ataskaita, naudojanti Supabase manager_transactions lentelę
-# ------------------------------------------------------------
-if report_mode == "Vadovų sandoriai":
-    show_manager_transactions_page()
-    st.stop()
 
 
 # ------------------------------------------------------------
