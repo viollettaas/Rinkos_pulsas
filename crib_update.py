@@ -4,25 +4,15 @@ crib_update.py
 
 Greitas CRIB (Nasdaq emitentu pranesimu) atnaujinimas i Supabase.
 
-Skirta naudoti is Streamlit mygtuko:
-    from crib_update import update_crib_news
-    stats = update_crib_news()
-
-Logika:
+Naudojimo logika:
 - atidaro https://www.crib.lt/;
 - perjungia LT kalba;
-- eina nuo naujausiu CRIB puslapiu;
-- nuskaito pranesimus, atidaro detalius puslapius ir paima pilna teksta;
-- saugo i ta pacia Supabase lentele market_news per save_news_df(..., "crib");
-- jei pranesimo kategorija yra "Pranesimai apie vadovu sandorius", papildomai nuskaito PDF priedus ir saugo i manager_transactions;
-- dublikatai ignoruojami per unique_key logika supabase_cache.py ir pdf_url manager_transactions lenteleje;
-- jei pirmame puslapyje nieko naujo neranda, sustoja po pirmo puslapio;
-- jei randa nauju pranesimu, eina iki pirmo jau DB esancio pranesimo.
-
-Svarbus pataisymas Streamlit Cloud:
-- nebenaudojamas webdriver_manager ChromeDriverManager(), nes Streamlit Cloud aplinkoje jis gali parinkti
-  ChromeDriver versija, nesuderinama su /usr/bin/chromium;
-- naudojamas Selenium Manager per webdriver.Chrome(options=options), kuris parenka suderinama driveri.
+- tikrina pirma CRIB puslapi nuo virsaus;
+- jeigu URL jau yra Supabase market_news lenteleje -> STOP;
+- jeigu URL naujas -> atidaro detalu puslapi, paima pilna teksta ir iraso i DB;
+- jeigu yra keli nauji pranesimai is eiles, iraso juos visus iki pirmo jau DB esancio pranesimo;
+- dublikatai papildomai ignoruojami per unique_key logika supabase_cache.py faile;
+- jeigu pranesimas yra apie vadovu sandorius, papildomai apdoroja PDF, jei modulis yra prieinamas.
 """
 
 import os
@@ -47,17 +37,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException
 
-from supabase_cache import save_news_df, load_news_df, log_scrape
+from supabase_cache import save_news_df, load_news_df, log_scrape, _supabase_headers, _supabase_rest_url, _http_client
 
 try:
     from backfill_manager_transactions_from_crib import save_manager_transactions_from_crib_selenium
 except Exception:
     save_manager_transactions_from_crib_selenium = None
 
-
-NEXT_BUTTON_HOST_ID = "pagination"
 DETAIL_TIMEOUT = 18
-PAGE_SLEEP = 0.8
 
 
 def _notify(progress, message: str):
@@ -66,39 +53,18 @@ def _notify(progress, message: str):
 
 
 def init_driver(headless: bool = True):
-    """
-    Sukuria Chrome/Chromium driveri.
-
-    Naudojamas Selenium Manager, o ne webdriver_manager.ChromeDriverManager(),
-    kad Streamlit Cloud aplinkoje neatsirastu klaida:
-        ChromeDriver only supports Chrome version X, current browser version Y.
-    """
     options = Options()
     if headless:
         options.add_argument("--headless=new")
-
     options.add_argument("--window-size=1600,1200")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--lang=lt")
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors=yes")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.binary_location = "/usr/bin/chromium"
     options.set_capability("acceptInsecureCerts", True)
-
-    chromium_paths = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ]
-    for path in chromium_paths:
-        if os.path.exists(path):
-            options.binary_location = path
-            break
-
     return webdriver.Chrome(options=options)
 
 
@@ -382,11 +348,7 @@ def process_manager_transactions_for_records(driver, records, progress=None):
         "manager_transactions_errors": 0,
     }
 
-    if not records:
-        return stats
-
-    if save_manager_transactions_from_crib_selenium is None:
-        _notify(progress, "Vadovu sandoriu PDF modulis nerastas, todel manager_transactions neatnaujinta.")
+    if not records or save_manager_transactions_from_crib_selenium is None:
         return stats
 
     for r in records:
@@ -394,15 +356,10 @@ def process_manager_transactions_for_records(driver, records, progress=None):
         url = str(r.get("Nuoroda") or "").strip()
         published_at = r.get("Published_dt")
 
-        if not url:
-            continue
-
-        if not is_manager_transactions_category(category):
+        if not url or not is_manager_transactions_category(category):
             continue
 
         stats["manager_messages_processed"] += 1
-        _notify(progress, f"Nuskaitomi vadovu sandoriu PDF: {url}")
-
         try:
             saved = save_manager_transactions_from_crib_selenium(
                 driver=driver,
@@ -410,102 +367,21 @@ def process_manager_transactions_for_records(driver, records, progress=None):
                 published_at=published_at,
             )
             stats["manager_transactions_saved"] += int(saved or 0)
-        except Exception as exc:
+        except Exception:
             stats["manager_transactions_errors"] += 1
-            _notify(progress, f"Vadovu sandoriu PDF klaida: {exc}")
 
     return stats
 
 
-def click_next_in_shadow_pagination(driver, host_id=NEXT_BUTTON_HOST_ID):
-    js = f"""
-    try {{
-        const host = document.getElementById('{host_id}');
-        if (!host) return {{ok:false, reason:'no_host'}};
-        const sr = host.shadowRoot;
-        if (!sr) return {{ok:false, reason:'no_shadow'}};
-
-        let btn = sr.querySelector('button[aria-label="Next page"], button[aria-label*="Next"], button[title*="Next"]');
-
-        if (!btn) {{
-            const icons = sr.querySelectorAll('i, nef-icon');
-            for (const ic of icons) {{
-                const txt = (ic.innerText || ic.textContent || '').toLowerCase();
-                if (txt.includes('chevron_right') || txt.includes('chevron right')) {{
-                    btn = ic.closest ? ic.closest('button') : null;
-                    if (btn) break;
-                }}
-            }}
-        }}
-
-        if (!btn) {{
-            const buttons = Array.from(sr.querySelectorAll('button'));
-            for (const b of buttons) {{
-                const txt = (b.innerText || b.textContent || '').toLowerCase();
-                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                if (txt.includes('next') || aria.includes('next') || txt.includes('>') || txt.includes('›')) {{
-                    btn = b;
-                    break;
-                }}
-            }}
-        }}
-
-        if (!btn) return {{ok:false, reason:'no_button'}};
-        if (btn.disabled || btn.getAttribute('disabled') !== null) return {{ok:false, reason:'disabled'}};
-
-        btn.scrollIntoView({{block:'center'}});
-        try {{ btn.click(); }}
-        catch(e) {{ btn.dispatchEvent(new MouseEvent('click', {{bubbles:true, cancelable:true}})); }}
-        return {{ok:true, reason:'clicked'}};
-    }} catch(e) {{
-        return {{ok:false, reason:'exception', err:String(e)}};
-    }}
-    """
-    try:
-        res = driver.execute_script(js) or {}
-        return bool(res.get("ok")), res.get("reason", "")
-    except Exception as e:
-        return False, str(e)
-
-
-def first_row_signature(driver):
-    try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "nef-table-row.message-row")
-        if not rows:
-            return ""
-        txt = get_inner_text(driver, rows[0])
-        return re.sub(r"\s+", " ", txt).strip()
-    except Exception:
-        return ""
-
-
-def wait_for_page_change(driver, old_signature, timeout=12):
-    start = time.time()
-    while time.time() - start < timeout:
-        time.sleep(0.6)
-        sig = first_row_signature(driver)
-        if sig and sig != old_signature:
-            return True
-    return False
-
-
-def _make_existing_key_from_db_row(row) -> str:
-    url = str(row.get("url", "") or row.get("Nuoroda", "") or "").strip().lower()
-    if url:
-        return "url|" + url
-
-    title = str(row.get("title", "") or row.get("Pilna_antraštė", "") or "").strip().lower()
-    published = str(row.get("published_at", "") or row.get("Published_dt", "") or "").strip()
-    try:
-        published = pd.to_datetime(published, errors="coerce").strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        pass
-    company = str(row.get("company", "") or row.get("Bendrovė", "") or "").strip().lower()
-    return f"fallback|{company}|{title}|{published}"
+def _normalize_url(url: str) -> str:
+    url = str(url or "").strip().lower()
+    url = re.sub(r"([?&])lang=[a-z]{2}", "", url)
+    url = url.rstrip("?&")
+    return url
 
 
 def _make_existing_key_from_crib_row(row) -> str:
-    url = str(row.get("Nuoroda", "") or "").strip().lower()
+    url = _normalize_url(row.get("Nuoroda", ""))
     if url:
         return "url|" + url
 
@@ -519,26 +395,53 @@ def _make_existing_key_from_crib_row(row) -> str:
     return f"fallback|{company}|{title}|{published}"
 
 
-def load_existing_crib_keys(start_lookup: date = date(2023, 1, 1)) -> set:
-    try:
-        df_existing = load_news_df("crib", start_lookup, date.today())
-    except Exception:
-        return set()
-
-    if df_existing is None or df_existing.empty:
-        return set()
-
-    return {
-        _make_existing_key_from_db_row(row)
-        for _, row in df_existing.iterrows()
-        if _make_existing_key_from_db_row(row)
+def load_recent_crib_keys(limit: int = 300) -> set:
+    """
+    Užkrauna tik naujausius CRIB URL/raktus iš DB.
+    Nebekrauna visos CRIB istorijos, todėl atnaujinimas daug greitesnis.
+    """
+    url = _supabase_rest_url("market_news")
+    params = {
+        "select": "url,title,company,published_at",
+        "source": "eq.crib",
+        "order": "published_at.desc",
+        "limit": str(limit),
     }
+
+    try:
+        with _http_client() as client:
+            response = client.get(url, headers=_supabase_headers(), params=params)
+            response.raise_for_status()
+            data = response.json() or []
+    except Exception:
+        # Atsarginis variantas, jei tiesioginė REST užklausa nepavyktų.
+        try:
+            df_existing = load_news_df("crib", date.today().replace(year=max(2023, date.today().year - 1)), date.today())
+            data = df_existing.to_dict("records") if df_existing is not None and not df_existing.empty else []
+        except Exception:
+            data = []
+
+    keys = set()
+    for row in data:
+        db_url = _normalize_url(row.get("url", ""))
+        if db_url:
+            keys.add("url|" + db_url)
+            continue
+
+        title = str(row.get("title", "") or "").strip().lower()
+        company = str(row.get("company", "") or "").strip().lower()
+        published = row.get("published_at")
+        try:
+            published = pd.to_datetime(published, errors="coerce").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            published = str(published or "").strip()
+        keys.add(f"fallback|{company}|{title}|{published}")
+
+    return keys
 
 
 def get_latest_crib_news_date():
     try:
-        from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
-
         url = _supabase_rest_url("market_news")
         params = {
             "select": "published_at,title,company,url",
@@ -573,8 +476,24 @@ def get_latest_crib_news_date():
             return None
 
 
-def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, stop_empty_pages: int = None):
-    existing_keys = load_existing_crib_keys()
+def update_crib_news(max_pages: int = 1, headless: bool = True, progress=None, stop_empty_pages: int = None, recent_key_limit: int = 300):
+    """
+    Atnaujina CRIB naujienų bazę greituoju režimu.
+
+    Logika:
+    - užkrauna tik paskutinius recent_key_limit DB raktų;
+    - atidaro tik pirmą CRIB puslapį;
+    - eina nuo viršaus;
+    - jei randa jau DB esantį URL/raktą -> STOP;
+    - jei URL naujas -> tik tada atidaro detalų puslapį;
+    - įrašo naujus pranešimus į Supabase.
+
+    Pastaba dėl ilgų laikotarpių:
+    - generuojant ataskaitas jos skaito DB;
+    - jei istorinis laikotarpis dar nėra DB, reikia jį užpildyti backfill skriptu;
+    - šis update skirtas naujausiems pranešimams papildyti, ne istorijai nuo nulio krauti.
+    """
+    existing_keys = load_recent_crib_keys(limit=recent_key_limit)
 
     driver = init_driver(headless=headless)
     total_found = 0
@@ -583,8 +502,7 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
     total_manager_messages_processed = 0
     total_manager_transactions_saved = 0
     total_manager_transactions_errors = 0
-    page = 1
-    reached_existing = False
+    pages_processed = 0
 
     try:
         _notify(progress, "Atidaromas CRIB...")
@@ -600,101 +518,93 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
             EC.presence_of_element_located((By.CSS_SELECTOR, "nef-table-row.message-row"))
         )
 
-        while page <= max_pages:
-            _notify(progress, f"Tikrinamas CRIB puslapis {page}...")
-            rows_basic = parse_crib_rows_on_page(driver)
+        _notify(progress, "Tikrinamas pirmas CRIB puslapis...")
+        rows_basic = parse_crib_rows_on_page(driver)
+        pages_processed = 1
+        total_found = len(rows_basic)
 
-            if not rows_basic:
-                break
-
-            page_dates = [r["Published_dt"].date() for r in rows_basic if r.get("Published_dt") is not None]
-            newest_on_page = max(page_dates) if page_dates else date.today()
-            oldest_on_page = min(page_dates) if page_dates else date.today()
-
-            new_rows = []
-            for r in rows_basic:
-                key = _make_existing_key_from_crib_row(r)
-
-                if existing_keys and key in existing_keys:
-                    reached_existing = True
-                    break
-
-                new_rows.append(r)
-
-            if page == 1 and not new_rows:
-                _notify(progress, "Nauju CRIB pranesimu pirmame puslapyje nerasta.")
-                total_found += len(rows_basic)
-                break
-
-            records = []
-            for idx, r in enumerate(new_rows, start=1):
-                url = str(r.get("Nuoroda") or "").strip()
-                title = str(r.get("Pilna_antraštė") or "").strip()
-                full_title, full_text = "", ""
-
-                if url:
-                    full_title, full_text = open_detail_in_new_tab(driver, url)
-
-                if full_title:
-                    r["Pilna_antraštė"] = full_title
-                elif title:
-                    r["Pilna_antraštė"] = title
-
-                r["Pilnas_tekstas"] = full_text or ""
-                r["Naujiena"] = make_news_label(r)
-                records.append(r)
-
-            df_page = pd.DataFrame(records)
-            df_page = add_company_norm(df_page)
-
-            found = len(df_page)
-            inserted = 0
-            manager_stats = {
+        if not rows_basic:
+            return {
+                "pages_processed": pages_processed,
+                "records_found": total_found,
+                "records_inserted": 0,
+                "new_candidates": 0,
                 "manager_messages_processed": 0,
                 "manager_transactions_saved": 0,
                 "manager_transactions_errors": 0,
             }
 
-            if found > 0:
-                inserted = save_news_df(df_page, "crib")
-                try:
-                    log_scrape("crib", newest_on_page, oldest_on_page, "success", found)
-                except Exception:
-                    pass
+        page_dates = [r["Published_dt"].date() for r in rows_basic if r.get("Published_dt") is not None]
+        newest_on_page = max(page_dates) if page_dates else date.today()
+        oldest_on_page = min(page_dates) if page_dates else date.today()
 
-                for _, row in df_page.iterrows():
-                    existing_keys.add(_make_existing_key_from_crib_row(row))
-
-                manager_stats = process_manager_transactions_for_records(
-                    driver=driver,
-                    records=records,
-                    progress=progress,
-                )
-
-            total_found += len(rows_basic)
-            total_new_candidates += found
-            total_inserted += inserted
-            total_manager_messages_processed += manager_stats.get("manager_messages_processed", 0)
-            total_manager_transactions_saved += manager_stats.get("manager_transactions_saved", 0)
-            total_manager_transactions_errors += manager_stats.get("manager_transactions_errors", 0)
-
-            if reached_existing:
+        new_rows = []
+        for r in rows_basic:
+            key = _make_existing_key_from_crib_row(r)
+            if existing_keys and key in existing_keys:
                 break
+            new_rows.append(r)
 
-            old_sig = first_row_signature(driver)
-            clicked, _reason = click_next_in_shadow_pagination(driver)
-            if not clicked:
-                break
+        if not new_rows:
+            return {
+                "pages_processed": pages_processed,
+                "records_found": total_found,
+                "records_inserted": 0,
+                "new_candidates": 0,
+                "manager_messages_processed": 0,
+                "manager_transactions_saved": 0,
+                "manager_transactions_errors": 0,
+            }
 
-            changed = wait_for_page_change(driver, old_sig, timeout=12)
-            if not changed:
-                break
+        records = []
+        for r in new_rows:
+            url = str(r.get("Nuoroda") or "").strip()
+            title = str(r.get("Pilna_antraštė") or "").strip()
+            full_title, full_text = "", ""
 
-            page += 1
-            time.sleep(PAGE_SLEEP)
+            if url:
+                full_title, full_text = open_detail_in_new_tab(driver, url)
+
+            if full_title:
+                r["Pilna_antraštė"] = full_title
+            elif title:
+                r["Pilna_antraštė"] = title
+
+            r["Pilnas_tekstas"] = full_text or ""
+            r["Naujiena"] = make_news_label(r)
+            records.append(r)
+
+        df_page = pd.DataFrame(records)
+        df_page = add_company_norm(df_page)
+
+        inserted = 0
+        manager_stats = {
+            "manager_messages_processed": 0,
+            "manager_transactions_saved": 0,
+            "manager_transactions_errors": 0,
+        }
+
+        if df_page is not None and not df_page.empty:
+            inserted = save_news_df(df_page, "crib")
+            try:
+                log_scrape("crib", newest_on_page, oldest_on_page, "success", len(df_page))
+            except Exception:
+                pass
+
+            manager_stats = process_manager_transactions_for_records(
+                driver=driver,
+                records=records,
+                progress=progress,
+            )
+
+        total_new_candidates = len(df_page) if df_page is not None else 0
+        total_inserted = int(inserted or 0)
+        total_manager_messages_processed = manager_stats.get("manager_messages_processed", 0)
+        total_manager_transactions_saved = manager_stats.get("manager_transactions_saved", 0)
+        total_manager_transactions_errors = manager_stats.get("manager_transactions_errors", 0)
 
         return {
-            "pages_processed": page,
+            "pages_processed": pages_processed,
             "records_found": total_found,
             "records_inserted": total_inserted,
             "new_candidates": total_new_candidates,
