@@ -969,6 +969,18 @@ with st.sidebar:
 
 
 
+
+# ------------------------------------------------------------
+# VADOVŲ SANDORIAI: atskira ataskaita, naudojanti Supabase manager_transactions lentelę
+# ------------------------------------------------------------
+if report_mode == "Vadovų sandoriai":
+    if show_manager_transactions_page is None:
+        st.error("Nepavyko užkrauti vadovų sandorių modulio `vadovu_sandoriai.py`.")
+        st.stop()
+
+    show_manager_transactions_page()
+    st.stop()
+
 # ------------------------------------------------------------
 # EMITENTŲ ATRANKA: atskira ataskaita, naudojanti tą pačią Supabase market_news lentelę
 # ------------------------------------------------------------
