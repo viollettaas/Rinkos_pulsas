@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 
-import re
 import os
+import re
 import warnings
 from datetime import date, timedelta
 from io import BytesIO
 from urllib.parse import urljoin
 
+import pandas as pd
+import streamlit as st
 import requests
 import pdfplumber
-import pandas as pd
 import urllib3
-import streamlit as st
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
@@ -30,6 +30,12 @@ except Exception:
     load_manager_transactions_df = None
 
 
+# ------------------------------------------------------------
+# Vadovu sandoriu atnaujinimas ir taisymas.
+# Viskas siame faile: nereikia manager_transactions_update.py ir
+# nereikia backfill_manager_transactions_from_crib.py.
+# ------------------------------------------------------------
+
 MANAGER_CATEGORY_TOKENS = (
     "pranešimai apie vadovų sandorius",
     "pranesimai apie vadovu sandorius",
@@ -38,9 +44,32 @@ MANAGER_CATEGORY_TOKENS = (
     "vadovu sandori",
 )
 
+MANAGER_TRANSACTION_COLUMNS = {
+    "crib_url",
+    "crib_title",
+    "crib_category",
+    "published_at",
+    "pdf_url",
+    "pdf_name",
+    "issuer",
+    "lei",
+    "person_name",
+    "person_role",
+    "isin",
+    "instrument",
+    "transaction_type",
+    "price",
+    "quantity",
+    "transaction_date",
+    "venue",
+    "raw_text",
+    "parse_status",
+    "price_quantity_note",
+}
+
 
 # ------------------------------------------------------------
-# Bendros pagalbinės funkcijos
+# Bendros pagalbines funkcijos
 # ------------------------------------------------------------
 
 def _notify(progress, message: str):
@@ -71,6 +100,210 @@ def _supabase_client_parts():
 def _collapse_ws(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
+
+def _to_iso_timestamp(value):
+    try:
+        if value is not None and not pd.isna(value):
+            return pd.to_datetime(value).isoformat()
+    except Exception:
+        pass
+    return None
+
+
+def _filter_row_for_manager_transactions(row: dict) -> dict:
+    return {k: v for k, v in (row or {}).items() if k in MANAGER_TRANSACTION_COLUMNS}
+
+
+# ------------------------------------------------------------
+# Supabase manager_transactions CRUD
+# ------------------------------------------------------------
+
+def _manager_pdf_already_saved(pdf_url: str) -> bool:
+    if not pdf_url:
+        return False
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {"select": "id,pdf_url", "pdf_url": f"eq.{pdf_url}", "limit": "1"}
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            return bool(resp.json() or [])
+    except Exception:
+        return False
+
+
+def _manager_transaction_already_saved_by_signature(row: dict) -> bool:
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {
+            "select": "id,pdf_url",
+            "crib_url": f"eq.{row.get('crib_url', '')}",
+            "issuer": f"eq.{row.get('issuer', '')}",
+            "person_name": f"eq.{row.get('person_name', '')}",
+            "transaction_date": f"eq.{row.get('transaction_date', '')}",
+            "isin": f"eq.{row.get('isin', '')}",
+            "limit": "1",
+        }
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            return bool(resp.json() or [])
+    except Exception:
+        return False
+
+
+def _post_manager_transaction(row: dict) -> bool:
+    _headers, _url, _client = _supabase_client_parts()
+    url = _url("manager_transactions")
+    clean_row = _filter_row_for_manager_transactions(row)
+
+    with _client() as client:
+        resp = client.post(
+            url,
+            headers={**_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json=clean_row,
+        )
+        if resp.status_code in (200, 201, 204):
+            return True
+        if resp.status_code == 409:
+            return False
+        raise RuntimeError(f"Supabase manager_transactions irasymo klaida: {resp.status_code} - {resp.text}")
+
+
+def _update_manager_transaction_by_id(row_id: int, parsed_row: dict) -> bool:
+    _headers, _url, _client = _supabase_client_parts()
+    url = _url("manager_transactions")
+    clean_row = _filter_row_for_manager_transactions(parsed_row)
+
+    # created_at nekeiciame, id nesiunciame.
+    clean_row.pop("id", None)
+
+    with _client() as client:
+        resp = client.patch(
+            url,
+            headers={**_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{row_id}"},
+            json=clean_row,
+        )
+        if resp.status_code in (200, 204):
+            return True
+        raise RuntimeError(f"Supabase manager_transactions update klaida: {resp.status_code} - {resp.text}")
+
+
+def _delete_manager_transactions_for_crib_url(crib_url: str) -> int:
+    if not crib_url:
+        return 0
+    _headers, _url, _client = _supabase_client_parts()
+    url = _url("manager_transactions")
+    with _client() as client:
+        resp = client.delete(
+            url,
+            headers={**_headers(), "Prefer": "return=representation"},
+            params={"crib_url": f"eq.{crib_url}"},
+        )
+        if resp.status_code not in (200, 204):
+            raise RuntimeError(f"Supabase manager_transactions delete klaida: {resp.status_code} - {resp.text}")
+        try:
+            return len(resp.json() or [])
+        except Exception:
+            return 0
+
+
+# ------------------------------------------------------------
+# CRIB / PDF nuskaitymas
+# ------------------------------------------------------------
+
+def _extract_pdf_links_from_html(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        text = (a.get_text(" ", strip=True) or "").lower()
+        href_l = href.lower()
+        if ".pdf" in href_l or "download" in href_l or "attachment" in href_l or "pdf" in text:
+            full = urljoin(base_url, href)
+            if full not in links:
+                links.append(full)
+    return links
+
+
+def _extract_pdf_links_from_crib_page(driver, crib_url: str) -> list[str]:
+    if not crib_url:
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    try:
+        resp = requests.get(crib_url, headers=headers, verify=False, timeout=25)
+        if resp.ok and resp.text:
+            links = _extract_pdf_links_from_html(resp.text, crib_url)
+            if links:
+                return links
+    except Exception:
+        pass
+
+    # Atsarginis variantas per Selenium.
+    main_handle = None
+    try:
+        main_handle = driver.current_window_handle
+        driver.execute_script("window.open('about:blank','_blank');")
+        driver.switch_to.window(driver.window_handles[-1])
+        driver.get(crib_url)
+        try:
+            WebDriverWait(driver, 18).until(lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"})
+        except Exception:
+            pass
+        links = _extract_pdf_links_from_html(driver.page_source, crib_url)
+        driver.close()
+        driver.switch_to.window(main_handle)
+        return links
+    except Exception:
+        try:
+            if len(driver.window_handles) > 1:
+                driver.close()
+            if main_handle:
+                driver.switch_to.window(main_handle)
+        except Exception:
+            pass
+        return []
+
+
+def _extract_pdf_text(pdf_url: str) -> str:
+    if not pdf_url:
+        return ""
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    resp = requests.get(pdf_url, headers=headers, verify=False, timeout=45)
+    resp.raise_for_status()
+
+    content = resp.content or b""
+    if len(content) < 100:
+        return ""
+
+    texts = []
+    with pdfplumber.open(BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            try:
+                txt = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            except Exception:
+                txt = page.extract_text() or ""
+            if txt:
+                texts.append(txt)
+    return "\n".join(texts).strip()
+
+
+# ------------------------------------------------------------
+# PDF parseris
+# ------------------------------------------------------------
 
 def _parse_number(value: str, as_int: bool = False):
     if value is None:
@@ -108,7 +341,8 @@ def _text_after_label(text: str, labels, max_len: int = 160) -> str:
         pattern = rf"(?:^|\n|\s){label}\s*[:\-]?\s*(.+?)(?=\n[a-z]\)|\n\d\.|\n[A-ZĄČĘĖĮŠŲŪŽ][^\n]{{0,80}}\s*[:\-]?|$)"
         m = re.search(pattern, text, flags=re.I | re.S)
         if m:
-            return _collapse_ws(m.group(1))[:max_len]
+            value = _collapse_ws(m.group(1))
+            return value[:max_len]
     return ""
 
 
@@ -116,169 +350,28 @@ def _extract_date_from_text(text: str):
     if not text:
         return None
     patterns = [
-        r"(\d{4}[-.]\d{2}[-.]\d{2})",
-        r"(\d{2}[-.]\d{2}[-.]\d{4})",
+        (r"(\d{4}[-.]\d{2}[-.]\d{2})", False),
+        (r"(\d{2}[-.]\d{2}[-.]\d{4})", True),
     ]
-    for pat in patterns:
+    for pat, dayfirst in patterns:
         m = re.search(pat, text)
         if m:
-            dt = pd.to_datetime(m.group(1), errors="coerce", dayfirst=pat.startswith("(\\d{2}"))
+            dt = pd.to_datetime(m.group(1), errors="coerce", dayfirst=dayfirst)
             if pd.notna(dt):
                 return dt.date().isoformat()
     return None
 
 
-# ------------------------------------------------------------
-# PDF ir CRIB puslapio nuskaitymas
-# ------------------------------------------------------------
-
-def _extract_pdf_text(pdf_url: str) -> str:
-    if not pdf_url:
-        return ""
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/pdf,*/*",
-    }
-    response = requests.get(pdf_url, headers=headers, verify=False, timeout=60)
-    response.raise_for_status()
-
-    text_parts = []
-    with pdfplumber.open(BytesIO(response.content)) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            if txt.strip():
-                text_parts.append(txt)
-    return "\n".join(text_parts).strip()
-
-
-def _extract_pdf_links_from_crib_page(driver, crib_url: str) -> list[str]:
-    if not crib_url:
-        return []
-
-    try:
-        driver.get(crib_url)
-        WebDriverWait(driver, 20).until(
-            lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"}
-        )
-    except Exception:
-        pass
-
-    try:
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-    except Exception:
-        return []
-
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
-        text = a.get_text(" ", strip=True).lower()
-        href_l = href.lower()
-        if ".pdf" in href_l or "download" in href_l or "attachment" in href_l or "pried" in text or "pdf" in text:
-            full = urljoin(crib_url, href)
-            if full not in links:
-                links.append(full)
-
-    return links
-
-
-# ------------------------------------------------------------
-# Supabase įrašymas ir deduplikacija
-# ------------------------------------------------------------
-
-def _manager_pdf_already_saved(pdf_url: str) -> bool:
-    if not pdf_url:
-        return False
-    try:
-        _headers, _url, _client = _supabase_client_parts()
-        url = _url("manager_transactions")
-        params = {"select": "pdf_url", "pdf_url": f"eq.{pdf_url}", "limit": "1"}
-        with _client() as client:
-            resp = client.get(url, headers=_headers(), params=params)
-            resp.raise_for_status()
-            return bool(resp.json() or [])
-    except Exception:
-        return False
-
-
-def _manager_transaction_already_saved_by_signature(row: dict) -> bool:
-    try:
-        _headers, _url, _client = _supabase_client_parts()
-        url = _url("manager_transactions")
-        params = {
-            "select": "id,pdf_url",
-            "crib_url": f"eq.{row.get('crib_url', '')}",
-            "issuer": f"eq.{row.get('issuer', '')}",
-            "person_name": f"eq.{row.get('person_name', '')}",
-            "transaction_date": f"eq.{row.get('transaction_date', '')}",
-            "isin": f"eq.{row.get('isin', '')}",
-            "limit": "1",
-        }
-        with _client() as client:
-            resp = client.get(url, headers=_headers(), params=params)
-            resp.raise_for_status()
-            return bool(resp.json() or [])
-    except Exception:
-        return False
-
-
-def _post_manager_transaction(row: dict) -> bool:
-    _headers, _url, _client = _supabase_client_parts()
-    url = _url("manager_transactions")
-    with _client() as client:
-        resp = client.post(
-            url,
-            headers={**_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
-            json=row,
-        )
-        if resp.status_code in (200, 201, 204):
-            return True
-        if resp.status_code == 409:
-            return False
-        raise RuntimeError(f"Supabase manager_transactions įrašymo klaida: {resp.status_code} - {resp.text}")
-
-
-def _delete_manager_transactions_for_crib_url(crib_url: str) -> int:
-    """Naudojama paskutinio pranešimo perskaičiavimui: ištrina tik to vieno CRIB URL įrašus."""
-    if not crib_url:
-        return 0
-    try:
-        _headers, _url, _client = _supabase_client_parts()
-        url = _url("manager_transactions")
-        params = {"crib_url": f"eq.{crib_url}"}
-        with _client() as client:
-            resp = client.delete(url, headers={**_headers(), "Prefer": "return=representation"}, params=params)
-            if resp.status_code in (200, 201, 204):
-                try:
-                    return len(resp.json() or [])
-                except Exception:
-                    return 0
-            raise RuntimeError(f"Supabase trynimo klaida: {resp.status_code} - {resp.text}")
-    except Exception:
-        return 0
-
-
-# ------------------------------------------------------------
-# MAR formos PDF parseris
-# ------------------------------------------------------------
-
-def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None) -> dict:
+def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> dict:
     text = text or ""
 
     person = _regex_value(text, r"1\..*?a\)\s*Pavadinimas\s+(.+?)\s+2\.")
     role = _regex_value(text, r"Pareigos\s*/\s*statusas\s+(.+?)\s+b\)\s*Pirminis")
     issuer = _regex_value(text, r"3\..*?a\)\s*Pavadinimas\s+(.+?)\s+b\)\s*LEI")
+    lei = _regex_value(text, r"b\)\s*LEI\s+([A-Z0-9]{18,20})")
     transaction_type = _regex_value(text, r"b\)\s*Sandorio pobūdis\s+(.+?)\s+c\)\s*Kaina")
     venue = _regex_value(text, r"f\)\s*Sandorio vieta\s+(.+?)\s*$")
-
-    transaction_date = (
-        _regex_value(text, r"e\)\s*Sandorio data\s+(\d{4}[-.]\d{2}[-.]\d{2})")
-        or _extract_date_from_text(text)
-    )
+    transaction_date = _regex_value(text, r"e\)\s*Sandorio data\s+(\d{4}[-.]\d{2}[-.]\d{2})") or _extract_date_from_text(text)
 
     isin_match = re.search(r"(?:ISIN\s*kodas\s*:\s*)?\b([A-Z]{2}[A-Z0-9]{10})\b", text, flags=re.I)
     isin = isin_match.group(1).upper() if isin_match else ""
@@ -319,23 +412,17 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     if not venue:
         venue = _text_after_label(text, [r"Sandorio vieta", r"Prekybos vieta", r"Place of the transaction", r"Trading venue", r"Venue"])
 
-    # Supaprastiname transaction_type, jei yra ilgas paaiškinimas.
-    if transaction_type.lower().startswith("pardavimas"):
-        transaction_type = "Pardavimas"
-    elif transaction_type.lower().startswith("pirkimas"):
-        transaction_type = "Pirkimas"
-
-    published_iso = None
+    pdf_name = ""
     try:
-        if published_at is not None and not pd.isna(published_at):
-            published_iso = pd.to_datetime(published_at).isoformat()
+        pdf_name = pdf_url.split("/")[-1].split("?")[0]
     except Exception:
-        published_iso = None
+        pass
 
     return {
-        "published_at": published_iso,
+        "published_at": _to_iso_timestamp(published_at),
         "transaction_date": transaction_date,
         "issuer": issuer,
+        "lei": lei,
         "person_name": person,
         "person_role": role,
         "isin": isin,
@@ -347,17 +434,21 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
         "parse_status": "parsed_mar_form" if text else "pdf_text_empty",
         "price_quantity_note": "",
         "pdf_url": pdf_url,
+        "pdf_name": pdf_name,
         "crib_url": crib_url,
+        "crib_title": crib_title or "",
+        "crib_category": crib_category or "",
         "raw_text": text[:12000] if text else "",
     }
 
 
-def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None, force_reparse: bool = False) -> int:
+# ------------------------------------------------------------
+# Nauju vadovu sandoriu irasymas is market_news
+# ------------------------------------------------------------
+
+def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> int:
     if not crib_url:
         return 0
-
-    if force_reparse:
-        _delete_manager_transactions_for_crib_url(crib_url)
 
     pdf_links = _extract_pdf_links_from_crib_page(driver, crib_url)
     if not pdf_links:
@@ -365,18 +456,33 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
 
     saved = 0
     for pdf_url in pdf_links:
-        if not force_reparse and _manager_pdf_already_saved(pdf_url):
+        if _manager_pdf_already_saved(pdf_url):
             continue
         try:
             text = _extract_pdf_text(pdf_url)
-            row = _parse_manager_transaction_pdf_text(text, pdf_url=pdf_url, crib_url=crib_url, published_at=published_at)
-            if not force_reparse and _manager_transaction_already_saved_by_signature(row):
+            row = _parse_manager_transaction_pdf_text(
+                text,
+                pdf_url=pdf_url,
+                crib_url=crib_url,
+                published_at=published_at,
+                crib_title=crib_title,
+                crib_category=crib_category,
+            )
+            if _manager_transaction_already_saved_by_signature(row):
                 continue
             if _post_manager_transaction(row):
                 saved += 1
-        except Exception:
-            row = _parse_manager_transaction_pdf_text("", pdf_url=pdf_url, crib_url=crib_url, published_at=published_at)
+        except Exception as exc:
+            row = _parse_manager_transaction_pdf_text(
+                "",
+                pdf_url=pdf_url,
+                crib_url=crib_url,
+                published_at=published_at,
+                crib_title=crib_title,
+                crib_category=crib_category,
+            )
             row["parse_status"] = "pdf_parse_error"
+            row["price_quantity_note"] = str(exc)[:500]
             try:
                 if _post_manager_transaction(row):
                     saved += 1
@@ -384,10 +490,6 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
                 pass
     return saved
 
-
-# ------------------------------------------------------------
-# CRIB vadovų pranešimų atranka iš market_news
-# ------------------------------------------------------------
 
 def _is_manager_notice(row) -> bool:
     text = " ".join([
@@ -457,19 +559,20 @@ def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messag
                 published_at = None
 
             stats["manager_messages_processed"] += 1
-            _notify(progress, f"Tikrinamas vadovų sandorių CRIB pranešimas: {url}")
+            _notify(progress, f"Tikrinamas vadovu sandoriu CRIB pranesimas: {url}")
 
             try:
                 saved = save_manager_transactions_from_crib_selenium(
                     driver=driver,
                     crib_url=url,
                     published_at=published_at,
-                    force_reparse=False,
+                    crib_title=str(row.get("title", "") or ""),
+                    crib_category=str(row.get("category", "") or ""),
                 )
                 stats["manager_transactions_saved"] += int(saved or 0)
             except Exception as exc:
                 stats["manager_transactions_errors"] += 1
-                _notify(progress, f"Vadovų sandorių PDF klaida: {exc}")
+                _notify(progress, f"Vadovu sandoriu PDF klaida: {exc}")
 
     finally:
         try:
@@ -480,34 +583,118 @@ def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messag
     return stats
 
 
-def update_latest_manager_transaction_notice(days_back: int = 45, headless: bool = True, progress=None) -> dict:
-    """
-    Perskaičiuoja tik naujausią CRIB vadovų sandorių pranešimą:
-    - randa naujausią market_news CRIB vadovų pranešimą;
-    - ištrina tik to CRIB URL įrašus manager_transactions;
-    - iš naujo nuskaito PDF ir įrašo su pataisytu parseriu.
-    """
+# ------------------------------------------------------------
+# Blogai nuskaitytu PDF taisymas be trynimo
+# ------------------------------------------------------------
+
+def _load_bad_manager_transactions(limit: int = 200) -> pd.DataFrame:
+    _headers, _url, _client = _supabase_client_parts()
+    url = _url("manager_transactions")
+    params = {
+        "select": "id,published_at,pdf_url,pdf_name,crib_url,crib_title,crib_category,issuer,person_name,transaction_date,parse_status",
+        "order": "id.desc",
+        "limit": str(limit),
+    }
+    with _client() as client:
+        resp = client.get(url, headers=_headers(), params=params)
+        resp.raise_for_status()
+        data = resp.json() or []
+
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    for col in ["issuer", "person_name", "transaction_date", "parse_status", "pdf_url"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    mask = (
+        df["pdf_url"].fillna("").astype(str).str.strip().ne("")
+        & (
+            df["issuer"].fillna("").astype(str).str.strip().eq("")
+            | df["person_name"].fillna("").astype(str).str.strip().eq("")
+            | df["transaction_date"].fillna("").astype(str).str.strip().eq("")
+            | df["parse_status"].fillna("").astype(str).isin(["pdf_parse_error", "pdf_text_empty"])
+        )
+    )
+    return df[mask].copy().reset_index(drop=True)
+
+
+def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
     stats = {
-        "manager_messages_found": 0,
-        "manager_messages_processed": 0,
-        "manager_transactions_saved": 0,
-        "manager_transactions_errors": 0,
-        "latest_crib_url": "",
+        "bad_found": 0,
+        "repaired": 0,
+        "failed": 0,
     }
 
-    notices = _load_recent_manager_crib_notices(days_back=days_back)
+    bad_df = _load_bad_manager_transactions(limit=limit)
+    if bad_df is None or bad_df.empty:
+        return stats
+
+    stats["bad_found"] = len(bad_df)
+
+    for _, r in bad_df.iterrows():
+        row_id = int(r.get("id"))
+        pdf_url = str(r.get("pdf_url") or "").strip()
+        crib_url = str(r.get("crib_url") or "").strip()
+
+        if not pdf_url:
+            stats["failed"] += 1
+            continue
+
+        _notify(progress, f"Taisomas manager_transactions id={row_id}")
+
+        try:
+            text = _extract_pdf_text(pdf_url)
+            parsed = _parse_manager_transaction_pdf_text(
+                text,
+                pdf_url=pdf_url,
+                crib_url=crib_url,
+                published_at=r.get("published_at"),
+                crib_title=str(r.get("crib_title") or ""),
+                crib_category=str(r.get("crib_category") or ""),
+            )
+
+            # Jei parseris vis tiek nieko naudingo nerado, paliekame klaidos statusa.
+            if not parsed.get("issuer") and not parsed.get("person_name"):
+                parsed["parse_status"] = "pdf_parse_empty_after_retry"
+
+            _update_manager_transaction_by_id(row_id, parsed)
+            stats["repaired"] += 1
+        except Exception as exc:
+            stats["failed"] += 1
+            try:
+                _update_manager_transaction_by_id(row_id, {
+                    "parse_status": "pdf_repair_error",
+                    "price_quantity_note": str(exc)[:500],
+                })
+            except Exception:
+                pass
+
+    return stats
+
+
+def recalc_latest_manager_notice(headless: bool = True, progress=None) -> dict:
+    stats = {
+        "notice_found": False,
+        "deleted": 0,
+        "inserted": 0,
+        "errors": 0,
+    }
+
+    notices = _load_recent_manager_crib_notices(days_back=45)
     if notices is None or notices.empty:
         return stats
 
-    row = notices.iloc[0]
-    crib_url = str(row.get("url", "") or "").strip()
-    stats["manager_messages_found"] = len(notices)
-    stats["latest_crib_url"] = crib_url
-
+    latest = notices.iloc[0]
+    crib_url = str(latest.get("url", "") or "").strip()
     if not crib_url:
         return stats
 
-    published_at = row.get("published_at", None)
+    stats["notice_found"] = True
+    stats["deleted"] = _delete_manager_transactions_for_crib_url(crib_url)
+
+    published_at = latest.get("published_at", None)
     try:
         published_at = pd.to_datetime(published_at, errors="coerce")
         if pd.isna(published_at):
@@ -519,16 +706,15 @@ def update_latest_manager_transaction_notice(days_back: int = 45, headless: bool
 
     driver = _init_driver(headless=headless)
     try:
-        stats["manager_messages_processed"] = 1
-        saved = save_manager_transactions_from_crib_selenium(
+        stats["inserted"] = save_manager_transactions_from_crib_selenium(
             driver=driver,
             crib_url=crib_url,
             published_at=published_at,
-            force_reparse=True,
+            crib_title=str(latest.get("title", "") or ""),
+            crib_category=str(latest.get("category", "") or ""),
         )
-        stats["manager_transactions_saved"] = int(saved or 0)
     except Exception:
-        stats["manager_transactions_errors"] = 1
+        stats["errors"] += 1
         raise
     finally:
         try:
@@ -540,7 +726,7 @@ def update_latest_manager_transaction_notice(days_back: int = 45, headless: bool
 
 
 # ------------------------------------------------------------
-# Ataskaitos duomenų paruošimas
+# Lenteles paruosimas
 # ------------------------------------------------------------
 
 def _load_manager_transactions_df_fallback(start_date, end_date) -> pd.DataFrame:
@@ -563,7 +749,7 @@ def _load_manager_transactions_df_fallback(start_date, end_date) -> pd.DataFrame
 
         return pd.DataFrame(data)
     except Exception as exc:
-        st.error(f"Nepavyko nuskaityti manager_transactions lentelės: {exc}")
+        st.error(f"Nepavyko nuskaityti manager_transactions lenteles: {exc}")
         return pd.DataFrame()
 
 
@@ -577,9 +763,7 @@ def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
     df = load_news_df("crib", start_date, end_date)
 
     if df is None or df.empty:
-        return pd.DataFrame(
-            columns=["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"]
-        )
+        return pd.DataFrame(columns=["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"])
 
     df = df.copy()
     df["issuer"] = df.get("company", "").fillna("").astype(str).str.strip()
@@ -595,12 +779,25 @@ def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
 
 ANNUAL_PATTERNS = [r"\bmetin", r"\bannual\s+report\b", r"\baudited\b", r"\baudituot"]
 HALF_YEAR_PATTERNS = [
-    r"\b6\s*m[ėe]n", r"\bšešių\s+m[ėe]nesių\b", r"\bpusme", r"\bhalf[- ]year\b",
-    r"\bsemi[- ]annual\b", r"\b6\s*months\b", r"\bsix\s+months\b",
+    r"\b6\s*m[ėe]n",
+    r"\bšešių\s+m[ėe]nesių\b",
+    r"\bpusme",
+    r"\bhalf[- ]year\b",
+    r"\bsemi[- ]annual\b",
+    r"\b6\s*months\b",
+    r"\bsix\s+months\b",
 ]
 EXCLUDE_PATTERNS = [
-    r"\b3\s*m[ėe]n", r"\b9\s*m[ėe]n", r"\bq1\b", r"\bq3\b", r"\bI\s+ketv",
-    r"\bIII\s+ketv", r"\bketvir", r"\bpreliminar", r"\bprognoz", r"\bdividend",
+    r"\b3\s*m[ėe]n",
+    r"\b9\s*m[ėe]n",
+    r"\bq1\b",
+    r"\bq3\b",
+    r"\bI\s+ketv",
+    r"\bIII\s+ketv",
+    r"\bketvir",
+    r"\bpreliminar",
+    r"\bprognoz",
+    r"\bdividend",
 ]
 
 
@@ -650,10 +847,7 @@ def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
     df["dpl_start_date"] = df["report_published_date"].apply(lambda x: x - timedelta(days=30))
     df["dpl_end_date"] = df["report_published_date"]
 
-    return df[[
-        "issuer", "issuer_norm", "dpl_report_type", "report_published_date", "dpl_start_date",
-        "dpl_end_date", "title", "category", "crib_url",
-    ]].drop_duplicates()
+    return df[["issuer", "issuer_norm", "dpl_report_type", "report_published_date", "dpl_start_date", "dpl_end_date", "title", "category", "crib_url"]].drop_duplicates()
 
 
 def _issuer_key(value) -> str:
@@ -665,7 +859,6 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
         return pd.DataFrame()
 
     df = transactions_df.copy()
-
     df["is_dpl_period"] = False
     df["dpl_report_type"] = ""
     df["dpl_report_date"] = pd.NaT
@@ -685,19 +878,11 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
             trade_date = row.get("transaction_date_dt")
             if not issuer or pd.isna(trade_date):
                 continue
-
-            matches = periods[
-                (periods["issuer_key"] == issuer)
-                & (periods["dpl_start_date"] <= trade_date)
-                & (periods["dpl_end_date"] >= trade_date)
-            ].copy()
-
+            matches = periods[(periods["issuer_key"] == issuer) & (periods["dpl_start_date"] <= trade_date) & (periods["dpl_end_date"] >= trade_date)].copy()
             if matches.empty:
                 continue
-
             matches["days_to_report"] = matches["report_published_date"].apply(lambda x: (x - trade_date).days)
             match = matches.sort_values("days_to_report").iloc[0]
-
             df.at[idx, "is_dpl_period"] = True
             df.at[idx, "dpl_report_type"] = match["dpl_report_type"]
             df.at[idx, "dpl_report_date"] = match["report_published_date"]
@@ -706,7 +891,6 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
             df.at[idx, "dpl_days_to_report"] = match["days_to_report"]
             df.at[idx, "dpl_report_title"] = match["title"]
             df.at[idx, "dpl_report_url"] = match["crib_url"]
-
         df.drop(columns=["issuer_key"], inplace=True, errors="ignore")
 
     df["DPL"] = df["is_dpl_period"].apply(lambda x: "Taip" if x else "Ne")
@@ -737,27 +921,18 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = df.copy()
-
     for col in ["published_at", "transaction_date"]:
         if col not in df.columns:
             df[col] = None
 
     published_dt = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
     transaction_dt = pd.to_datetime(df["transaction_date"], errors="coerce")
-
     df["published_date"] = published_dt.dt.date
     df["transaction_date_dt"] = transaction_dt.dt.date
-    df["days_to_publish"] = (
-        pd.to_datetime(df["published_date"], errors="coerce")
-        - pd.to_datetime(df["transaction_date_dt"], errors="coerce")
-    ).dt.days
-
+    df["days_to_publish"] = (pd.to_datetime(df["published_date"], errors="coerce") - pd.to_datetime(df["transaction_date_dt"], errors="coerce")).dt.days
     df["is_late_notification"] = df["days_to_publish"].apply(lambda x: bool(pd.notna(x) and x > 3))
 
-    for col in [
-        "issuer", "person_name", "person_role", "isin", "instrument", "transaction_type",
-        "venue", "parse_status", "price_quantity_note",
-    ]:
+    for col in ["issuer", "person_name", "person_role", "isin", "instrument", "transaction_type", "venue", "parse_status", "price_quantity_note"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
@@ -774,10 +949,8 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
 def _apply_multiselect_filter(df: pd.DataFrame, col: str, label: str) -> pd.DataFrame:
     if col not in df.columns:
         return df
-
     values = sorted([x for x in df[col].dropna().unique() if str(x).strip()])
     selected = st.multiselect(label, values, key=f"mgr_filter_{col}")
-
     if selected:
         return df[df[col].isin(selected)]
     return df
@@ -789,7 +962,6 @@ def _show_summary_cards(df: pd.DataFrame):
     persons = df["person_name"].replace("", pd.NA).dropna().nunique()
     late = int(df["is_late_notification"].sum())
     dpl = int(df["is_dpl_period"].sum())
-
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Pranešimų / PDF", total)
     c2.metric("Emitentų", issuers)
@@ -800,14 +972,11 @@ def _show_summary_cards(df: pd.DataFrame):
 
 def _show_tables(df: pd.DataFrame):
     st.subheader("1. Detali vadovų sandorių lentelė")
-
     detail_cols = [
-        "DPL", "DPL paaiškinimas", "DPL tipas", "DPL pradžia", "DPL pabaiga",
-        "Ataskaitos paskelbimo data", "DPL dienų iki ataskaitos", "Susijusi ataskaita",
-        "Ataskaitos nuoroda", "published_date", "transaction_date_dt", "days_to_publish",
-        "is_late_notification", "issuer", "person_name", "person_role", "isin", "instrument",
-        "transaction_type", "price", "quantity", "transaction_value", "price_quantity_note", "venue",
-        "parse_status", "pdf_url", "crib_url",
+        "DPL", "DPL paaiškinimas", "DPL tipas", "DPL pradžia", "DPL pabaiga", "Ataskaitos paskelbimo data",
+        "DPL dienų iki ataskaitos", "Susijusi ataskaita", "Ataskaitos nuoroda", "published_date", "transaction_date_dt",
+        "days_to_publish", "is_late_notification", "issuer", "person_name", "person_role", "isin", "instrument",
+        "transaction_type", "price", "quantity", "transaction_value", "price_quantity_note", "venue", "parse_status", "pdf_url", "crib_url",
     ]
     detail_cols = [c for c in detail_cols if c in df.columns]
     st.dataframe(df[detail_cols], use_container_width=True, hide_index=True)
@@ -827,6 +996,10 @@ def _show_tables(df: pd.DataFrame):
     )
     st.dataframe(person_summary, use_container_width=True, hide_index=True)
 
+
+# ------------------------------------------------------------
+# Streamlit puslapis
+# ------------------------------------------------------------
 
 def show_manager_transactions_page():
     st.markdown(
@@ -854,20 +1027,12 @@ def show_manager_transactions_page():
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-card-title">👔 Vadovų sandoriai</div>', unsafe_allow_html=True)
 
-        manager_start_date = st.date_input(
-            "Pranešimo data nuo",
-            value=date.today() - timedelta(days=30),
-            key="manager_start_date",
-        )
-        manager_end_date = st.date_input(
-            "Pranešimo data iki",
-            value=date.today(),
-            key="manager_end_date",
-        )
+        manager_start_date = st.date_input("Pranešimo data nuo", value=date.today() - timedelta(days=30), key="manager_start_date")
+        manager_end_date = st.date_input("Pranešimo data iki", value=date.today(), key="manager_end_date")
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-card-subtitle">Perskaičiuoja tik naujausią CRIB vadovų sandorių pranešimą arba patikrina platesnį periodą.</div>',
+            '<div class="sidebar-card-subtitle">Atnaujina vadovų sandorių PDF iš CRIB pranešimų, kurie jau yra market_news lentelėje.</div>',
             unsafe_allow_html=True,
         )
 
@@ -880,40 +1045,20 @@ def show_manager_transactions_page():
             key="manager_update_days",
         )
 
-        latest_update_btn = st.button(
-            "🔁 Perskaičiuoti paskutinį pranešimą",
-            use_container_width=True,
-            key="manager_latest_reparse_btn",
-        )
+        manager_update_btn = st.button("🔄 Atnaujinti vadovų sandorius", use_container_width=True, key="manager_transactions_update_btn")
+        latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
+        repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
 
-        manager_update_btn = st.button(
-            "🔄 Atnaujinti vadovų sandorius",
-            use_container_width=True,
-            key="manager_transactions_update_btn",
+        repair_limit = st.number_input(
+            "Blogų PDF taisymo limitas",
+            min_value=10,
+            max_value=1000,
+            value=200,
+            step=10,
+            key="manager_repair_limit",
         )
 
         st.markdown("</div>", unsafe_allow_html=True)
-
-    if latest_update_btn:
-        try:
-            with st.spinner("Perskaičiuojamas naujausias vadovų sandorių pranešimas..."):
-                stats = update_latest_manager_transaction_notice(
-                    days_back=int(manager_update_days),
-                    headless=True,
-                    progress=None,
-                )
-
-            st.success(
-                "Paskutinis pranešimas perskaičiuotas: "
-                f"CRIB URL {stats.get('latest_crib_url', '')}, "
-                f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
-                f"klaidų {stats.get('manager_transactions_errors', 0)}."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error("Nepavyko perskaičiuoti paskutinio vadovų sandorių pranešimo.")
-            st.exception(exc)
-            st.stop()
 
     if manager_update_btn:
         try:
@@ -924,7 +1069,6 @@ def show_manager_transactions_page():
                     headless=True,
                     progress=None,
                 )
-
             st.success(
                 "Vadovų sandoriai atnaujinti: "
                 f"rasta CRIB pranešimų {stats.get('manager_messages_found', 0)}, "
@@ -935,6 +1079,39 @@ def show_manager_transactions_page():
             st.rerun()
         except Exception as exc:
             st.error("Nepavyko atnaujinti vadovų sandorių.")
+            st.exception(exc)
+            st.stop()
+
+    if latest_recalc_btn:
+        try:
+            with st.spinner("Perskaičiuojamas paskutinis vadovų sandorių pranešimas..."):
+                stats = recalc_latest_manager_notice(headless=True, progress=None)
+            st.success(
+                "Paskutinis pranešimas perskaičiuotas: "
+                f"rastas={stats.get('notice_found')}, "
+                f"ištrinta {stats.get('deleted', 0)}, "
+                f"įrašyta {stats.get('inserted', 0)}, "
+                f"klaidų {stats.get('errors', 0)}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error("Nepavyko perskaičiuoti paskutinio pranešimo.")
+            st.exception(exc)
+            st.stop()
+
+    if repair_bad_btn:
+        try:
+            with st.spinner("Taisomi blogai nuskaityti PDF įrašai..."):
+                stats = repair_bad_manager_transactions(limit=int(repair_limit), progress=None)
+            st.success(
+                "Blogų PDF taisymas baigtas: "
+                f"rasta {stats.get('bad_found', 0)}, "
+                f"sutvarkyta {stats.get('repaired', 0)}, "
+                f"nepavyko {stats.get('failed', 0)}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error("Nepavyko sutvarkyti blogai nuskaitytų PDF.")
             st.exception(exc)
             st.stop()
 
@@ -951,7 +1128,6 @@ def show_manager_transactions_page():
 
     news_start_date = manager_start_date - timedelta(days=370)
     news_end_date = manager_end_date + timedelta(days=370)
-
     crib_news_df = load_crib_news_df(news_start_date, news_end_date)
     dpl_periods_df = prepare_dpl_periods_df(crib_news_df)
     df = add_dpl_check_to_transactions(df, dpl_periods_df)
@@ -969,10 +1145,7 @@ def show_manager_transactions_page():
             )
         else:
             st.dataframe(
-                dpl_periods_df[[
-                    "issuer", "dpl_report_type", "report_published_date", "dpl_start_date",
-                    "dpl_end_date", "category", "title", "crib_url",
-                ]],
+                dpl_periods_df[["issuer", "dpl_report_type", "report_published_date", "dpl_start_date", "dpl_end_date", "category", "title", "crib_url"]],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1010,7 +1183,6 @@ def show_manager_transactions_page():
             df = df[df["is_dpl_period"] == False]
 
     _show_tables(df)
-
     st.download_button(
         "⬇ Atsisiųsti CSV",
         data=df.to_csv(index=False).encode("utf-8-sig"),
