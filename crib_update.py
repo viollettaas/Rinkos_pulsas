@@ -21,9 +21,11 @@ os.environ["WDM_SSL_VERIFY"] = "0"
 import re
 import time
 import warnings
+from urllib.parse import urljoin
 from datetime import datetime, date
 
 import pandas as pd
+import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -476,54 +478,240 @@ def get_latest_crib_news_date():
             return None
 
 
+
+
+def _requests_headers():
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.crib.lt/",
+    }
+
+
+def _clean_text(value: str) -> str:
+    value = re.sub(r"\r", "", str(value or ""))
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def fetch_crib_first_page_html(timeout: int = 25) -> str:
+    """
+    Greitas CRIB pirmo puslapio gavimas per requests.
+    Jei pavyksta, nereikia startuoti Selenium vien tam, kad nustatytume,
+    jog naujų pranešimų nėra.
+    """
+    urls = [
+        "https://www.crib.lt/?lang=lt",
+        "https://www.crib.lt/",
+    ]
+    last_error = None
+    for url in urls:
+        try:
+            response = requests.get(
+                url,
+                headers=_requests_headers(),
+                timeout=timeout,
+                verify=False,
+            )
+            response.raise_for_status()
+            text = response.text or ""
+            if "nef-table-row" in text or "message-row" in text or "Published" in text or "Company" in text:
+                return text
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return ""
+
+
+def _row_text_soup(el):
+    if el is None:
+        return ""
+    return _clean_text(el.get_text(" ", strip=True))
+
+
+def _extract_href_and_title_from_soup_row(row):
+    link_el = row.select_one("nef-link[href], a.table-link[href], a[href]")
+    href = ""
+    title = ""
+    if link_el is not None:
+        href = (link_el.get("href") or "").strip()
+        title = _row_text_soup(link_el)
+    if href:
+        href = urljoin("https://www.crib.lt/", href)
+        if "lang=" in href:
+            href = re.sub(r"([?&])lang=[a-z]{2}", r"\1lang=lt", href)
+        else:
+            sep = "&" if "?" in href else "?"
+            href = f"{href}{sep}lang=lt"
+    return href, title
+
+
+def parse_crib_rows_from_html(html: str):
+    """Parsina CRIB pirmo puslapio eilutes be Selenium."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    rows = soup.select("nef-table-row.message-row")
+    if not rows:
+        # Atsarginis variantas, jei CRIB kada nors grąžintų įprastą lentelę.
+        rows = soup.select("table tbody tr, table tr")
+
+    out = []
+    for row in rows:
+        try:
+            cells = row.select("nef-table-cell, td")
+            if not cells:
+                continue
+
+            raw_date = _row_text_soup(cells[0]) if len(cells) >= 1 else ""
+            dt = parse_dt_safe(raw_date)
+            if dt is None:
+                continue
+
+            href, headline = _extract_href_and_title_from_soup_row(row)
+
+            company = ""
+            category = ""
+
+            company_el = row.select_one(".table-issuer, .table-company, nef-table-cell.table-issuer, nef-table-cell.table-company")
+            if company_el is not None:
+                company = _row_text_soup(company_el)
+            elif len(cells) >= 2:
+                company = _row_text_soup(cells[1])
+
+            category_el = row.select_one(".table-category, nef-table-cell.table-category")
+            if category_el is not None:
+                category = _row_text_soup(category_el)
+            elif len(cells) >= 4:
+                category = _row_text_soup(cells[-1])
+
+            if not headline:
+                # Dažniausiai: Published | Company | Headline | Message Category
+                if len(cells) >= 3:
+                    headline = _row_text_soup(cells[2])
+                else:
+                    headline = _row_text_soup(row)
+
+            out.append({
+                "Bendrovė": company,
+                "Kategorija": category,
+                "Naujiena": "",
+                "Published_dt": dt,
+                "Nuoroda": href,
+                "Pilna_antraštė": headline,
+                "Pilnas_tekstas": "",
+            })
+        except Exception:
+            continue
+    return out
+
+
+def extract_title_and_text_from_html(html: str):
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        return "", ""
+
+    title = ""
+    t_el = soup.find(["h1", "h2"])
+    if t_el:
+        title = t_el.get_text(" ", strip=True)
+
+    selectors = [
+        "article", "main", ".nef-message-details", ".notice", ".notice__content",
+        ".page-content", ".content-area", ".content"
+    ]
+    best_text = ""
+    for sel in selectors:
+        for el in soup.select(sel):
+            txt = el.get_text("\n", strip=True)
+            if len(txt) > len(best_text):
+                best_text = txt
+
+    if not best_text:
+        paras = soup.find_all("p")
+        best_text = "\n\n".join(p.get_text(" ", strip=True) for p in paras[:12])
+
+    return _clean_text(title), _clean_text(best_text)
+
+
+def fetch_detail_fast(url: str, timeout: int = 25):
+    if not url:
+        return "", ""
+    try:
+        response = requests.get(
+            url,
+            headers=_requests_headers(),
+            timeout=timeout,
+            verify=False,
+        )
+        response.raise_for_status()
+        return extract_title_and_text_from_html(response.text or "")
+    except Exception:
+        return "", ""
+
+
+def start_driver_for_manager_transactions(headless: bool = True):
+    """Selenium startuojamas tik tada, kai tikrai reikia PDF apdorojimui."""
+    driver = init_driver(headless=headless)
+    try:
+        driver.get("https://www.crib.lt/")
+        wait_ready(driver, timeout=30)
+        click_possible_cookie_banners(driver)
+        click_language_lt_real_button(driver, timeout=20)
+    except Exception:
+        pass
+    return driver
+
+
 def update_crib_news(max_pages: int = 1, headless: bool = True, progress=None, stop_empty_pages: int = None, recent_key_limit: int = 300):
     """
-    Atnaujina CRIB naujienų bazę greituoju režimu.
+    Itin greitas CRIB atnaujinimas.
 
-    Logika:
-    - užkrauna tik paskutinius recent_key_limit DB raktų;
-    - atidaro tik pirmą CRIB puslapį;
-    - eina nuo viršaus;
-    - jei randa jau DB esantį URL/raktą -> STOP;
-    - jei URL naujas -> tik tada atidaro detalų puslapį;
-    - įrašo naujus pranešimus į Supabase.
-
-    Pastaba dėl ilgų laikotarpių:
-    - generuojant ataskaitas jos skaito DB;
-    - jei istorinis laikotarpis dar nėra DB, reikia jį užpildyti backfill skriptu;
-    - šis update skirtas naujausiems pranešimams papildyti, ne istorijai nuo nulio krauti.
+    Pagrindinė idėja:
+    - pirmiausia per REST iš DB paimami tik paskutiniai recent_key_limit CRIB raktai;
+    - CRIB pirmas puslapis paimamas per requests, be Selenium;
+    - patikrinama pirma naujienos eilutė;
+    - jei ji jau DB, iškart grąžinama, neatidarant detalių puslapių ir nestartuojant Selenium;
+    - jei yra naujų eilučių virš pirmos DB esančios eilutės, tik joms imamas pilnas tekstas;
+    - Selenium startuojamas tik tada, kai tarp naujų pranešimų yra vadovų sandorių PDF.
     """
     existing_keys = load_recent_crib_keys(limit=recent_key_limit)
 
-    driver = init_driver(headless=headless)
     total_found = 0
     total_inserted = 0
     total_new_candidates = 0
     total_manager_messages_processed = 0
     total_manager_transactions_saved = 0
     total_manager_transactions_errors = 0
-    pages_processed = 0
+    pages_processed = 1
 
     try:
-        _notify(progress, "Atidaromas CRIB...")
-        driver.get("https://www.crib.lt/")
-        wait_ready(driver, timeout=30)
-        time.sleep(1.0)
-        click_possible_cookie_banners(driver)
-
-        _notify(progress, "Perjungiama LT kalba...")
-        click_language_lt_real_button(driver, timeout=20)
-
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "nef-table-row.message-row"))
-        )
-
         _notify(progress, "Tikrinamas pirmas CRIB puslapis...")
-        rows_basic = parse_crib_rows_on_page(driver)
-        pages_processed = 1
+        html = fetch_crib_first_page_html(timeout=25)
+        rows_basic = parse_crib_rows_from_html(html)
         total_found = len(rows_basic)
 
         if not rows_basic:
+            return {
+                "pages_processed": pages_processed,
+                "records_found": total_found,
+                "records_inserted": 0,
+                "new_candidates": 0,
+                "manager_messages_processed": 0,
+                "manager_transactions_saved": 0,
+                "manager_transactions_errors": 0,
+            }
+
+        # Svarbiausias greičio patikrinimas: jei pati naujausia eilutė jau DB,
+        # nieko daugiau nebedarome.
+        first_key = _make_existing_key_from_crib_row(rows_basic[0])
+        if existing_keys and first_key in existing_keys:
             return {
                 "pages_processed": pages_processed,
                 "records_found": total_found,
@@ -560,10 +748,7 @@ def update_crib_news(max_pages: int = 1, headless: bool = True, progress=None, s
         for r in new_rows:
             url = str(r.get("Nuoroda") or "").strip()
             title = str(r.get("Pilna_antraštė") or "").strip()
-            full_title, full_text = "", ""
-
-            if url:
-                full_title, full_text = open_detail_in_new_tab(driver, url)
+            full_title, full_text = fetch_detail_fast(url) if url else ("", "")
 
             if full_title:
                 r["Pilna_antraštė"] = full_title
@@ -578,12 +763,6 @@ def update_crib_news(max_pages: int = 1, headless: bool = True, progress=None, s
         df_page = add_company_norm(df_page)
 
         inserted = 0
-        manager_stats = {
-            "manager_messages_processed": 0,
-            "manager_transactions_saved": 0,
-            "manager_transactions_errors": 0,
-        }
-
         if df_page is not None and not df_page.empty:
             inserted = save_news_df(df_page, "crib")
             try:
@@ -591,17 +770,28 @@ def update_crib_news(max_pages: int = 1, headless: bool = True, progress=None, s
             except Exception:
                 pass
 
-            manager_stats = process_manager_transactions_for_records(
-                driver=driver,
-                records=records,
-                progress=progress,
-            )
-
         total_new_candidates = len(df_page) if df_page is not None else 0
         total_inserted = int(inserted or 0)
-        total_manager_messages_processed = manager_stats.get("manager_messages_processed", 0)
-        total_manager_transactions_saved = manager_stats.get("manager_transactions_saved", 0)
-        total_manager_transactions_errors = manager_stats.get("manager_transactions_errors", 0)
+
+        manager_records = [r for r in records if is_manager_transactions_category(r.get("Kategorija"))]
+        if manager_records and save_manager_transactions_from_crib_selenium is not None:
+            driver = None
+            try:
+                driver = start_driver_for_manager_transactions(headless=headless)
+                manager_stats = process_manager_transactions_for_records(
+                    driver=driver,
+                    records=manager_records,
+                    progress=progress,
+                )
+                total_manager_messages_processed = manager_stats.get("manager_messages_processed", 0)
+                total_manager_transactions_saved = manager_stats.get("manager_transactions_saved", 0)
+                total_manager_transactions_errors = manager_stats.get("manager_transactions_errors", 0)
+            finally:
+                try:
+                    if driver is not None:
+                        driver.quit()
+                except Exception:
+                    pass
 
         return {
             "pages_processed": pages_processed,
@@ -620,8 +810,3 @@ def update_crib_news(max_pages: int = 1, headless: bool = True, progress=None, s
             pass
         raise
 
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
