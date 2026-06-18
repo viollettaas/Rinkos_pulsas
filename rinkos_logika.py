@@ -1230,118 +1230,29 @@ def _can_scrape_vz_period(period_start: date, period_end: date) -> bool:
     """True, jei bent dalis periodo patenka į paskutines 14 dienų."""
     return period_end >= _vz_scrape_cutoff_date()
 
-def get_news_with_supabase_cache(source: str, start_date: date, end_date: date, scrape_func, df_stat: pd.DataFrame = None, progress=None) -> pd.DataFrame:
+def get_news_with_supabase_cache(source: str, start_date: date, end_date: date, scrape_func=None, df_stat: pd.DataFrame = None, progress=None) -> pd.DataFrame:
     """
-    CRIB ir VŽ cache logika:
+    DB-only naujienų logika ataskaitos generavimui.
 
-    - Visada pirmiausia skaitoma Supabase DB.
-    - CRIB gali būti scrapinamas istorijai ir gyvoms dienoms pagal cache / log taisykles.
-    - VŽ NIEKADA nescrapinama už periodą, kurio pabaiga senesnė nei 14 dienų.
-      Tokiu atveju grąžinami tik DB esantys VŽ įrašai.
-    - Jei VŽ intervalas mišrus, sena dalis imama tik iš DB, o scrapinti leidžiama tik
-      nuo paskutinių 14 dienų ribos.
-    - Vakar ir šiandien laikomos "gyvomis" dienomis, bet jos atnaujinamos tik tada,
-      jei nėra neseno sėkmingo scrape log'o. Pagal nutylėjimą TTL = 6 valandos.
-    - Po galimo scrapinimo galutinis rezultatas grąžinamas iš Supabase DB.
+    Svarbu:
+    - Ataskaitos generavimo metu NIEKADA neinama į CRIB ar VŽ scraperius.
+    - CRIB/VŽ naujienos imamos tik iš Supabase `market_news` lentelės.
+    - Nauji CRIB pranešimai į DB įrašomi tik per atskirą mygtuką
+      „Atnaujinti duomenis“ (`crib_update.update_crib_news`).
+    - Jei pasirinktam laikotarpiui DB nėra įrašų, grąžinamas tuščias DataFrame,
+      o ataskaita tiesiog nerodys naujienų tame periode.
 
-    Nasdaq statistika čia nedalyvauja ir į DB nerašoma.
+    Parametrai `scrape_func`, `df_stat`, `progress` palikti dėl suderinamumo su
+    esamais `generate_report(...)` kvietimais.
     """
     if start_date is None or end_date is None:
         return _normalize_cached_news_columns(pd.DataFrame(), source)
 
-    today = date.today()
-    live_start = today - timedelta(days=1)
-    live_refresh_hours = 6
+    if progress:
+        progress(f"{source.upper()}: naujienos kraunamos iš Supabase DB...")
 
     cached_raw = load_news_df(source, start_date, end_date)
-    cached = _normalize_cached_news_columns(cached_raw, source)
-
-    # VŽ taisyklė: jei visas pasirinktas periodas senesnis nei 14 dienų,
-    # jokio VŽ scraping'o nedarome. Naudojame tik tai, kas jau yra DB.
-    if source == "vz" and not _can_scrape_vz_period(start_date, end_date):
-        return cached
-
-    # Jei VŽ periodas mišrus, senesnė nei 14 d. dalis nebus scrapinama.
-    # Gali būti scrapinama tik nuo vz_scrape_start_allowed iki end_date.
-    vz_scrape_start_allowed = _vz_scrape_cutoff_date() if source == "vz" else start_date
-
-    # Jei visas periodas istorinis, DB užtenka. Tušti istoriniai periodai
-    # nebescrapinami, jeigu scrape log rodo, kad jie jau buvo patikrinti.
-    if end_date < live_start:
-        if cached_raw is not None and not cached_raw.empty:
-            return cached
-        if _source_has_successful_scrape_covering(source, start_date, end_date):
-            return cached
-
-        scrape_start = max(start_date, vz_scrape_start_allowed)
-        scrape_end = end_date
-        if scrape_start <= scrape_end:
-            fresh = _scrape_news_source(
-                source,
-                scrape_func,
-                scrape_start,
-                scrape_end,
-                df_stat=df_stat,
-                progress=progress,
-            )
-            save_news_df(fresh, source)
-            log_scrape(source, scrape_start, scrape_end, "success", len(fresh) if fresh is not None else 0)
-        return _load_cached_news_normalized(source, start_date, end_date)
-
-    # Istorinė dalis iki užvakarykščios dienos.
-    historical_start = start_date
-    historical_end = min(end_date, live_start - timedelta(days=1))
-
-    if historical_start <= historical_end:
-        hist_cached_raw = load_news_df(source, historical_start, historical_end)
-        hist_has_rows = hist_cached_raw is not None and not hist_cached_raw.empty
-        hist_has_log = _source_has_successful_scrape_covering(source, historical_start, historical_end)
-
-        if not hist_has_rows and not hist_has_log:
-            scrape_start = max(historical_start, vz_scrape_start_allowed)
-            scrape_end = historical_end
-            if scrape_start <= scrape_end:
-                fresh_hist = _scrape_news_source(
-                    source,
-                    scrape_func,
-                    scrape_start,
-                    scrape_end,
-                    df_stat=df_stat,
-                    progress=progress,
-                )
-                save_news_df(fresh_hist, source)
-                log_scrape(source, scrape_start, scrape_end, "success", len(fresh_hist) if fresh_hist is not None else 0)
-
-    # Gyva dalis: vakar + šiandien. Ji atnaujinama tik kas live_refresh_hours val.
-    live_range_start = max(start_date, live_start, vz_scrape_start_allowed)
-    live_range_end = end_date
-
-    if live_range_start <= live_range_end:
-        live_cached_raw = load_news_df(source, live_range_start, live_range_end)
-        live_has_recent_scrape = _source_has_recent_successful_scrape(
-            source,
-            live_range_start,
-            live_range_end,
-            max_age_hours=live_refresh_hours,
-        )
-
-        # Jei gyvas periodas jau neseniai tikrintas, naudojame DB. Tai reiškia,
-        # kad spaudžiant tas pačias datas pakartotinai nebus einama į scraperį.
-        if not live_has_recent_scrape:
-            fresh_live = _scrape_news_source(
-                source,
-                scrape_func,
-                live_range_start,
-                live_range_end,
-                df_stat=df_stat,
-                progress=progress,
-            )
-            save_news_df(fresh_live, source)
-            log_scrape(source, live_range_start, live_range_end, "success", len(fresh_live) if fresh_live is not None else 0)
-        elif live_cached_raw is not None and not live_cached_raw.empty:
-            pass
-
-    return _load_cached_news_normalized(source, start_date, end_date)
+    return _normalize_cached_news_columns(cached_raw, source)
 
 
 def build_vz_map_from_df(vz_df: pd.DataFrame, df_stat: pd.DataFrame) -> dict:
