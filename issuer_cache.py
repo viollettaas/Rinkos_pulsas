@@ -6,11 +6,11 @@ Emitentų sąrašo cache Supabase duomenų bazėje.
 Naudojama VŽ atnaujinimui, kad nereikėtų kiekvieną kartą siųstis Nasdaq statistics.
 
 Reikalinga Supabase lentelė: market_issuers
-Rekomenduojama unikali kolona: unique_key
+Unikali kolona: unique_key
 """
 
 import hashlib
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import pandas as pd
 
@@ -30,16 +30,20 @@ def _norm_key(value) -> str:
 def _find_col(df: pd.DataFrame, candidates):
     if df is None or df.empty:
         return None
+
     lower_map = {str(c).strip().lower(): c for c in df.columns}
+
     for c in candidates:
         key = str(c).strip().lower()
         if key in lower_map:
             return lower_map[key]
+
     for col in df.columns:
         col_l = str(col).strip().lower()
         for c in candidates:
             if str(c).strip().lower() in col_l:
                 return col
+
     return None
 
 
@@ -67,6 +71,7 @@ def build_issuer_df_from_stat_df(df_stat: pd.DataFrame) -> pd.DataFrame:
     out["Bendrovė"] = df_stat[company_col].fillna("").astype(str).str.strip()
     out["Trumpinys"] = df_stat[ticker_col].fillna("").astype(str).str.strip() if ticker_col else ""
     out["Sąrašas/segmentas"] = df_stat[segment_col].fillna("").astype(str).str.strip() if segment_col else ""
+
     out = out[out["Bendrovė"] != ""].drop_duplicates(subset=["Bendrovė"]).reset_index(drop=True)
     return out
 
@@ -74,30 +79,38 @@ def build_issuer_df_from_stat_df(df_stat: pd.DataFrame) -> pd.DataFrame:
 def save_issuer_list_from_stat_df(df_stat: pd.DataFrame, source: str = "nasdaq_statistics", market: str = "VLN") -> int:
     """
     Išsaugo arba atnaujina emitentų sąrašą Supabase market_issuers lentelėje.
-    Dublikatai atnaujinami pagal unique_key.
+
+    Svarbu: pildome ir issuer, ir company laukus, nes ankstesnėje lentelės
+    schemoje company galėjo būti NOT NULL.
     """
     issuer_df = build_issuer_df_from_stat_df(df_stat)
     if issuer_df.empty:
         return 0
 
     today = date.today().isoformat()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     rows = []
 
     for _, r in issuer_df.iterrows():
         issuer = _norm(r.get("Bendrovė", ""))
         if not issuer:
             continue
+
+        issuer_norm = _norm_key(issuer)
+        unique_key = _issuer_unique_key(source, issuer, market)
+
         rows.append({
             "source": source,
             "market": market,
             "issuer": issuer,
-            "issuer_norm": _norm_key(issuer),
+            "issuer_norm": issuer_norm,
+            "company": issuer,
+            "company_norm": issuer_norm,
             "ticker": _norm(r.get("Trumpinys", "")),
             "segment": _norm(r.get("Sąrašas/segmentas", "")),
             "last_seen_date": today,
             "updated_at": now,
-            "unique_key": _issuer_unique_key(source, issuer, market),
+            "unique_key": unique_key,
         })
 
     if not rows:
@@ -105,6 +118,7 @@ def save_issuer_list_from_stat_df(df_stat: pd.DataFrame, source: str = "nasdaq_s
 
     url = _supabase_rest_url("market_issuers")
     saved = 0
+
     with _http_client() as client:
         for row in rows:
             response = client.post(
@@ -113,12 +127,16 @@ def save_issuer_list_from_stat_df(df_stat: pd.DataFrame, source: str = "nasdaq_s
                     **_supabase_headers(),
                     "Prefer": "resolution=merge-duplicates,return=minimal",
                 },
+                params={"on_conflict": "unique_key"},
                 json=row,
             )
             if response.status_code in (200, 201, 204):
                 saved += 1
             else:
-                raise RuntimeError(f"Supabase emitentų sąrašo įrašymo klaida: {response.status_code} - {response.text}")
+                raise RuntimeError(
+                    f"Supabase emitentų sąrašo įrašymo klaida: {response.status_code} - {response.text}"
+                )
+
     return saved
 
 
@@ -129,7 +147,7 @@ def load_issuer_df(source: str = "nasdaq_statistics", market: str = "VLN") -> pd
     """
     url = _supabase_rest_url("market_issuers")
     params = {
-        "select": "issuer,ticker,segment,last_seen_date,updated_at",
+        "select": "issuer,company,ticker,segment,last_seen_date,updated_at",
         "source": f"eq.{source}",
         "market": f"eq.{market}",
         "order": "issuer.asc",
@@ -144,8 +162,13 @@ def load_issuer_df(source: str = "nasdaq_statistics", market: str = "VLN") -> pd
         return pd.DataFrame(columns=["Bendrovė", "Trumpinys", "Sąrašas/segmentas"])
 
     df = pd.DataFrame(data)
+    issuer_series = df.get("issuer", pd.Series(dtype=str)).fillna("").astype(str)
+
+    if issuer_series.str.strip().eq("").all() and "company" in df.columns:
+        issuer_series = df["company"].fillna("").astype(str)
+
     out = pd.DataFrame({
-        "Bendrovė": df.get("issuer", pd.Series(dtype=str)).fillna("").astype(str),
+        "Bendrovė": issuer_series,
         "Trumpinys": df.get("ticker", pd.Series(dtype=str)).fillna("").astype(str),
         "Sąrašas/segmentas": df.get("segment", pd.Series(dtype=str)).fillna("").astype(str),
     })
