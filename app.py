@@ -20,9 +20,9 @@ from supabase_cache import save_news_df, load_news_df
 from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
 from vz_update import update_vz_news_fast
 try:
-    from manager_transactions_update import update_manager_transactions_from_market_news
+    from manager_transactions_update import update_manager_transactions_from_recent_crib
 except Exception:
-    update_manager_transactions_from_market_news = None
+    update_manager_transactions_from_recent_crib = None
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -907,10 +907,6 @@ with st.sidebar:
             vz_inserted = 0
             vz_found = 0
             vz_note = ""
-            mgr_processed = 0
-            mgr_saved = 0
-            mgr_skipped = 0
-            mgr_note = ""
 
             with st.spinner("Tikrinami nauji CRIB pranešimai..."):
                 stats = update_crib_news(
@@ -922,25 +918,29 @@ with st.sidebar:
                 crib_inserted = int(stats.get("records_inserted", 0) or 0)
                 crib_pages = int(stats.get("pages_processed", 0) or 0)
 
-            # Papildomas žingsnis: jeigu CRIB pranešimai jau yra market_news,
-            # bet jų vadovų sandorių PDF dar nėra manager_transactions,
-            # nuskaitome PDF ir papildome manager_transactions.
-            if update_manager_transactions_from_market_news is not None:
-                with st.spinner("Atnaujinami vadovų sandorių PDF iš DB esančių CRIB pranešimų..."):
-                    mgr_stats = update_manager_transactions_from_market_news(
-                        days_back=180,
-                        news_limit=600,
-                        max_messages=40,
+            manager_note = ""
+            manager_processed = 0
+            manager_saved = 0
+            manager_found = 0
+            if update_manager_transactions_from_recent_crib is not None:
+                with st.spinner("Tikrinami paskutinio mėnesio vadovų sandorių CRIB pranešimai..."):
+                    mgr_stats = update_manager_transactions_from_recent_crib(
+                        days_back=45,
+                        max_messages=30,
                         headless=True,
                         progress=None,
                     )
-                    mgr_processed = int(mgr_stats.get("manager_messages_processed", 0) or 0)
-                    mgr_saved = int(mgr_stats.get("manager_transactions_saved", 0) or 0)
-                    mgr_skipped = int(mgr_stats.get("manager_messages_skipped_existing", 0) or 0)
-                    if mgr_stats.get("error_message"):
-                        mgr_note = f" Vadovų sandoriai neatnaujinti: {mgr_stats.get('error_message')}"
+                manager_found = int(mgr_stats.get("manager_messages_found", 0) or 0)
+                manager_processed = int(mgr_stats.get("manager_messages_processed", 0) or 0)
+                manager_saved = int(mgr_stats.get("manager_transactions_saved", 0) or 0)
+                manager_errors = int(mgr_stats.get("manager_transactions_errors", 0) or 0)
+                manager_note = (
+                    f" vadovų sandoriai: rasta CRIB pranešimų {manager_found}, "
+                    f"apdorota {manager_processed}, naujai įrašyta sandorių/PDF {manager_saved}"
+                    f"{', klaidų ' + str(manager_errors) if manager_errors else ''};"
+                )
             else:
-                mgr_note = " Vadovų sandoriai neatnaujinti: nerastas manager_transactions_update.py modulis."
+                manager_note = " vadovų sandoriai neatnaujinti: nerastas manager_transactions_update.py modulis;"
 
             # VŽ atnaujinimas naudoja DB išsaugotą emitentų sąrašą.
             # Sąrašas atnaujinamas tik tada, kai sugeneruojama rinkos ataskaita.
@@ -989,11 +989,10 @@ with st.sidebar:
             st.session_state.emitentu_result = None
             st.session_state.news_update_message = (
                 f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
-                f"(patikrinta puslapių: {crib_pages}); "
-                f"vadovų sandoriai: apdorota CRIB pranešimų {mgr_processed}, "
-                f"naujai įrašyta sandorių/PDF {mgr_saved}, jau DB buvo {mgr_skipped}; "
+                f"(patikrinta puslapių: {crib_pages});"
+                f"{manager_note} "
                 f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
-                f"{mgr_note}{vz_note}"
+                f"{vz_note}"
             )
             st.rerun()
         except Exception as exc:
@@ -1007,9 +1006,8 @@ with st.sidebar:
 # ------------------------------------------------------------
 if report_mode == "Vadovų sandoriai":
     if show_manager_transactions_page is None:
-        st.error("Nepavyko užkrauti vadovų sandorių modulio `vadovu_sandoriai.py`.")
+        st.error("Nepavyko užkrauti vadovų sandorių modulio vadovu_sandoriai.py.")
         st.stop()
-
     show_manager_transactions_page()
     st.stop()
 
@@ -1435,4 +1433,3 @@ with tab5:
         height=900,
         scrolling=True,
     )
-
