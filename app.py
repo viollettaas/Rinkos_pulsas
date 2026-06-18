@@ -15,6 +15,7 @@ from rinkos_logika import (
 from emitentu_atranka import generate_emitentu_ataskaita
 from crib_update import update_crib_news, get_latest_crib_news_date
 from supabase_cache import save_news_df
+from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
 try:
     from vadovu_sandoriai import show_manager_transactions_page
 except Exception:
@@ -702,7 +703,7 @@ with st.sidebar:
         """
         <div class="news-db-block">
             <div class="sidebar-section-title">🔄 Naujienų bazė</div>
-            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus, atsisiunčia Nasdaq emitentų sąrašą pagal pasirinktą laikotarpį ir atnaujina aktualius VŽ straipsnius.</div>
+            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus ir atnaujina aktualius VŽ straipsnius pagal DB išsaugotą emitentų sąrašą.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -748,35 +749,44 @@ with st.sidebar:
                 crib_inserted = int(stats.get("records_inserted", 0) or 0)
                 crib_pages = int(stats.get("pages_processed", 0) or 0)
 
-            update_start = st.session_state.get("rinkos_start_date", date.today())
-            update_end = st.session_state.get("rinkos_end_date", date.today())
-
-            df_stat_for_vz = None
-            with st.spinner("Atsisiunčiamas Nasdaq emitentų sąrašas VŽ atrankai..."):
+            # VŽ atnaujinimas naudoja DB išsaugotą emitentų sąrašą.
+            # Sąrašas atnaujinamas tik tada, kai sugeneruojama rinkos ataskaita.
+            df_issuers_for_vz = None
+            with st.spinner("Kraunamas emitentų sąrašas iš DB VŽ atrankai..."):
                 try:
-                    df_stat_for_vz = download_nasdaq_statistics_df_for_vz(update_start, update_end)
-                except Exception as nasdaq_exc:
-                    if st.session_state.report_result is not None:
-                        df_stat_for_vz = st.session_state.report_result.get("df_raw")
-                        vz_note = (
-                            " Nasdaq sąrašo atsisiųsti nepavyko, todėl VŽ atrankai panaudotas "
-                            "paskutinės sugeneruotos rinkos ataskaitos emitentų sąrašas."
-                        )
-                    else:
-                        vz_note = f" VŽ neatnaujinta: nepavyko gauti Nasdaq emitentų sąrašo ({nasdaq_exc})."
+                    df_issuers_for_vz = load_issuer_df()
+                except Exception as issuer_exc:
+                    df_issuers_for_vz = None
+                    vz_note = f" VŽ neatnaujinta: nepavyko užkrauti emitentų sąrašo iš DB ({issuer_exc})."
 
-            if df_stat_for_vz is not None and not df_stat_for_vz.empty:
-                vz_start = update_start
-                vz_end = update_end
-                with st.spinner("Tikrinami VŽ straipsniai pagal Nasdaq emitentų sąrašą..."):
+            if (df_issuers_for_vz is None or df_issuers_for_vz.empty) and st.session_state.report_result is not None:
+                # Atsarginis variantas: jei DB dar tuščia, panaudojame paskutinę sugeneruotą ataskaitą
+                # ir iš karto išsaugome emitentų sąrašą DB ateičiai.
+                df_last = st.session_state.report_result.get("df_raw")
+                if df_last is not None and not df_last.empty:
+                    try:
+                        save_issuer_list_from_stat_df(df_last)
+                        df_issuers_for_vz = load_issuer_df()
+                        vz_note = " Emitentų sąrašas DB buvo tuščias, todėl panaudota paskutinė sugeneruota rinkos ataskaita ir sąrašas išsaugotas DB."
+                    except Exception as save_issuer_exc:
+                        vz_note = f" VŽ neatnaujinta: nepavyko išsaugoti emitentų sąrašo DB ({save_issuer_exc})."
+
+            if df_issuers_for_vz is not None and not df_issuers_for_vz.empty:
+                # VŽ scraperis žiūri tik pirmą VŽ puslapį, todėl datos naudojamos plačiai,
+                # kad būtų paimti ir senesni pirmame puslapyje esantys straipsniai.
+                vz_start = date(2023, 1, 1)
+                vz_end = date.today()
+                with st.spinner("Tikrinamas pirmas VŽ puslapis pagal DB emitentų sąrašą..."):
                     _, vz_df = vz_scrape_full(
                         vz_start,
                         vz_end,
-                        df_stat_for_vz,
+                        df_issuers_for_vz,
                         progress=None,
                     )
                     vz_found = len(vz_df) if vz_df is not None else 0
                     vz_inserted = save_news_df(vz_df, "vz") if vz_df is not None and not vz_df.empty else 0
+            elif not vz_note:
+                vz_note = " VŽ neatnaujinta: DB nėra emitentų sąrašo. Sugeneruokite rinkos ataskaitą, kad sąrašas būtų išsaugotas DB."
 
             st.session_state.report_result = None
             st.session_state.emitentu_result = None
@@ -1150,7 +1160,13 @@ if run_btn:
 
         st.session_state.report_result = generated
         st.session_state.report_filename = filename
-        progress_box.success("Ataskaita sugeneruota.")
+
+        try:
+            issuer_count = save_issuer_list_from_stat_df(generated.get("df_raw"))
+            progress_box.success(f"Ataskaita sugeneruota. Emitentų sąrašas DB atnaujintas: {issuer_count} įrašų.")
+        except Exception as issuer_exc:
+            progress_box.warning(f"Ataskaita sugeneruota, bet emitentų sąrašo nepavyko išsaugoti DB: {issuer_exc}")
+
         st.rerun()
 
     except Exception as exc:
