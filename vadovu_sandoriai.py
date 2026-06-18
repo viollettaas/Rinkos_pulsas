@@ -1311,6 +1311,86 @@ def _apply_multiselect_filter(df: pd.DataFrame, col: str, label: str) -> pd.Data
     return df
 
 
+
+def _format_dpl_period(row) -> str:
+    """Suformuoja trumpą DPL laikotarpio tekstą lentelei."""
+    if row is None or row.empty:
+        return ""
+    start = row.get("dpl_start_date", "")
+    end = row.get("dpl_end_date", "")
+    report_date = row.get("report_published_date", "")
+    title = str(row.get("title", "") or "").strip()
+
+    def fmt(x):
+        try:
+            if pd.isna(x):
+                return ""
+        except Exception:
+            pass
+        try:
+            return pd.to_datetime(x).date().isoformat()
+        except Exception:
+            return str(x or "")
+
+    period = f"{fmt(start)} – {fmt(end)}".strip(" –")
+    if report_date:
+        period = f"{period} (ataskaita: {fmt(report_date)})" if period else f"Ataskaita: {fmt(report_date)}"
+    if title:
+        period = f"{period}\n{title}" if period else title
+    return period
+
+
+def build_dpl_dates_summary_df(dpl_periods_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Paruošia įmonių DPL datų lentelę:
+    - įmonės pavadinimas;
+    - paskutinis 6 mėn. / pusmečio DPL laikotarpis;
+    - paskutinis metinės ataskaitos DPL laikotarpis.
+    """
+    columns = ["Įmonė", "6 mėn. DPL laikotarpis", "Metų DPL laikotarpis"]
+    if dpl_periods_df is None or dpl_periods_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = dpl_periods_df.copy()
+    for col in ["issuer", "dpl_report_type", "report_published_date", "dpl_start_date", "dpl_end_date", "title"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["issuer"] = df["issuer"].fillna("").astype(str).str.strip()
+    df = df[df["issuer"] != ""].copy()
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df["report_published_date_sort"] = pd.to_datetime(df["report_published_date"], errors="coerce")
+    df = df.sort_values(["issuer", "report_published_date_sort"], ascending=[True, False])
+
+    rows = []
+    for issuer, g in df.groupby("issuer", sort=True):
+        g = g.copy()
+        half = g[g["dpl_report_type"].fillna("").astype(str).str.contains("6|pusme", case=False, regex=True)]
+        annual = g[g["dpl_report_type"].fillna("").astype(str).str.contains("metin", case=False, regex=True)]
+
+        half_text = _format_dpl_period(half.iloc[0]) if not half.empty else ""
+        annual_text = _format_dpl_period(annual.iloc[0]) if not annual.empty else ""
+
+        rows.append({
+            "Įmonė": issuer,
+            "6 mėn. DPL laikotarpis": half_text,
+            "Metų DPL laikotarpis": annual_text,
+        })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def show_dpl_dates_table(dpl_periods_df: pd.DataFrame):
+    """Parodo DPL datų lentelę vadovų sandorių ataskaitoje."""
+    st.subheader("DPL laikotarpiai pagal įmones")
+    dpl_dates_df = build_dpl_dates_summary_df(dpl_periods_df)
+    if dpl_dates_df.empty:
+        st.info("DPL laikotarpių nerasta pagal pasirinktą vadovų sandorių laikotarpį.")
+    else:
+        st.dataframe(dpl_dates_df, use_container_width=True, hide_index=True)
+
 def _show_summary_cards(df: pd.DataFrame):
     total = len(df)
     issuers = df["issuer"].replace("", pd.NA).dropna().nunique()
@@ -1474,6 +1554,9 @@ def show_manager_transactions_page():
             )
         else:
             st.dataframe(dpl_periods_df[["issuer", "dpl_report_type", "report_published_date", "dpl_start_date", "dpl_end_date", "category", "title", "crib_url"]], use_container_width=True, hide_index=True)
+
+    show_dpl_dates_table(dpl_periods_df)
+    st.markdown("---")
 
     _show_summary_cards(df)
     st.markdown("---")
