@@ -89,7 +89,10 @@ def _to_iso_timestamp(value):
 
 
 def _filter_row_for_manager_transactions(row: dict) -> dict:
-    return {k: v for k, v in (row or {}).items() if k in MANAGER_TRANSACTION_COLUMNS}
+    clean = {k: v for k, v in (row or {}).items() if k in MANAGER_TRANSACTION_COLUMNS}
+    if "issuer" in clean and not _is_empty_db_value(clean.get("issuer")):
+        clean["issuer"] = _canonical_issuer_name(clean.get("issuer"))
+    return clean
 
 
 def _is_good_parsed_row(row: dict) -> bool:
@@ -99,6 +102,71 @@ def _is_good_parsed_row(row: dict) -> bool:
         and str(row.get("transaction_date") or "").strip()
         and str(row.get("isin") or "").strip()
     )
+
+
+# ------------------------------------------------------------
+# Emitentu pavadinimu suvienodinimas pagal market_issuers
+# ------------------------------------------------------------
+
+_ISSUER_LOOKUP_CACHE = None
+
+
+def _issuer_norm_key(value) -> str:
+    """Suvienodintas raktas emitentu palyginimui."""
+    s = str(value or "").lower().strip()
+    repl = str.maketrans({"ą":"a","č":"c","ę":"e","ė":"e","į":"i","š":"s","ų":"u","ū":"u","ž":"z"})
+    s = s.translate(repl)
+    s = re.sub(r"\b(ab|uab|as|asa|akcine bendrove|uzdaroji akcine bendrove)\b", " ", s)
+    s = s.replace(" group", " ").replace(" grupe", " ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _load_issuer_lookup_from_market_issuers() -> dict:
+    global _ISSUER_LOOKUP_CACHE
+    if _ISSUER_LOOKUP_CACHE is not None:
+        return _ISSUER_LOOKUP_CACHE
+
+    lookup = {}
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("market_issuers")
+        params = {
+            "select": "issuer,company,issuer_norm,company_norm,ticker",
+            "market": "eq.VLN",
+            "order": "issuer.asc",
+        }
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            rows = resp.json() or []
+        for r in rows:
+            canonical = str(r.get("issuer") or r.get("company") or "").strip()
+            if not canonical:
+                continue
+            for c in [canonical, r.get("issuer"), r.get("company"), r.get("issuer_norm"), r.get("company_norm"), r.get("ticker")]:
+                key = _issuer_norm_key(c)
+                if key:
+                    lookup[key] = canonical
+    except Exception:
+        lookup = {}
+
+    _ISSUER_LOOKUP_CACHE = lookup
+    return lookup
+
+
+def _canonical_issuer_name(value: str) -> str:
+    original = str(value or "").strip()
+    if not original:
+        return ""
+    lookup = _load_issuer_lookup_from_market_issuers()
+    key = _issuer_norm_key(original)
+    if key in lookup:
+        return lookup[key]
+    for k, canonical in lookup.items():
+        if key and k and (key in k or k in key):
+            return canonical
+    return original
 
 
 # ------------------------------------------------------------
@@ -251,10 +319,17 @@ def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dic
     for col in fill_if_empty_or_bad:
         new_val = parsed_row.get(col)
         old_val = current_row.get(col)
+        if col == "issuer" and _has_useful_value(new_val):
+            new_val = _canonical_issuer_name(new_val)
         if (_is_empty_db_value(old_val) or _is_bad_existing_value(col, old_val)) and _has_useful_value(new_val):
             # Neįrašome akivaizdžiai blogos naujos reikšmės.
             if not _is_bad_existing_value(col, new_val):
                 update[col] = new_val
+
+    old_issuer = current_row.get("issuer")
+    canonical_old_issuer = _canonical_issuer_name(old_issuer)
+    if _has_useful_value(old_issuer) and canonical_old_issuer and canonical_old_issuer != str(old_issuer).strip():
+        update["issuer"] = canonical_old_issuer
 
     # raw_text atnaujiname, jei DB tuščias arba naujas tekstas ilgesnis.
     new_raw = str(parsed_row.get("raw_text") or "")
@@ -725,6 +800,8 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     except Exception:
         pass
 
+    issuer = _canonical_issuer_name(issuer)
+
     status = "parsed_mar_form" if norm_text else "pdf_text_empty"
     row = {
         "published_at": _to_iso_timestamp(published_at),
@@ -917,14 +994,20 @@ def _load_bad_manager_transactions(limit: int = 200) -> pd.DataFrame:
     isin_series = df["isin"].fillna("").astype(str).str.strip()
     bad_isin = isin_series.eq("") | (~isin_series.apply(_looks_like_valid_isin))
 
+    issuer_series = df["issuer"].fillna("").astype(str).str.strip()
+    issuer_needs_canonical = issuer_series.apply(
+        lambda x: bool(x) and _canonical_issuer_name(x) != x
+    )
+
     mask = (
         df["pdf_url"].fillna("").astype(str).str.strip().ne("")
         & (
             df["issuer"].fillna("").astype(str).str.strip().eq("")
+            | issuer_needs_canonical
             | df["person_name"].fillna("").astype(str).str.strip().eq("")
             | df["transaction_date"].fillna("").astype(str).str.strip().eq("")
             | bad_isin
-            | df["parse_status"].fillna("").astype(str).isin(["pdf_parse_error", "pdf_text_empty", "parsed_incomplete", "pdf_parse_empty_after_retry"])
+            | df["parse_status"].fillna("").astype(str).isin(["pdf_parse_error", "pdf_text_empty", "parsed_incomplete", "pdf_parse_empty_after_retry", "repaired_partial_fields"])
         )
     )
     return df[mask].copy().reset_index(drop=True)
@@ -972,7 +1055,10 @@ def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: s
 def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
     """
     Pakartotinai perparsina blogai / tuščiai nuskaitytus manager_transactions įrašus
-    ir ATNAUJINA TIK TUŠČIUS LAUKUS pagal id.
+    ir pagal id užpildo tuščius / aiškiai blogus laukus.
+
+    Papildomai visada suvienodina issuer pagal market_issuers lentelę, net jeigu
+    pats issuer laukas nėra tuščias.
 
     Nieko netrina ir nekuria naujų dublikatų. Jei konkretaus PDF teksto nepavyksta
     paimti, bandoma naudoti:
@@ -1160,8 +1246,8 @@ def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"])
     df = df.copy()
-    df["issuer"] = df.get("company", "").fillna("").astype(str).str.strip()
-    df["issuer_norm"] = df.get("company_norm", "").fillna("").astype(str).str.strip()
+    df["issuer"] = df.get("company", "").fillna("").astype(str).str.strip().apply(_canonical_issuer_name)
+    df["issuer_norm"] = df["issuer"].apply(_issuer_norm_key)
     df["category"] = df.get("category", "").fillna("").astype(str).str.strip()
     df["title"] = df.get("title", "").fillna("").astype(str).str.strip()
     df["published_at"] = df.get("published_at", None)
@@ -1217,7 +1303,7 @@ def prepare_dpl_periods_df(news_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _issuer_key(value) -> str:
-    return str(value or "").lower().strip()
+    return _issuer_norm_key(_canonical_issuer_name(value))
 
 
 def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df: pd.DataFrame) -> pd.DataFrame:
@@ -1293,6 +1379,7 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
+    df["issuer"] = df["issuer"].apply(_canonical_issuer_name)
     for col in ["price", "quantity"]:
         if col not in df.columns:
             df[col] = None
