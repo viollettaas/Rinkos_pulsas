@@ -10,12 +10,20 @@ from rinkos_logika import (
     generate_report,
     extract_dates_from_filename,
     download_nasdaq_statistics_excel,
-    vz_scrape_full,
+    atitinka,
+    extract_date_from_url,
+    _open_new_tab_and_get,
 )
 from emitentu_atranka import generate_emitentu_ataskaita
 from crib_update import update_crib_news, get_latest_crib_news_date
-from supabase_cache import save_news_df
+from supabase_cache import save_news_df, load_news_df
 from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 try:
     from vadovu_sandoriai import show_manager_transactions_page
 except Exception:
@@ -653,6 +661,162 @@ def download_nasdaq_statistics_df_for_vz(start_date: date, end_date: date) -> pd
 
 
 
+def _init_vz_driver(headless: bool = True):
+    """Selenium driveris VŽ pirmo puslapio patikrinimui.
+    Naudojamas Selenium Manager, kad Streamlit Cloud nekiltų ChromeDriver versijų konfliktų.
+    """
+    options = Options()
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--window-size=1600,1200")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--lang=lt")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors=yes")
+    options.set_capability("acceptInsecureCerts", True)
+    return webdriver.Chrome(options=options)
+
+
+def _existing_vz_urls() -> set:
+    """Pasiima jau DB esančių VŽ URL sąrašą, kad neatidarinėtume straipsnių pakartotinai."""
+    try:
+        df_existing = load_news_df("vz", date(2023, 1, 1), date.today())
+    except Exception:
+        return set()
+
+    if df_existing is None or df_existing.empty:
+        return set()
+
+    url_col = "url" if "url" in df_existing.columns else "Nuoroda" if "Nuoroda" in df_existing.columns else None
+    if url_col is None:
+        return set()
+
+    return {
+        str(u).strip().lower()
+        for u in df_existing[url_col].dropna().tolist()
+        if str(u).strip()
+    }
+
+
+def _title_matches_issuers(title: str, issuers) -> bool:
+    if not title:
+        return False
+    for issuer in issuers:
+        if atitinka(str(issuer), str(title)):
+            return True
+    return False
+
+
+def vz_scrape_first_page_fast(df_stat: pd.DataFrame, progress=None) -> pd.DataFrame:
+    """Greitas VŽ atnaujinimas.
+
+    Skaito tik pirmą VŽ puslapį. Pilną straipsnio tekstą atidaro tik tada, kai:
+    1) straipsnio URL dar nėra DB;
+    2) antraštė atitinka bent vieną emitentą iš df_stat["Bendrovė"].
+
+    Grąžina DataFrame, suderinamą su save_news_df(..., "vz").
+    """
+    if df_stat is None or df_stat.empty or "Bendrovė" not in df_stat.columns:
+        return pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+
+    issuers = [str(x).strip() for x in df_stat["Bendrovė"].dropna().unique().tolist() if str(x).strip()]
+    if not issuers:
+        return pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+
+    existing_urls = _existing_vz_urls()
+    driver = _init_vz_driver(headless=True)
+    items = []
+
+    try:
+        driver.get("https://www.vz.lt/")
+        try:
+            WebDriverWait(driver, 12).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        except Exception:
+            pass
+
+        # Slapukai, jei rodomi.
+        for by, selector in [
+            (By.ID, "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll"),
+            (By.XPATH, "//button[contains(., 'Sutinku') or contains(., 'Priimti') or contains(., 'Accept') or contains(., 'Allow')]")
+        ]:
+            try:
+                btn = WebDriverWait(driver, 4).until(EC.element_to_be_clickable((by, selector)))
+                driver.execute_script("arguments[0].click();", btn)
+                break
+            except Exception:
+                pass
+
+        try:
+            WebDriverWait(driver, 12).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article.vz-article")))
+        except Exception:
+            pass
+
+        articles = driver.find_elements(By.CSS_SELECTOR, "article.vz-article")
+
+        for el in articles:
+            try:
+                link_el = None
+                title = ""
+                url = ""
+
+                # Pirmiausia bandome tą pačią struktūrą, kuri buvo naudojama ankstesniame VŽ scraperyje.
+                try:
+                    desc = el.find_element(By.CSS_SELECTOR, "div.vz-article__summary--description")
+                    link_el = desc.find_element(By.CSS_SELECTOR, "a")
+                    title = (desc.text or "").strip()
+                except Exception:
+                    try:
+                        link_el = el.find_element(By.CSS_SELECTOR, "a[href]")
+                        title = (link_el.text or el.text or "").strip()
+                    except Exception:
+                        link_el = None
+
+                if link_el is None:
+                    continue
+
+                url = (link_el.get_attribute("href") or "").strip()
+                if not url:
+                    continue
+
+                url_key = url.lower()
+
+                # 1) jei jau DB – net neatidarinėjame.
+                if url_key in existing_urls:
+                    continue
+
+                # 2) jei antraštė neatitinka emitentų – net neatidarinėjame.
+                if not _title_matches_issuers(title, issuers):
+                    continue
+
+                data_url = extract_date_from_url(url)
+                if data_url is None:
+                    data_url = date.today()
+
+                full_title, content = _open_new_tab_and_get(driver, url, timeout=18)
+                if not full_title:
+                    full_title = title
+
+                items.append({
+                    "Antraštė": str(full_title or title).strip(),
+                    "Nuoroda": url,
+                    "Data": data_url,
+                    "Pilnas_tekstas": str(content or "").strip(),
+                })
+
+            except Exception:
+                continue
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    return pd.DataFrame(items, columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+
+
 # ------------------------------------------------------------
 # ATASKAITOS PASIRINKIMAS
 # ------------------------------------------------------------
@@ -777,9 +941,7 @@ with st.sidebar:
                 vz_start = date(2023, 1, 1)
                 vz_end = date.today()
                 with st.spinner("Tikrinamas pirmas VŽ puslapis pagal DB emitentų sąrašą..."):
-                    _, vz_df = vz_scrape_full(
-                        vz_start,
-                        vz_end,
+                    vz_df = vz_scrape_first_page_fast(
                         df_issuers_for_vz,
                         progress=None,
                     )
