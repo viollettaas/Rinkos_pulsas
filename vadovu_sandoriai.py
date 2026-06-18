@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 
 import re
+import os
+import warnings
 from datetime import date, timedelta
 
 import pandas as pd
+import urllib3
 import streamlit as st
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ.setdefault("WDM_SSL_VERIFY", "0")
 
 from supabase_cache import load_news_df
 
@@ -13,10 +23,146 @@ try:
 except Exception:
     load_manager_transactions_df = None
 
+
+
+# ------------------------------------------------------------
+# Vadovų sandorių atnaujinimas iš market_news CRIB pranešimų
+# Viskas šiame faile, todėl nereikia manager_transactions_update.py.
+# ------------------------------------------------------------
 try:
-    from manager_transactions_update import update_manager_transactions_from_recent_crib
+    from backfill_manager_transactions_from_crib import save_manager_transactions_from_crib_selenium
 except Exception:
-    update_manager_transactions_from_recent_crib = None
+    save_manager_transactions_from_crib_selenium = None
+
+MANAGER_CATEGORY_TOKENS = (
+    "pranešimai apie vadovų sandorius",
+    "pranesimai apie vadovu sandorius",
+    "notifications on transactions concluded by managers",
+    "vadovų sandori",
+    "vadovu sandori",
+)
+
+
+def _notify(progress, message: str):
+    if progress:
+        progress(message)
+
+
+def _init_driver(headless: bool = True):
+    options = Options()
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--window-size=1600,1200")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--lang=lt")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors=yes")
+    options.set_capability("acceptInsecureCerts", True)
+    return webdriver.Chrome(options=options)
+
+
+def _is_manager_notice(row) -> bool:
+    text = " ".join([
+        str(row.get("category", "") or ""),
+        str(row.get("title", "") or ""),
+        str(row.get("content", "") or "")[:500],
+    ]).lower()
+    return any(token in text for token in MANAGER_CATEGORY_TOKENS)
+
+
+def _load_recent_manager_crib_notices(days_back: int = 45) -> pd.DataFrame:
+    start = date.today() - timedelta(days=days_back)
+    end = date.today()
+    df = load_news_df("crib", start, end)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    for col in ["category", "title", "url", "published_at", "content", "company"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    mask = df.apply(_is_manager_notice, axis=1)
+    df = df[mask].copy()
+
+    if df.empty:
+        return df
+
+    df["published_at_dt"] = pd.to_datetime(df["published_at"], errors="coerce", utc=False)
+    df = df.sort_values("published_at_dt", ascending=False)
+    df = df.drop_duplicates(subset=["url"], keep="first")
+    return df.reset_index(drop=True)
+
+
+def update_manager_transactions_from_recent_crib(
+    days_back: int = 45,
+    max_messages: int = 30,
+    headless: bool = True,
+    progress=None,
+) -> dict:
+    """
+    Patikrina paskutinius CRIB pranešimus market_news lentelėje ir papildo
+    manager_transactions, jei vadovų sandorių PDF dar nėra įrašyti.
+    """
+    stats = {
+        "manager_messages_found": 0,
+        "manager_messages_processed": 0,
+        "manager_transactions_saved": 0,
+        "manager_transactions_errors": 0,
+        "module_available": save_manager_transactions_from_crib_selenium is not None,
+    }
+
+    if save_manager_transactions_from_crib_selenium is None:
+        return stats
+
+    notices = _load_recent_manager_crib_notices(days_back=days_back)
+    if notices is None or notices.empty:
+        return stats
+
+    notices = notices.head(max_messages).copy()
+    stats["manager_messages_found"] = len(notices)
+
+    driver = _init_driver(headless=headless)
+    try:
+        for _, row in notices.iterrows():
+            url = str(row.get("url", "") or "").strip()
+            if not url:
+                continue
+
+            published_at = row.get("published_at", None)
+            try:
+                published_at = pd.to_datetime(published_at, errors="coerce")
+                if pd.isna(published_at):
+                    published_at = None
+                else:
+                    published_at = published_at.to_pydatetime()
+            except Exception:
+                published_at = None
+
+            stats["manager_messages_processed"] += 1
+            _notify(progress, f"Tikrinamas vadovų sandorių CRIB pranešimas: {url}")
+
+            try:
+                saved = save_manager_transactions_from_crib_selenium(
+                    driver=driver,
+                    crib_url=url,
+                    published_at=published_at,
+                )
+                stats["manager_transactions_saved"] += int(saved or 0)
+            except Exception as exc:
+                stats["manager_transactions_errors"] += 1
+                _notify(progress, f"Vadovų sandorių PDF klaida: {exc}")
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    return stats
 
 
 def _load_manager_transactions_df_fallback(start_date, end_date) -> pd.DataFrame:
@@ -485,8 +631,8 @@ def show_manager_transactions_page():
         st.markdown("</div>", unsafe_allow_html=True)
 
     if manager_update_btn:
-        if update_manager_transactions_from_recent_crib is None:
-            st.error("Nerastas manager_transactions_update.py modulis arba jame nėra update_manager_transactions_from_recent_crib funkcijos.")
+        if save_manager_transactions_from_crib_selenium is None:
+            st.error("Nerastas backfill_manager_transactions_from_crib.py arba jame nėra save_manager_transactions_from_crib_selenium funkcijos.")
             st.stop()
 
         try:
