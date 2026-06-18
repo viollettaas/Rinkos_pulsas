@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 from datetime import date, timedelta
+from io import BytesIO
+import requests
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -592,6 +595,62 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
+def download_nasdaq_statistics_df_for_vz(start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    Atsisiunčia Nasdaq Baltic statistics Excel pagal pasirinktą laikotarpį
+    ir grąžina VLN lapą kaip DataFrame. Naudojama tik emitentų sąrašui,
+    pagal kurį atrenkami aktualūs VŽ straipsniai.
+    """
+    if start_date is None or end_date is None:
+        raise ValueError("VŽ atnaujinimui reikia nurodyti pradžios ir pabaigos datas.")
+    if start_date > end_date:
+        raise ValueError("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
+
+    base_url = "https://nasdaqbaltic.com/statistics/lt/statistics/download"
+    params = {
+        "filter": 1,
+        "start": start_date.strftime("%Y-%m-%d"),
+        "end": end_date.strftime("%Y-%m-%d"),
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+            "application/vnd.ms-excel,application/octet-stream,*/*"
+        ),
+        "Referer": "https://nasdaqbaltic.com/statistics/lt/statistics",
+        "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    response = requests.get(
+        base_url,
+        params=params,
+        headers=headers,
+        verify=False,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    content = response.content or b""
+    content_type = response.headers.get("Content-Type", "").lower()
+    if content[:100].lstrip().lower().startswith(b"<html") or "text/html" in content_type:
+        raise RuntimeError(
+            "Nasdaq Baltic vietoje Excel grąžino HTML puslapį. "
+            "Pabandykite dar kartą arba naudokite jau sugeneruotos ataskaitos emitentų sąrašą."
+        )
+
+    excel_file = BytesIO(content)
+    try:
+        return pd.read_excel(excel_file, sheet_name="VLN")
+    except Exception:
+        excel_file.seek(0)
+        return pd.read_excel(excel_file)
+
+
 
 # ------------------------------------------------------------
 # ATASKAITOS PASIRINKIMAS
@@ -643,7 +702,7 @@ with st.sidebar:
         """
         <div class="news-db-block">
             <div class="sidebar-section-title">🔄 Naujienų bazė</div>
-            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus ir, jei yra paskutinės rinkos ataskaitos emitentų sąrašas, atnaujina VŽ straipsnius pagal tuos emitentus.</div>
+            <div class="sidebar-section-subtitle">Patikrina naujausius CRIB pranešimus, atsisiunčia Nasdaq emitentų sąrašą pagal pasirinktą laikotarpį ir atnaujina aktualius VŽ straipsnius.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -689,14 +748,27 @@ with st.sidebar:
                 crib_inserted = int(stats.get("records_inserted", 0) or 0)
                 crib_pages = int(stats.get("pages_processed", 0) or 0)
 
+            update_start = st.session_state.get("rinkos_start_date", date.today())
+            update_end = st.session_state.get("rinkos_end_date", date.today())
+
             df_stat_for_vz = None
-            if st.session_state.report_result is not None:
-                df_stat_for_vz = st.session_state.report_result.get("df_raw")
+            with st.spinner("Atsisiunčiamas Nasdaq emitentų sąrašas VŽ atrankai..."):
+                try:
+                    df_stat_for_vz = download_nasdaq_statistics_df_for_vz(update_start, update_end)
+                except Exception as nasdaq_exc:
+                    if st.session_state.report_result is not None:
+                        df_stat_for_vz = st.session_state.report_result.get("df_raw")
+                        vz_note = (
+                            " Nasdaq sąrašo atsisiųsti nepavyko, todėl VŽ atrankai panaudotas "
+                            "paskutinės sugeneruotos rinkos ataskaitos emitentų sąrašas."
+                        )
+                    else:
+                        vz_note = f" VŽ neatnaujinta: nepavyko gauti Nasdaq emitentų sąrašo ({nasdaq_exc})."
 
             if df_stat_for_vz is not None and not df_stat_for_vz.empty:
-                vz_start = date.today() - timedelta(days=14)
-                vz_end = date.today()
-                with st.spinner("Tikrinami nauji VŽ straipsniai pagal paskutinės ataskaitos emitentus..."):
+                vz_start = update_start
+                vz_end = update_end
+                with st.spinner("Tikrinami VŽ straipsniai pagal Nasdaq emitentų sąrašą..."):
                     _, vz_df = vz_scrape_full(
                         vz_start,
                         vz_end,
@@ -705,8 +777,6 @@ with st.sidebar:
                     )
                     vz_found = len(vz_df) if vz_df is not None else 0
                     vz_inserted = save_news_df(vz_df, "vz") if vz_df is not None and not vz_df.empty else 0
-            else:
-                vz_note = " VŽ neatnaujinta: pirmiausia sugeneruokite rinkos ataskaitą, kad būtų emitentų sąrašas."
 
             st.session_state.report_result = None
             st.session_state.emitentu_result = None
