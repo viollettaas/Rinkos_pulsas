@@ -14,9 +14,15 @@ Logika:
 - eina nuo naujausiu CRIB puslapiu;
 - nuskaito pranesimus, atidaro detalius puslapius ir paima pilna teksta;
 - saugo i ta pacia Supabase lentele market_news per save_news_df(..., "crib");
-- jei pranesimo kategorija yra „Pranešimai apie vadovų sandorius“, papildomai nuskaito PDF priedus ir saugo i manager_transactions;
+- jei pranesimo kategorija yra "Pranesimai apie vadovu sandorius", papildomai nuskaito PDF priedus ir saugo i manager_transactions;
 - dublikatai ignoruojami per unique_key logika supabase_cache.py ir pdf_url manager_transactions lenteleje;
-- sustoja, kai keli puslapiai is eiles neirase nieko naujo, arba pasiekia max_pages.
+- jei pirmame puslapyje nieko naujo neranda, sustoja po pirmo puslapio;
+- jei randa nauju pranesimu, eina iki pirmo jau DB esancio pranesimo.
+
+Svarbus pataisymas Streamlit Cloud:
+- nebenaudojamas webdriver_manager ChromeDriverManager(), nes Streamlit Cloud aplinkoje jis gali parinkti
+  ChromeDriver versija, nesuderinama su /usr/bin/chromium;
+- naudojamas Selenium Manager per webdriver.Chrome(options=options), kuris parenka suderinama driveri.
 """
 
 import os
@@ -36,17 +42,13 @@ from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException
-from webdriver_manager.chrome import ChromeDriverManager
 
 from supabase_cache import save_news_df, load_news_df, log_scrape
 
-# Naudojame jau paruošta vadovų sandorių PDF nuskaitymo logiką.
-# Funkcija pati praleidžia PDF, kurie jau yra manager_transactions lentelėje.
 try:
     from backfill_manager_transactions_from_crib import save_manager_transactions_from_crib_selenium
 except Exception:
@@ -64,18 +66,40 @@ def _notify(progress, message: str):
 
 
 def init_driver(headless: bool = True):
+    """
+    Sukuria Chrome/Chromium driveri.
+
+    Naudojamas Selenium Manager, o ne webdriver_manager.ChromeDriverManager(),
+    kad Streamlit Cloud aplinkoje neatsirastu klaida:
+        ChromeDriver only supports Chrome version X, current browser version Y.
+    """
     options = Options()
     if headless:
         options.add_argument("--headless=new")
+
     options.add_argument("--window-size=1600,1200")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--lang=lt")
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors=yes")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.set_capability("acceptInsecureCerts", True)
-    return webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+
+    chromium_paths = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    for path in chromium_paths:
+        if os.path.exists(path):
+            options.binary_location = path
+            break
+
+    return webdriver.Chrome(options=options)
 
 
 def wait_ready(driver, timeout=25):
@@ -342,8 +366,6 @@ def make_news_label(row):
     return label
 
 
-
-
 def is_manager_transactions_category(value: str) -> bool:
     text = str(value or "").lower()
     return (
@@ -354,14 +376,6 @@ def is_manager_transactions_category(value: str) -> bool:
 
 
 def process_manager_transactions_for_records(driver, records, progress=None):
-    """
-    Iš naujai rastų CRIB pranešimų atrenka kategoriją
-    „Pranešimai apie vadovų sandorius“ ir į manager_transactions
-    įrašo visus PDF priedus.
-
-    Ši funkcija naudojama tik update_crib_news() metu, t. y. paspaudus
-    Streamlit mygtuką „Atnaujinti duomenis“.
-    """
     stats = {
         "manager_messages_processed": 0,
         "manager_transactions_saved": 0,
@@ -372,10 +386,7 @@ def process_manager_transactions_for_records(driver, records, progress=None):
         return stats
 
     if save_manager_transactions_from_crib_selenium is None:
-        _notify(
-            progress,
-            "Vadovų sandorių PDF modulis nerastas, todėl manager_transactions neatnaujinta.",
-        )
+        _notify(progress, "Vadovu sandoriu PDF modulis nerastas, todel manager_transactions neatnaujinta.")
         return stats
 
     for r in records:
@@ -390,7 +401,7 @@ def process_manager_transactions_for_records(driver, records, progress=None):
             continue
 
         stats["manager_messages_processed"] += 1
-        _notify(progress, f"Nuskaitomi vadovų sandorių PDF: {url}")
+        _notify(progress, f"Nuskaitomi vadovu sandoriu PDF: {url}")
 
         try:
             saved = save_manager_transactions_from_crib_selenium(
@@ -401,9 +412,10 @@ def process_manager_transactions_for_records(driver, records, progress=None):
             stats["manager_transactions_saved"] += int(saved or 0)
         except Exception as exc:
             stats["manager_transactions_errors"] += 1
-            _notify(progress, f"Vadovų sandorių PDF klaida: {exc}")
+            _notify(progress, f"Vadovu sandoriu PDF klaida: {exc}")
 
     return stats
+
 
 def click_next_in_shadow_pagination(driver, host_id=NEXT_BUTTON_HOST_ID):
     js = f"""
@@ -508,12 +520,6 @@ def _make_existing_key_from_crib_row(row) -> str:
 
 
 def load_existing_crib_keys(start_lookup: date = date(2023, 1, 1)) -> set:
-    """
-    Užkrauna jau DB esančių CRIB pranešimų raktus.
-    Naudojama tam, kad atnaujinimo metu nereikėtų eiti per kelis tuščius puslapius:
-    - jei pirmas puslapis visas jau DB, sustojame po pirmo puslapio;
-    - jei randame naujų įrašų, einame tik iki pirmo jau DB esančio pranešimo.
-    """
     try:
         df_existing = load_news_df("crib", start_lookup, date.today())
     except Exception:
@@ -529,12 +535,7 @@ def load_existing_crib_keys(start_lookup: date = date(2023, 1, 1)) -> set:
     }
 
 
-
 def get_latest_crib_news_date():
-    """
-    Grąžina naujausios CRIB naujienos datą iš Supabase market_news lentelės.
-    Naudojama Streamlit mygtuko kortelėje, kad būtų matoma, iki kada DB atnaujinta.
-    """
     try:
         from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
 
@@ -560,7 +561,6 @@ def get_latest_crib_news_date():
             return None
         return latest.to_pydatetime()
     except Exception:
-        # Atsarginis variantas, jeigu tiesioginė REST užklausa nepavyktų.
         try:
             df = load_news_df("crib", date(2023, 1, 1), date.today())
             if df is None or df.empty or "published_at" not in df.columns:
@@ -574,19 +574,6 @@ def get_latest_crib_news_date():
 
 
 def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, stop_empty_pages: int = None):
-    """
-    Atnaujina CRIB naujienų bazę.
-
-    Logika:
-    - pirmiausia paima jau DB esančių CRIB pranešimų raktus;
-    - patikrina pirmą CRIB puslapį;
-    - jei pirmame puslapyje nėra naujų pranešimų, sustoja po pirmo puslapio;
-    - jei naujų yra, įrašo juos ir eina toliau tik iki pirmo jau DB esančio pranešimo;
-    - detalius puslapius atidaro tik naujiems pranešimams, todėl atnaujinimas yra greitesnis.
-
-    Returns:
-        dict su pages_processed, records_found, records_inserted, new_candidates, manager_transactions_saved.
-    """
     existing_keys = load_existing_crib_keys()
 
     driver = init_driver(headless=headless)
@@ -634,9 +621,8 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
 
                 new_rows.append(r)
 
-            # Jei pirmame puslapyje nieko naujo nerasta, daugiau puslapių netikriname.
             if page == 1 and not new_rows:
-                _notify(progress, "Naujų CRIB pranešimų pirmame puslapyje nerasta.")
+                _notify(progress, "Nauju CRIB pranesimu pirmame puslapyje nerasta.")
                 total_found += len(rows_basic)
                 break
 
@@ -676,13 +662,9 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
                 except Exception:
                     pass
 
-                # Kad šiame pačiame paleidime dublikatų neapdorotume antrą kartą.
                 for _, row in df_page.iterrows():
                     existing_keys.add(_make_existing_key_from_crib_row(row))
 
-                # Papildomas žingsnis: jei tarp naujų CRIB pranešimų yra
-                # „Pranešimai apie vadovų sandorius“, iškart nuskaitome jų PDF
-                # ir išsaugome manager_transactions lentelėje.
                 manager_stats = process_manager_transactions_for_records(
                     driver=driver,
                     records=records,
@@ -696,7 +678,6 @@ def update_crib_news(max_pages: int = 20, headless: bool = True, progress=None, 
             total_manager_transactions_saved += manager_stats.get("manager_transactions_saved", 0)
             total_manager_transactions_errors += manager_stats.get("manager_transactions_errors", 0)
 
-            # Jei šiame puslapyje jau pasiekėme pirmą DB esantį pranešimą, toliau neiname.
             if reached_existing:
                 break
 
