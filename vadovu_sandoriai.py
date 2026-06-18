@@ -178,7 +178,7 @@ def _update_manager_transaction_by_id(row_id: int, parsed_row: dict) -> bool:
 
 
 def _is_empty_db_value(value) -> bool:
-    """Ar manager_transactions laukas laikytinas tuščiu / netaisyklingu."""
+    """Ar manager_transactions laukas laikytinas tuščiu."""
     if value is None:
         return True
     try:
@@ -194,32 +194,57 @@ def _is_empty_db_value(value) -> bool:
     return False
 
 
+def _is_bad_existing_value(col: str, value) -> bool:
+    """Ar DB reikšmė nėra tuščia, bet aiškiai blogai nuskaityta ir ją reikia perrašyti."""
+    if _is_empty_db_value(value):
+        return True
+    s = str(value).strip()
+    s_l = s.lower()
+
+    if col == "isin":
+        return not bool(re.fullmatch(r"(?:LT|LV|EE)[A-Z0-9]{10}", s, flags=re.I))
+
+    if col in {"issuer", "person_name"}:
+        bad_tokens = ["/ vardas", "pavardė", "pavarde", "vadovaujamas", "pareigas einančio"]
+        return any(t in s_l for t in bad_tokens)
+
+    if col == "instrument":
+        return ("kaina" in s_l and "kiekis" in s_l) or ("identifikavimo" in s_l and len(s) > 80)
+
+    if col == "transaction_type":
+        return len(s) > 220 or "kaina(-os)" in s_l or "apimtis" in s_l
+
+    if col == "venue":
+        return len(s) > 260 or "vadovaujamas pareigas" in s_l or "pasiraš" in s_l or "pasiras" in s_l
+
+    return False
+
+
 def _has_useful_value(value) -> bool:
     return not _is_empty_db_value(value)
 
 
 def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dict, parsed_row: dict) -> bool:
     """
-    Atnaujina tik tuščius / blogai nuskaitytus laukus.
-
-    Svarbu: netriname eilučių ir neperrašome gerų reikšmių tuščiomis.
-    Jeigu PDF buvo nuskaitytas per alternatyvią CRIB attachment nuorodą, iš jos
-    paimame duomenų laukus, bet originalaus pdf_url nekeičiame, nebent jis tuščias.
+    Atnaujina tuščius laukus pagal id. Taip pat perrašo kelias aiškiai blogas
+    senas reikšmes, pvz. ISIN='VADOVAUJAMAS' arba asmenį su '/ vardas'.
+    Gerų reikšmių tuščiomis neperrašome.
     """
     update = {}
 
-    # Laukai, kuriuos taisome tik tada, kai DB reikšmė tuščia, o parseris rado naują reikšmę.
-    fill_if_empty = [
+    fill_if_empty_or_bad = [
         "issuer", "lei", "person_name", "person_role", "isin", "instrument",
         "transaction_type", "price", "quantity", "transaction_date", "venue",
         "crib_title", "crib_category", "pdf_name", "price_quantity_note",
     ]
 
-    for col in fill_if_empty:
+    for col in fill_if_empty_or_bad:
         new_val = parsed_row.get(col)
         old_val = current_row.get(col)
-        if _is_empty_db_value(old_val) and _has_useful_value(new_val):
-            update[col] = new_val
+        if (_is_empty_db_value(old_val) or _is_bad_existing_value(col, old_val)) and _has_useful_value(new_val):
+            # Neįrašome akivaizdžiai blogos naujos reikšmės.
+            if not _is_bad_existing_value(col, new_val):
+                update[col] = new_val
 
     # raw_text atnaujiname, jei DB tuščias arba naujas tekstas ilgesnis.
     new_raw = str(parsed_row.get("raw_text") or "")
@@ -227,15 +252,13 @@ def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dic
     if new_raw and (not old_raw.strip() or len(new_raw) > len(old_raw)):
         update["raw_text"] = new_raw
 
-    # pdf_url keičiame tik jei senas tuščias. Paprastai paliekame originalią nuorodą.
+    # pdf_url keičiame tik jei senas tuščias.
     if _is_empty_db_value(current_row.get("pdf_url")) and _has_useful_value(parsed_row.get("pdf_url")):
         update["pdf_url"] = parsed_row.get("pdf_url")
 
-    # published_at pildome tik jei tuščias.
     if _is_empty_db_value(current_row.get("published_at")) and _has_useful_value(parsed_row.get("published_at")):
         update["published_at"] = parsed_row.get("published_at")
 
-    # Statusą keičiame pagal rezultatą. Jei pagrindiniai laukai užsipildė, laikome sutvarkytu.
     merged = dict(current_row)
     merged.update(update)
     if _is_good_parsed_row(merged):
@@ -493,6 +516,78 @@ def _extract_date_from_text(text: str):
     return None
 
 
+def _clean_person_name(value: str) -> str:
+    v = _collapse_ws(value)
+    if not v:
+        return ""
+    v = re.sub(r"^[/\\]?\s*vardas\s*,?\s*", "", v, flags=re.I)
+    v = re.sub(r"\bpavard[ėe]\b", "", v, flags=re.I)
+    v = re.sub(r"\bvardas\b", "", v, flags=re.I)
+    v = _collapse_ws(v.strip(" ,;:-"))
+    # Jei liko daug teksto, paimame pirmą dviejų žodžių asmens vardą.
+    m = re.search(r"([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+\s+[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+(?:-[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)?)", v)
+    if m:
+        return _collapse_ws(m.group(1))
+    return v[:140]
+
+
+def _clean_issuer(value: str) -> str:
+    v = _collapse_ws(value)
+    if not v:
+        return ""
+    v = re.sub(r"\bLEI\b.*$", "", v, flags=re.I).strip(" ,;:-")
+    return _collapse_ws(v)[:180]
+
+
+def _extract_person_fallback(text: str) -> str:
+    if not text:
+        return ""
+    patterns = [
+        r"1\..*?a\)\s*Pavadinimas\s+(.+?)\s+2\.",
+        r"(?:Vadovaujamas pareigas einančio asmens|Vadovo|Asmens)\s+(?:vardas ir pavardė|vardas,?\s*pavardė)\s+(.+?)(?:\n|$)",
+        r"(?:Name of the person|Person name)\s+(.+?)(?:\n|$)",
+        r"([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+\s+[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+(?:-[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)?),\s*(?:AB|Akcinė bendrovė|UAB|AS|A/S)",
+        r"(Darius\s+Šulnis|Artūras\s+Šilinis|Andrius\s+Pranckevičius|Regina\s+Kvaraciejienė|Rokas\s+Kvaraciejus|Eglė\s+Kvaraciejūtė-Ivanauskienė)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I | re.S)
+        if m:
+            val = _clean_person_name(m.group(1))
+            if val:
+                return val
+    return ""
+
+
+def _extract_issuer_fallback(text: str, role: str = "", venue: str = "", crib_title: str = "") -> str:
+    combined = "\n".join([text or "", role or "", venue or "", crib_title or ""])
+    patterns = [
+        r"3\..*?a\)\s*Pavadinimas\s+(.+?)\s+b\)\s*LEI",
+        r"(?:Emitento pavadinimas|Issuer name|Name of the issuer)\s+(.+?)(?:\n|LEI|$)",
+        r"(Akcinė\s+bendrovė\s+[„\"A-ZĄČĘĖĮŠŲŪŽ][^\n,;]{2,80})",
+        r"(AB\s+[„\"A-ZĄČĘĖĮŠŲŪŽ][^\n,;]{2,80})\s+(?:vadovas|valdybos|stebėtojų|stebetojų)",
+        r",\s*(AB\s+[„\"A-ZĄČĘĖĮŠŲŪŽ][^,;\n]{2,80})\s+vadov",
+        r"(AB\s+Akola\s+group)",
+        r"(AB\s+„Invalda\s+INVL“)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, combined, flags=re.I | re.S)
+        if m:
+            val = _clean_issuer(m.group(1))
+            if val:
+                return val
+    return ""
+
+
+def _clean_instrument(value: str) -> str:
+    v = _collapse_ws(value)
+    v = re.sub(r"Finansinės priemonės", "", v, flags=re.I)
+    v = re.sub(r"aprašymas,?\s*priemonės\s*rūšis", "", v, flags=re.I)
+    v = re.sub(r"Identifikavimo\s+kodas", "", v, flags=re.I)
+    v = re.sub(r"ISIN\s*(?:kodas)?\s*[:\-]?\s*(?:LT|LV|EE)[A-Z0-9]{10}", "", v, flags=re.I)
+    v = re.sub(r"Kaina\(-?os\)?.*$", "", v, flags=re.I | re.S)
+    return _collapse_ws(v)[:220]
+
+
 def _extract_isin(text: str) -> str:
     if not text:
         return ""
@@ -509,6 +604,7 @@ def _extract_isin(text: str) -> str:
 
 def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> dict:
     text = text or ""
+    norm_text = _collapse_ws(text)
 
     person = _regex_value(text, r"1\..*?a\)\s*Pavadinimas\s+(.+?)\s+2\.")
     role = _regex_value(text, r"Pareigos\s*/\s*statusas\s+(.+?)\s+b\)\s*Pirminis")
@@ -518,43 +614,87 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     venue = _regex_value(text, r"f\)\s*Sandorio vieta\s+(.+?)\s*$")
     transaction_date = _regex_value(text, r"e\)\s*Sandorio data\s+(\d{4}[-.]\d{2}[-.]\d{2})") or _extract_date_from_text(text)
 
+    # Alternatyvios formos, kur laukai vadinasi kitaip.
+    if not person:
+        person = _text_after_label(text, [
+            r"Vadovaujamas pareigas einančio asmens vardas ir pavardė",
+            r"Vadovo vardas ir pavardė",
+            r"Asmens vardas ir pavardė",
+            r"Name of the person",
+            r"Person name",
+        ], max_len=180)
+    person = _clean_person_name(person) or _extract_person_fallback(text)
+
+    if not role:
+        role = _text_after_label(text, [
+            r"Pareigos / statusas",
+            r"Vadovaujamas pareigas einančio asmens pareigos",
+            r"Pareigos",
+            r"Statusas",
+            r"Position",
+            r"Function",
+            r"Role",
+        ], max_len=220)
+    role = _collapse_ws(role)
+
+    if not issuer:
+        issuer = _text_after_label(text, [
+            r"Emitento pavadinimas",
+            r"Issuer name",
+            r"Name of the issuer",
+        ], max_len=180)
+    issuer = _clean_issuer(issuer) or _extract_issuer_fallback(text, role=role, venue=venue, crib_title=crib_title)
+
+    if not transaction_type:
+        transaction_type = _text_after_label(text, [
+            r"Sandorio pobūdis",
+            r"Sandorio rūšis",
+            r"Nature of the transaction",
+            r"Transaction type",
+        ], max_len=220)
+    transaction_type = _collapse_ws(re.sub(r"Kaina\(-?os\)?.*$", "", transaction_type or "", flags=re.I | re.S))
+
+    if not venue:
+        venue = _text_after_label(text, [
+            r"Sandorio vieta",
+            r"Prekybos vieta",
+            r"Place of the transaction",
+            r"Trading venue",
+            r"Venue",
+        ], max_len=220)
+    venue = _collapse_ws(re.sub(r"(?:Pagal|Under the power|Vadovaujamas pareigas|pasiraš).*", "", venue or "", flags=re.I | re.S))
+
     isin = _extract_isin(text)
 
     instrument_block = _regex_value(text, r"a\)\s*Finansinės priemonės\s+(.+?)\s+b\)\s*Sandorio pobūdis")
-    instrument = re.sub(
-        r"aprašymas, priemonės|rūšis|Identifikavimo kodas|ISIN\s*kodas\s*[:\-]?\s*[A-Z0-9]+",
-        " ",
-        instrument_block,
-        flags=re.I,
-    )
-    instrument = _collapse_ws(instrument)
+    if not instrument_block:
+        instrument_block = _text_after_label(text, [
+            r"Finansinės priemonės aprašymas.*?Identifikavimo kodas",
+            r"Finansinė priemonė",
+            r"Financial instrument",
+        ], max_len=260)
+    instrument = _clean_instrument(instrument_block)
 
     price = None
     quantity = None
-    pq = re.search(r"Kaina\s+Kiekis\s+([\d\s]+(?:[,.]\d+)?)\s*EUR\s+([\d\s]+)", text, flags=re.I)
+
+    # LT MAR forma: Kaina Kiekis / 1,66 EUR 78 718
+    pq = re.search(r"Kaina\s+Kiekis\s+([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|€)?\s+([\d\s]+)", text, flags=re.I)
+    if not pq:
+        # Kita forma: Kaina(-os) Apimtis / 0,00 EUR 2 340 249
+        pq = re.search(r"Kaina\(-?os\)?\s+Apimtis\s+([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|€)?\s+([\d\s]+)", text, flags=re.I)
     if pq:
         price = _parse_number(pq.group(1))
         quantity = _parse_number(pq.group(2), as_int=True)
 
     if quantity is None:
-        q = re.search(r"Akcijų\s+kiekis\s*:\s*([\d\s]+)", text, flags=re.I)
+        q = re.search(r"(?:Akcijų\s+kiekis|apibendrinta\s+apimtis)\s*[:\-]?\s*([\d\s]+)", text, flags=re.I)
         if q:
             quantity = _parse_number(q.group(1), as_int=True)
     if price is None:
-        pr = re.search(r"Vienos\s+akcijos\s+kaina\s+([\d\s]+(?:[,.]\d+)?)\s*EUR", text, flags=re.I)
+        pr = re.search(r"(?:Vienos\s+akcijos\s+kaina|kaina)\s*[:\-]?\s*([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|€)", text, flags=re.I)
         if pr:
             price = _parse_number(pr.group(1))
-
-    if not person:
-        person = _text_after_label(text, [r"Vadovo vardas ir pavardė", r"Asmens vardas ir pavardė", r"Name of the person", r"Person name"])
-    if not issuer:
-        issuer = _text_after_label(text, [r"Emitento pavadinimas", r"Issuer name", r"Name of the issuer"])
-    if not role:
-        role = _text_after_label(text, [r"Pareigos / statusas", r"Pareigos", r"Statusas", r"Position", r"Function", r"Role"])
-    if not transaction_type:
-        transaction_type = _text_after_label(text, [r"Sandorio pobūdis", r"Sandorio rūšis", r"Nature of the transaction", r"Transaction type"])
-    if not venue:
-        venue = _text_after_label(text, [r"Sandorio vieta", r"Prekybos vieta", r"Place of the transaction", r"Trading venue", r"Venue"])
 
     pdf_name = ""
     try:
@@ -562,7 +702,7 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     except Exception:
         pass
 
-    status = "parsed_mar_form" if _collapse_ws(text) else "pdf_text_empty"
+    status = "parsed_mar_form" if norm_text else "pdf_text_empty"
     row = {
         "published_at": _to_iso_timestamp(published_at),
         "transaction_date": transaction_date,
@@ -585,6 +725,8 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
         "crib_category": crib_category or "",
         "raw_text": text[:12000] if text else "",
     }
+
+    # Jei nėra kainos/kiekio dėl paveldėjimo ar įkeitimo, bet pagrindiniai laukai yra, nelaikome tuščiu parseriu.
     if status == "parsed_mar_form" and not _is_good_parsed_row(row):
         row["parse_status"] = "parsed_incomplete"
     return row
