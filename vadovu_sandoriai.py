@@ -4,10 +4,15 @@ import re
 import os
 import warnings
 from datetime import date, timedelta
+from io import BytesIO
+from urllib.parse import urljoin
 
+import requests
+import pdfplumber
 import pandas as pd
 import urllib3
 import streamlit as st
+from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -26,13 +31,10 @@ except Exception:
 
 
 # ------------------------------------------------------------
-# Vadovų sandorių atnaujinimas iš market_news CRIB pranešimų
-# Viskas šiame faile, todėl nereikia manager_transactions_update.py.
+# Vadovų sandorių atnaujinimas iš market_news CRIB pranešimų.
+# Viskas šiame faile: nereikia manager_transactions_update.py ir
+# nereikia backfill_manager_transactions_from_crib.py.
 # ------------------------------------------------------------
-try:
-    from backfill_manager_transactions_from_crib import save_manager_transactions_from_crib_selenium
-except Exception:
-    save_manager_transactions_from_crib_selenium = None
 
 MANAGER_CATEGORY_TOKENS = (
     "pranešimai apie vadovų sandorius",
@@ -61,6 +63,250 @@ def _init_driver(headless: bool = True):
     options.add_argument("--ignore-ssl-errors=yes")
     options.set_capability("acceptInsecureCerts", True)
     return webdriver.Chrome(options=options)
+
+
+def _supabase_client_parts():
+    from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
+    return _supabase_headers, _supabase_rest_url, _http_client
+
+
+def _manager_pdf_already_saved(pdf_url: str) -> bool:
+    if not pdf_url:
+        return False
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {"select": "pdf_url", "pdf_url": f"eq.{pdf_url}", "limit": "1"}
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            return bool(resp.json() or [])
+    except Exception:
+        return False
+
+
+def _post_manager_transaction(row: dict) -> bool:
+    _headers, _url, _client = _supabase_client_parts()
+    url = _url("manager_transactions")
+    with _client() as client:
+        resp = client.post(
+            url,
+            headers={**_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json=row,
+        )
+        if resp.status_code in (200, 201, 204):
+            return True
+        if resp.status_code == 409:
+            return False
+        raise RuntimeError(f"Supabase manager_transactions įrašymo klaida: {resp.status_code} - {resp.text}")
+
+
+def _text_after_label(text: str, labels, max_len: int = 160) -> str:
+    if not text:
+        return ""
+    for label in labels:
+        pattern = rf"{label}\s*[:\-]?\s*(.+)"
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            value = m.group(1).strip()
+            value = re.split(r"\n|\r|\s{3,}", value)[0].strip()
+            return value[:max_len]
+    return ""
+
+
+def _extract_number_after(text: str, labels) -> float | None:
+    raw = _text_after_label(text, labels, max_len=80)
+    if not raw:
+        return None
+    m = re.search(r"[-+]?\d[\d\s.,]*", raw)
+    if not m:
+        return None
+    s = m.group(0).replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_date_from_text(text: str):
+    if not text:
+        return None
+    patterns = [
+        r"(\d{4}[-.]\d{2}[-.]\d{2})",
+        r"(\d{2}[-.]\d{2}[-.]\d{4})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            dt = pd.to_datetime(m.group(1), errors="coerce", dayfirst=(pat.startswith('(\\d{2}')))
+            if pd.notna(dt):
+                return dt.date().isoformat()
+    return None
+
+
+def _extract_pdf_text(pdf_url: str) -> str:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(pdf_url, headers=headers, timeout=45, verify=False)
+    resp.raise_for_status()
+    content = resp.content or b""
+    if len(content) < 100:
+        return ""
+    text_parts = []
+    with pdfplumber.open(BytesIO(content)) as pdf:
+        for page in pdf.pages[:6]:
+            try:
+                text_parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+    return "\n".join(text_parts).strip()
+
+
+def _extract_pdf_links_from_crib_page(driver, crib_url: str) -> list[str]:
+    driver.get(crib_url)
+    try:
+        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"})
+    except Exception:
+        pass
+
+    links = []
+    try:
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+    except Exception:
+        soup = None
+
+    if soup is not None:
+        for a in soup.find_all("a"):
+            href = (a.get("href") or "").strip()
+            txt = a.get_text(" ", strip=True).lower()
+            if not href:
+                continue
+            full = urljoin(crib_url, href)
+            low = full.lower()
+            if ".pdf" in low or "download" in low or "attachment" in low or "getfile" in low or "file" in low or "pdf" in txt:
+                links.append(full)
+
+    # Shadow DOM / custom elements fallback.
+    try:
+        hrefs = driver.execute_script(
+            """
+            const out = [];
+            function scan(root){
+              root.querySelectorAll('a[href], nef-link[href]').forEach(a => out.push(a.href || a.getAttribute('href')));
+              root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) scan(el.shadowRoot); });
+            }
+            scan(document);
+            return out;
+            """
+        ) or []
+        for href in hrefs:
+            full = urljoin(crib_url, str(href or "").strip())
+            low = full.lower()
+            if full and (".pdf" in low or "download" in low or "attachment" in low or "getfile" in low):
+                links.append(full)
+    except Exception:
+        pass
+
+    clean = []
+    seen = set()
+    for u in links:
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        clean.append(u)
+    return clean
+
+
+def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None) -> dict:
+    issuer = _text_after_label(text, [
+        r"Emitento pavadinimas", r"Emitentas", r"Issuer name", r"Name of the issuer",
+    ])
+    person = _text_after_label(text, [
+        r"Vadovo vardas ir pavardė", r"Asmens vardas ir pavardė", r"Name of the person", r"Person name",
+    ])
+    role = _text_after_label(text, [
+        r"Pareigos", r"Statusas", r"Position", r"Function", r"Role",
+    ])
+    isin = _text_after_label(text, [r"ISIN", r"Finansinės priemonės identifikavimo kodas", r"Identification code"])
+    instrument = _text_after_label(text, [
+        r"Finansinės priemonės pavadinimas", r"Priemonės pavadinimas", r"Financial instrument", r"Instrument",
+    ])
+    transaction_type = _text_after_label(text, [
+        r"Sandorio pobūdis", r"Sandorio rūšis", r"Nature of the transaction", r"Transaction type",
+    ])
+    venue = _text_after_label(text, [
+        r"Sandorio vieta", r"Prekybos vieta", r"Place of the transaction", r"Trading venue", r"Venue",
+    ])
+
+    price = _extract_number_after(text, [r"Kaina", r"Price"])
+    quantity = _extract_number_after(text, [r"Kiekis", r"Volume", r"Quantity"])
+    transaction_date = None
+    date_label_value = _text_after_label(text, [
+        r"Sandorio data", r"Transaction date", r"Date of transaction",
+    ], max_len=80)
+    if date_label_value:
+        transaction_date = _extract_date_from_text(date_label_value)
+    if not transaction_date:
+        transaction_date = _extract_date_from_text(text)
+
+    published_iso = None
+    try:
+        if published_at is not None and not pd.isna(published_at):
+            published_iso = pd.to_datetime(published_at).isoformat()
+    except Exception:
+        published_iso = None
+
+    return {
+        "published_at": published_iso,
+        "transaction_date": transaction_date,
+        "issuer": issuer,
+        "person_name": person,
+        "person_role": role,
+        "isin": isin,
+        "instrument": instrument,
+        "transaction_type": transaction_type,
+        "price": price,
+        "quantity": quantity,
+        "venue": venue,
+        "parse_status": "parsed_basic" if text else "pdf_text_empty",
+        "price_quantity_note": "",
+        "pdf_url": pdf_url,
+        "crib_url": crib_url,
+        "raw_text": text[:12000] if text else "",
+    }
+
+
+def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None) -> int:
+    """
+    Savarankiška versija be backfill_manager_transactions_from_crib.py.
+    Iš CRIB pranešimo ištraukia PDF priedus, praleidžia jau DB esančius PDF,
+    bando perskaityti PDF tekstą ir įrašo į manager_transactions.
+    """
+    if not crib_url:
+        return 0
+
+    pdf_links = _extract_pdf_links_from_crib_page(driver, crib_url)
+    if not pdf_links:
+        return 0
+
+    saved = 0
+    for pdf_url in pdf_links:
+        if _manager_pdf_already_saved(pdf_url):
+            continue
+        try:
+            text = _extract_pdf_text(pdf_url)
+            row = _parse_manager_transaction_pdf_text(text, pdf_url=pdf_url, crib_url=crib_url, published_at=published_at)
+            if _post_manager_transaction(row):
+                saved += 1
+        except Exception:
+            # Įrašome bent PDF faktą, kad tas pats PDF nebūtų bandomas be galo.
+            row = _parse_manager_transaction_pdf_text("", pdf_url=pdf_url, crib_url=crib_url, published_at=published_at)
+            row["parse_status"] = "pdf_parse_error"
+            try:
+                if _post_manager_transaction(row):
+                    saved += 1
+            except Exception:
+                pass
+    return saved
 
 
 def _is_manager_notice(row) -> bool:
@@ -112,11 +358,8 @@ def update_manager_transactions_from_recent_crib(
         "manager_messages_processed": 0,
         "manager_transactions_saved": 0,
         "manager_transactions_errors": 0,
-        "module_available": save_manager_transactions_from_crib_selenium is not None,
+        "module_available": True,
     }
-
-    if save_manager_transactions_from_crib_selenium is None:
-        return stats
 
     notices = _load_recent_manager_crib_notices(days_back=days_back)
     if notices is None or notices.empty:
@@ -631,10 +874,6 @@ def show_manager_transactions_page():
         st.markdown("</div>", unsafe_allow_html=True)
 
     if manager_update_btn:
-        if save_manager_transactions_from_crib_selenium is None:
-            st.error("Nerastas backfill_manager_transactions_from_crib.py arba jame nėra save_manager_transactions_from_crib_selenium funkcijos.")
-            st.stop()
-
         try:
             with st.spinner("Tikrinami paskutiniai CRIB vadovų sandorių pranešimai ir PDF..."):
                 stats = update_manager_transactions_from_recent_crib(
