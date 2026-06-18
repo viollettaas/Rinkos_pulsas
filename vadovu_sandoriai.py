@@ -13,6 +13,11 @@ try:
 except Exception:
     load_manager_transactions_df = None
 
+try:
+    from manager_transactions_update import update_manager_transactions_from_recent_crib
+except Exception:
+    update_manager_transactions_from_recent_crib = None
+
 
 def _load_manager_transactions_df_fallback(start_date, end_date) -> pd.DataFrame:
     """
@@ -456,7 +461,55 @@ def show_manager_transactions_page():
             key="manager_end_date",
         )
 
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-card-subtitle">Atnaujina tik vadovų sandorių PDF iš paskutinių CRIB pranešimų, kurie jau yra market_news lentelėje.</div>',
+            unsafe_allow_html=True,
+        )
+
+        manager_update_days = st.number_input(
+            "Tikrinti paskutines dienas",
+            min_value=7,
+            max_value=180,
+            value=45,
+            step=1,
+            key="manager_update_days",
+        )
+
+        manager_update_btn = st.button(
+            "🔄 Atnaujinti vadovų sandorius",
+            use_container_width=True,
+            key="manager_transactions_update_btn",
+        )
+
         st.markdown("</div>", unsafe_allow_html=True)
+
+    if manager_update_btn:
+        if update_manager_transactions_from_recent_crib is None:
+            st.error("Nerastas manager_transactions_update.py modulis arba jame nėra update_manager_transactions_from_recent_crib funkcijos.")
+            st.stop()
+
+        try:
+            with st.spinner("Tikrinami paskutiniai CRIB vadovų sandorių pranešimai ir PDF..."):
+                stats = update_manager_transactions_from_recent_crib(
+                    days_back=int(manager_update_days),
+                    max_messages=50,
+                    headless=True,
+                    progress=None,
+                )
+
+            st.success(
+                "Vadovų sandoriai atnaujinti: "
+                f"rasta CRIB pranešimų {stats.get('manager_messages_found', 0)}, "
+                f"apdorota {stats.get('manager_messages_processed', 0)}, "
+                f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
+                f"klaidų {stats.get('manager_transactions_errors', 0)}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error("Nepavyko atnaujinti vadovų sandorių.")
+            st.exception(exc)
+            st.stop()
 
     if manager_start_date > manager_end_date:
         st.error("Data „nuo“ negali būti vėlesnė už datą „iki“.")
