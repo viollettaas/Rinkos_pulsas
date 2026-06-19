@@ -21,7 +21,6 @@ _LIT_ENDINGS = [
 
 
 def inflect_pattern(stem: str) -> str:
-    """Sukuria paprastą lietuviškų galūnių regex šabloną raktažodžiui."""
     if any(ch in stem for ch in r".^$*+?{}[]\|()"):
         return stem
 
@@ -176,20 +175,18 @@ def highlight_keywords(text: str) -> str:
 
 
 def find_matched_keywords(text: str) -> str:
-    """
-    Grąžina raktažodžius / frazes, dėl kurių įrašas buvo atrinktas.
-    Naudojama interaktyvioje lentelėje.
-    """
     if not text:
         return ""
 
     found = []
 
-    for cat, pats in COMPILED.items():
+    for _, pats in COMPILED.items():
         for pat in pats:
             for m in pat.finditer(text):
                 val = norm_text(m.group(0))
-                if val and val.lower() not in [x.lower() for x in found]:
+                existing = [x.lower() for x in found]
+
+                if val and val.lower() not in existing:
                     found.append(val)
 
     return ", ".join(found[:12])
@@ -200,19 +197,6 @@ def find_matched_keywords(text: str) -> str:
 # ============================================================
 
 def load_crib_news_for_report(start_date: date, end_date: date) -> pd.DataFrame:
-    """
-    Ima CRIB naujienas iš Supabase ir konvertuoja į ataskaitai tinkamą formą.
-
-    Tikėtini stulpeliai:
-    - source
-    - company
-    - company_norm
-    - category
-    - title
-    - url
-    - published_at
-    - content
-    """
     raw = load_news_df("crib", start_date, end_date)
 
     if raw is None or raw.empty:
@@ -285,6 +269,7 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
         ).lower()
 
         cats = classify_row_text(text, allow_multiple=True)
+
         assigned.append(cats)
         matched.append(find_matched_keywords(text))
 
@@ -377,12 +362,10 @@ def build_pretty_html(
     th{background:#fbfdff;font-weight:700;color:#234}
     th.date-col, td.date-col{width:125px}
     th.title-col, td.title-col{width:40%}
-    .muted{color:var(--muted);font-size:0.88rem}
     .controls{display:flex;gap:8px;align-items:center}
     .btn{background:var(--accent);color:white;padding:8px 10px;border-radius:8px;text-decoration:none;font-weight:600;cursor:pointer;border:none}
     .small{font-size:0.84rem;color:var(--muted)}
     .toggle-btn{background:#f3f7fb;border-radius:8px;padding:6px 8px;border:1px solid #e7eef6;cursor:pointer}
-    .no-rows{color:var(--muted);padding:8px 0}
     .collapsible{overflow:hidden;transition:max-height .25s ease-out}
     strong.kw{font-weight:800;color:var(--danger)}
     .filter-controls{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -614,8 +597,6 @@ def build_pretty_html(
 
             for r in rows:
                 date_raw = r.get("date", "")
-                date_fmt = ""
-
                 dt = pd.to_datetime(date_raw, errors="coerce")
 
                 if pd.notna(dt):
@@ -677,7 +658,7 @@ def build_pretty_html(
                     f"<tr data-cats='{cats_attr}'>"
                     f"<td class='date-col'>{html_lib.escape(date_fmt)}</td>"
                     f"<td class='title-col'>{link_html}</td>"
-                    f"<td>{summary_html}</td>"
+                    f"<td>{highlight_keywords(summary_raw)}</td>"
                     f"</tr>"
                 )
 
@@ -698,9 +679,6 @@ def build_pretty_html(
 # ============================================================
 
 def prepare_streamlit_view_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Paruošia dataframe patogiam rodymui Streamlit lentelėje.
-    """
     if df is None or df.empty:
         return pd.DataFrame(columns=[
             "data",
@@ -731,8 +709,8 @@ def prepare_streamlit_view_df(df: pd.DataFrame) -> pd.DataFrame:
     out["nuoroda"] = out["url"].fillna("").astype(str)
 
     out = out.sort_values(
-        by=["date_parsed", "orig_order"],
-        ascending=[False, True],
+        by=["date_parsed", "data"],
+        ascending=[False, False],
     )
 
     return out[[
@@ -753,10 +731,6 @@ def filter_streamlit_df(
     selected_issuers: Optional[list] = None,
     selected_categories: Optional[list] = None,
 ) -> pd.DataFrame:
-    """
-    Filtruoja Streamlit lentelės dataframe pagal paieškos žodį,
-    emitentus ir kategorijas.
-    """
     if df_view is None or df_view.empty:
         return df_view
 
@@ -784,7 +758,7 @@ def filter_streamlit_df(
             "raktazodziai",
         ]
 
-        mask = False
+        mask = pd.Series(False, index=out.index)
 
         for col in searchable_cols:
             mask = mask | out[col].astype(str).str.lower().str.contains(
@@ -807,16 +781,6 @@ def generate_emitentu_ataskaita(
     end_date: date,
     title: Optional[str] = None,
 ) -> dict:
-    """
-    Sugeneruoja emitentų atrankos ataskaitą iš Supabase.
-
-    Grąžina dict:
-    - html
-    - df
-    - summary
-    - start_date
-    - end_date
-    """
     if start_date is None or end_date is None:
         raise ValueError("Reikia nurodyti start_date ir end_date.")
 
@@ -831,22 +795,9 @@ def generate_emitentu_ataskaita(
 
     html = build_pretty_html(df, title=title)
 
-    expl = defaultdict(int)
-
-    if not df.empty and "categories" in df.columns:
-        for cats in df["categories"]:
-            for c in cats:
-                expl[c] += 1
-
-    summary = pd.DataFrame(
-        sorted(expl.items(), key=lambda x: -x[1]),
-        columns=["category", "count"],
-    )
-
     return {
         "html": html,
         "df": df,
-        "summary": summary,
         "start_date": start_date,
         "end_date": end_date,
     }
@@ -857,7 +808,6 @@ def save_emitentu_ataskaita_html(
     end_date: date,
     output_path: str | Path,
 ) -> Path:
-    """Sugeneruoja ir išsaugo HTML failą lokaliai."""
     result = generate_emitentu_ataskaita(start_date, end_date)
 
     path = Path(output_path)
@@ -868,14 +818,6 @@ def save_emitentu_ataskaita_html(
 
 
 def render_emitentu_atranka_page(default_days: int = 30):
-    """
-    Pilnas Streamlit puslapio blokas.
-
-    Pvz. app.py:
-
-        from emitentu_atranka import render_emitentu_atranka_page
-        render_emitentu_atranka_page()
-    """
     import streamlit as st
     import streamlit.components.v1 as components
 
@@ -909,15 +851,16 @@ def render_emitentu_atranka_page(default_days: int = 30):
         key="crib_cls_generate",
     )
 
-   if generate_clicked:
-    st.session_state.pop("crib_cls_result", None)
+    if generate_clicked:
+        st.session_state.pop("crib_cls_result", None)
 
-    with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama ataskaita..."):
-        result = generate_emitentu_ataskaita(start, end)
+        with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama ataskaita..."):
+            result = generate_emitentu_ataskaita(start, end)
 
-    st.session_state["crib_cls_result"] = result
-    st.session_state["crib_cls_start_used"] = start
-    st.session_state["crib_cls_end_used"] = end
+        st.session_state["crib_cls_result"] = result
+        st.session_state["crib_cls_start_used"] = start
+        st.session_state["crib_cls_end_used"] = end
+
     result = st.session_state.get("crib_cls_result")
 
     if not result:
@@ -1016,7 +959,6 @@ def render_emitentu_atranka_page(default_days: int = 30):
         )
 
         df_export = prepare_streamlit_view_df(result["df"])
-
         csv_data = df_export.to_csv(index=False).encode("utf-8-sig")
 
         st.download_button(
@@ -1037,8 +979,4 @@ if __name__ == "__main__":
     out.write_text(res["html"], encoding="utf-8")
 
     print(f"Išsaugota: {out.resolve()}")
-
-    if not res["summary"].empty:
-        print(res["summary"].to_string(index=False))
-    else:
-        print("Nėra įrašų.")
+    print(f"Įrašų skaičius: {len(res['df'])}")
