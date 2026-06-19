@@ -909,10 +909,15 @@ def render_emitentu_atranka_page(default_days: int = 30):
         key="crib_cls_generate",
     )
 
-    if generate_clicked:
-        with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama ataskaita..."):
-            st.session_state["crib_cls_result"] = generate_emitentu_ataskaita(start, end)
+   if generate_clicked:
+    st.session_state.pop("crib_cls_result", None)
 
+    with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama ataskaita..."):
+        result = generate_emitentu_ataskaita(start, end)
+
+    st.session_state["crib_cls_result"] = result
+    st.session_state["crib_cls_start_used"] = start
+    st.session_state["crib_cls_end_used"] = end
     result = st.session_state.get("crib_cls_result")
 
     if not result:
