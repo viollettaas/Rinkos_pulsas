@@ -1,10 +1,9 @@
-
 import re
 import html as html_lib
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import pandas as pd
 
@@ -22,14 +21,17 @@ _LIT_ENDINGS = [
 
 
 def inflect_pattern(stem: str) -> str:
-    """Sukuria paprasta lietuvisku galuniu regex sablona raktazodziui."""
+    """Sukuria paprastą lietuviškų galūnių regex šabloną raktažodžiui."""
     if any(ch in stem for ch in r".^$*+?{}[]\|()"):
         return stem
+
     esc_stem = re.escape(stem)
     nonempty = [re.escape(e) for e in sorted(set(_LIT_ENDINGS)) if e]
-    group = "|".join(nonempty) if nonempty else ""
+    group = "|".join(nonempty)
+
     if group:
         return rf"\b{esc_stem}(?:{group})?\b"
+
     return rf"\b{esc_stem}\b"
 
 
@@ -71,8 +73,10 @@ RAW_CATEGORIES = {
 
 
 COMPILED = {}
+
 for cat, tokens in RAW_CATEGORIES.items():
     compiled_list = []
+
     for token in tokens:
         if " " in token or any(ch in token for ch in r".^$*+?{}[]\|()"):
             try:
@@ -81,15 +85,16 @@ for cat, tokens in RAW_CATEGORIES.items():
                 compiled_list.append(re.compile(re.escape(token), flags=re.I | re.U))
         else:
             compiled_list.append(re.compile(inflect_pattern(token), flags=re.I | re.U))
+
     COMPILED[cat] = compiled_list
+
 
 CATEGORY_ORDER = list(RAW_CATEGORIES.keys())
 
 
 # ============================================================
-# PAGALBINES FUNKCIJOS
+# PAGALBINĖS FUNKCIJOS
 # ============================================================
-
 
 def norm_text(s) -> str:
     if s is None:
@@ -106,64 +111,99 @@ def slugify(s) -> str:
 
 def parse_dates_safe(series: pd.Series) -> pd.Series:
     parsed = pd.to_datetime(series, format="%Y-%m-%d %H:%M:%S", errors="coerce")
+
     if parsed.isna().any():
         rem_idx = parsed[parsed.isna()].index
         if not rem_idx.empty:
             remainder = series.loc[rem_idx]
             parsed_remainder = pd.to_datetime(remainder, dayfirst=True, errors="coerce")
             parsed.loc[parsed_remainder.index] = parsed_remainder
+
     if parsed.isna().any():
         rem_idx = parsed[parsed.isna()].index
         if not rem_idx.empty:
             remainder = series.loc[rem_idx]
             parsed_remainder = pd.to_datetime(remainder, errors="coerce")
             parsed.loc[parsed_remainder.index] = parsed_remainder
+
     return parsed
 
 
 def score_categories(text: str) -> dict:
     scores = defaultdict(int)
+
     for cat, pats in COMPILED.items():
         for pat in pats:
             if pat.search(text or ""):
                 scores[cat] += 1
+
     return scores
 
 
 def classify_row_text(text: str, allow_multiple: bool = True):
     scores = score_categories(text)
+
     if not scores:
         return ["Kiti"]
+
     max_score = max(scores.values()) if scores else 0
+
     if max_score == 0:
         return ["Kiti"]
+
     winners = [cat for cat, sc in scores.items() if sc == max_score and sc > 0]
+
     return winners if allow_multiple else (winners[:1] if winners else ["Kiti"])
 
 
 def highlight_keywords(text: str) -> str:
     if not text:
         return ""
+
     escaped = html_lib.escape(str(text))
+
     for pats in COMPILED.values():
         for pat in pats:
             try:
-                escaped = pat.sub(lambda m: f"<strong class='kw'>{m.group(0)}</strong>", escaped)
+                escaped = pat.sub(
+                    lambda m: f"<strong class='kw'>{m.group(0)}</strong>",
+                    escaped,
+                )
             except re.error:
                 continue
+
     return escaped
+
+
+def find_matched_keywords(text: str) -> str:
+    """
+    Grąžina raktažodžius / frazes, dėl kurių įrašas buvo atrinktas.
+    Naudojama interaktyvioje lentelėje.
+    """
+    if not text:
+        return ""
+
+    found = []
+
+    for cat, pats in COMPILED.items():
+        for pat in pats:
+            for m in pat.finditer(text):
+                val = norm_text(m.group(0))
+                if val and val.lower() not in [x.lower() for x in found]:
+                    found.append(val)
+
+    return ", ".join(found[:12])
 
 
 # ============================================================
 # SUPABASE -> ATASKAITOS DATAFRAME
 # ============================================================
 
-
 def load_crib_news_for_report(start_date: date, end_date: date) -> pd.DataFrame:
     """
-    Ima CRIB naujienas is Supabase ir konvertuoja i ataskaitai tinkama forma.
+    Ima CRIB naujienas iš Supabase ir konvertuoja į ataskaitai tinkamą formą.
 
-    Tavo market_news lenteleje tiketini stulpeliai:
+    Tikėtini stulpeliai:
     - source
     - company
     - company_norm
@@ -182,7 +222,6 @@ def load_crib_news_for_report(start_date: date, end_date: date) -> pd.DataFrame:
 
     df = raw.copy()
 
-    # Saugus stulpeliu paemimas, kad nesugriutu, jei kazkurio truksta.
     def col(name, default=""):
         if name in df.columns:
             return df[name]
@@ -216,10 +255,11 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=[
             "date", "issuer", "type", "category_src", "title", "url", "summary",
-            "orig_order", "combined_text", "categories", "categories_str",
+            "orig_order", "combined_text", "categories", "categories_str", "matched_keywords",
         ])
 
     df = df.copy().reset_index(drop=True)
+
     df["title"] = df["title"].fillna("").astype(str)
     df["summary"] = df["summary"].fillna("").astype(str)
     df["type"] = df.get("type", "").fillna("").astype(str)
@@ -229,18 +269,31 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
     if "orig_order" not in df.columns:
         df["orig_order"] = df.index
 
-    df["combined_text"] = (df["title"] + " " + df["summary"] + " " + df["type"]).str.lower()
+    df["combined_text"] = (
+        df["title"] + " " + df["summary"] + " " + df["type"] + " " + df["issuer"]
+    ).str.lower()
 
     assigned = []
+    matched = []
+
     for _, row in df.iterrows():
-        text = (row["title"] + " " + row["summary"] + " " + row["type"]).lower()
+        text = (
+            row["title"] + " " +
+            row["summary"] + " " +
+            row["type"] + " " +
+            row["issuer"]
+        ).lower()
+
         cats = classify_row_text(text, allow_multiple=True)
         assigned.append(cats)
+        matched.append(find_matched_keywords(text))
 
     df["categories"] = assigned
     df["categories_str"] = df["categories"].apply(
         lambda x: ";".join(x) if isinstance(x, (list, tuple)) else str(x)
     )
+    df["matched_keywords"] = matched
+
     return df
 
 
@@ -248,43 +301,46 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
 # HTML GENERAVIMAS
 # ============================================================
 
-
-def build_pretty_html(df: pd.DataFrame, title: str = "Emitentų atranka pagal CRIB naujienas") -> str:
+def build_pretty_html(
+    df: pd.DataFrame,
+    title: str = "Emitentų atranka pagal CRIB naujienas",
+) -> str:
     if df is None or df.empty:
         return f"""
         <!doctype html>
-        <html><head><meta charset='utf-8'></head>
+        <html>
+        <head><meta charset='utf-8'></head>
         <body style='font-family:Arial,sans-serif;padding:24px'>
             <h2>{html_lib.escape(title)}</h2>
             <p>Nurodytame laikotarpyje CRIB naujienų duomenų bazėje nerasta.</p>
-        </body></html>
+        </body>
+        </html>
         """
 
-    expl = defaultdict(int)
-    for cats in df.get("categories", []):
-        if not cats:
-            expl["Kiti"] += 1
-        else:
-            for c in cats:
-                expl[c] += 1
-    summary_df = pd.DataFrame(sorted(expl.items(), key=lambda x: -x[1]), columns=["category", "count"])
+    cats_from_src = sorted({
+        c.strip()
+        for c in df["category_src"].unique()
+        if c and str(c).strip()
+    })
 
-    cats_from_src = sorted({c.strip() for c in df["category_src"].unique() if c and str(c).strip()})
     cats_assigned = set()
+
     for row in df.get("categories", []):
         if isinstance(row, (list, tuple)):
             for c in row:
                 cats_assigned.add(str(c))
         elif row:
             cats_assigned.add(str(row))
+
     cats_assigned = sorted(cats_assigned)
     all_categories = sorted(set(cats_from_src + cats_assigned))
+
     if not all_categories:
         all_categories = CATEGORY_ORDER.copy()
 
-    # Naujausi emitentai pagal pirma naujiena virsuje.
     df_tmp = df.copy()
     df_tmp["date_parsed"] = parse_dates_safe(df_tmp["date"])
+
     issuer_order = (
         df_tmp.sort_values("date_parsed", ascending=False)["issuer"]
         .drop_duplicates()
@@ -336,17 +392,28 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Emitentų atranka pagal CR
     """
 
     js = """
-    function scrollToId(id){document.querySelector('#'+id).scrollIntoView({behavior:'smooth',block:'start'});}
+    function scrollToId(id){
+      document.querySelector('#'+id).scrollIntoView({behavior:'smooth',block:'start'});
+    }
+
     function expandAll(){
-      document.querySelectorAll('.collapsible').forEach(div=>{ div.style.maxHeight = div.scrollHeight + 'px'; });
+      document.querySelectorAll('.collapsible').forEach(div=>{
+        div.style.maxHeight = div.scrollHeight + 'px';
+      });
       document.querySelectorAll('[data-toggle]').forEach(btn => btn.innerText = 'Slėpti');
-      let g = document.getElementById('global_toggle'); if(g) g.innerText = 'Slėpti visus';
+      let g = document.getElementById('global_toggle');
+      if(g) g.innerText = 'Slėpti visus';
     }
+
     function collapseAll(){
-      document.querySelectorAll('.collapsible').forEach(div=>{ div.style.maxHeight = '0px'; });
+      document.querySelectorAll('.collapsible').forEach(div=>{
+        div.style.maxHeight = '0px';
+      });
       document.querySelectorAll('[data-toggle]').forEach(btn => btn.innerText = 'Rodyti');
-      let g = document.getElementById('global_toggle'); if(g) g.innerText = 'Rodyti visus';
+      let g = document.getElementById('global_toggle');
+      if(g) g.innerText = 'Rodyti visus';
     }
+
     function toggleAll(){
       let anyClosed = false;
       document.querySelectorAll('.collapsible').forEach(div=>{
@@ -354,56 +421,80 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Emitentų atranka pagal CR
       });
       if(anyClosed) expandAll(); else collapseAll();
     }
+
     document.addEventListener('click', function(e){
       if(e.target.matches('[data-toggle]') || e.target.closest('[data-toggle]')){
         let btn = e.target.closest('[data-toggle]');
         let target = document.querySelector(btn.dataset.toggle);
         if(!target) return;
+
         if(target.style.maxHeight && target.style.maxHeight !== '0px'){
-          target.style.maxHeight = '0px'; btn.innerText = 'Rodyti';
+          target.style.maxHeight = '0px';
+          btn.innerText = 'Rodyti';
         } else {
-          target.style.maxHeight = target.scrollHeight + 'px'; btn.innerText = 'Slėpti';
+          target.style.maxHeight = target.scrollHeight + 'px';
+          btn.innerText = 'Slėpti';
         }
       }
     });
+
     function tocFilter(){
       let q = document.getElementById('toc_search').value.trim().toLowerCase();
+
       document.querySelectorAll('.toc li').forEach(li=>{
         let txt = li.dataset.issuer || '';
         li.style.display = txt.indexOf(q) !== -1 ? '' : 'none';
       });
     }
+
     function getSelectedCategories(){
-      return Array.from(document.querySelectorAll('.cat-filter input[type="checkbox"]:checked')).map(n=>n.value);
+      return Array.from(
+        document.querySelectorAll('.cat-filter input[type="checkbox"]:checked')
+      ).map(n=>n.value);
     }
+
     function filterByCategories(){
       const selected = getSelectedCategories();
       const rows = document.querySelectorAll('tr[data-cats]');
+
       rows.forEach(row=>{
-        const cats = (row.dataset.cats || '').toLowerCase().split(';').map(x=>x.trim()).filter(Boolean);
+        const cats = (row.dataset.cats || '')
+          .toLowerCase()
+          .split(';')
+          .map(x=>x.trim())
+          .filter(Boolean);
+
         const keep = cats.some(c => selected.includes(c));
         row.style.display = keep ? '' : 'none';
       });
+
       document.querySelectorAll('.issuer-card').forEach(card=>{
         const trs = Array.from(card.querySelectorAll('tr[data-cats]'));
         const anyVisible = trs.length ? trs.some(tr => tr.style.display !== 'none') : false;
         card.style.display = anyVisible ? '' : 'none';
       });
     }
+
     function toggleSelectAllCats(){
       const inputs = Array.from(document.querySelectorAll('.cat-filter input[type="checkbox"]'));
       const anyUnchecked = inputs.some(i=>!i.checked);
-      inputs.forEach(i=> i.checked = anyUnchecked );
+      inputs.forEach(i=> i.checked = anyUnchecked);
       filterByCategories();
+
       const btn = document.getElementById('cat_select_all_btn');
       if(btn) btn.innerText = anyUnchecked ? 'Atžymėti viską' : 'Pažymėti viską';
     }
+
     document.addEventListener('DOMContentLoaded', function(){
       document.querySelectorAll('.collapsible').forEach(div => div.style.maxHeight = '0px');
-      let g = document.getElementById('global_toggle'); if(g) g.innerText = 'Rodyti visus';
+
+      let g = document.getElementById('global_toggle');
+      if(g) g.innerText = 'Rodyti visus';
+
       document.querySelectorAll('.cat-filter input[type="checkbox"]').forEach(cb=>{
         cb.addEventListener('change', filterByCategories);
       });
+
       filterByCategories();
     });
     """
@@ -413,6 +504,7 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Emitentų atranka pagal CR
     parts.append("<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>")
     parts.append(f"<title>{html_lib.escape(title)}</title><style>{css}</style></head><body>")
     parts.append("<div class='container'>")
+
     parts.append("<header>")
     parts.append("<div style='display:flex;flex-direction:column'>")
     parts.append(f"<h1>{html_lib.escape(title)}</h1>")
@@ -430,112 +522,166 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Emitentų atranka pagal CR
     parts.append("<div class='small'>Pasirinkite kategorijas — rodys tik pažymėtas.</div>")
     parts.append("<div class='filter-controls'><button id='cat_select_all_btn' class='toggle-btn' onclick='toggleSelectAllCats()'>Atžymėti viską</button></div>")
     parts.append("<div style='max-height:220px;overflow:auto;margin-top:8px' class='cat-filter'>")
+
     for cat in all_categories:
         v = html_lib.escape(cat)
         v_lower = html_lib.escape(cat.lower())
-        parts.append(f"<div class='cat-checkbox'><label><input type='checkbox' value='{v_lower}' checked/> <span style='margin-left:6px'>{v}</span></label></div>")
+        parts.append(
+            f"<div class='cat-checkbox'>"
+            f"<label><input type='checkbox' value='{v_lower}' checked/> "
+            f"<span style='margin-left:6px'>{v}</span></label></div>"
+        )
+
     parts.append("</div></div>")
 
     parts.append("<ul style='margin-top:10px'>")
+
     for issuer in issuer_order:
         safe = slugify(issuer)
         cnt = int((df["issuer"] == issuer).sum())
+
         parts.append(
             f"<li data-issuer='{html_lib.escape(issuer.lower())}'>"
             f"<a href='javascript:void(0)' onclick=\"scrollToId('{safe}')\">"
             f"{html_lib.escape(issuer)} <span class='badge'>{cnt}</span></a></li>"
         )
+
     parts.append("</ul></aside>")
 
     parts.append("<main class='content'>")
-    summary_txt = ", ".join([f"{r['category']}:{r['count']}" for _, r in summary_df.iterrows()])
     parts.append(
-        f"<div class='summary-card'><strong>Santrauka:</strong> &nbsp; "
-        f"Visų įrašų skaičius: <strong>{len(df)}</strong> &nbsp; • &nbsp; "
-        f"Kategorijų pasiskirstymas: {html_lib.escape(summary_txt)}</div>"
+        f"<div class='summary-card'><strong>Įrašų skaičius:</strong> "
+        f"<strong>{len(df)}</strong></div>"
     )
 
     for issuer in issuer_order:
         issuer_rows = df[df["issuer"] == issuer].copy()
         issuer_rows["date_parsed"] = parse_dates_safe(issuer_rows["date"])
-        issuer_rows = issuer_rows.sort_values(by=["date_parsed", "orig_order"], ascending=[False, True])
+        issuer_rows = issuer_rows.sort_values(
+            by=["date_parsed", "orig_order"],
+            ascending=[False, True],
+        )
 
         safe = slugify(issuer)
+
         parts.append(f"<section id='{safe}' class='issuer-card'>")
         parts.append("<div class='issuer-header'>")
         parts.append(
             f"<div><div class='issuer-title'>{html_lib.escape(issuer)}</div>"
             f"<div class='small'>{len(issuer_rows)} įrašai</div></div>"
         )
-        parts.append(f"<div class='controls'><button class='toggle-btn' data-toggle='#ct_{safe}'>Rodyti</button></div>")
+        parts.append(
+            f"<div class='controls'>"
+            f"<button class='toggle-btn' data-toggle='#ct_{safe}'>Rodyti</button>"
+            f"</div>"
+        )
         parts.append("</div>")
         parts.append(f"<div id='ct_{safe}' class='collapsible'>")
 
         cat_map = defaultdict(list)
+
         for _, r in issuer_rows.iterrows():
             cats = r.get("categories") or ["Kiti"]
+
             for c in cats:
                 cat_map[c].append(r)
 
-        display_order = CATEGORY_ORDER + [c for c in sorted(cat_map.keys()) if c not in CATEGORY_ORDER]
+        display_order = CATEGORY_ORDER + [
+            c for c in sorted(cat_map.keys())
+            if c not in CATEGORY_ORDER
+        ]
 
         for cat in display_order:
             rows = cat_map.get(cat, [])
-            parts.append(f"<div class='cat-block'><div class='cat-title'>{html_lib.escape(cat)} <span class='small'>({len(rows)})</span></div>")
+
             if not rows:
-                parts.append("<div class='no-rows'>Nėra įrašų.</div>")
-            else:
-                parts.append("<table><thead><tr><th class='date-col'>Data</th><th class='title-col'>Antraštė / nuoroda</th><th>Santrauka</th></tr></thead><tbody>")
-                for r in rows:
-                    date_raw = r.get("date", "")
-                    date_fmt = ""
-                    dt = pd.to_datetime(date_raw, errors="coerce")
-                    if pd.notna(dt):
-                        date_fmt = dt.strftime("%Y-%m-%d %H:%M")
-                    else:
-                        date_fmt = str(date_raw)
+                continue
 
-                    title_raw = r.get("title", "")
-                    url = r.get("url", "")
-                    summary_raw = r.get("summary", "")
+            parts.append(
+                f"<div class='cat-block'>"
+                f"<div class='cat-title'>{html_lib.escape(cat)} "
+                f"<span class='small'>({len(rows)})</span></div>"
+            )
 
-                    category_from_html = (r.get("category_src") or "").strip()
-                    cats_assigned = r.get("categories") or []
-                    if isinstance(cats_assigned, str):
-                        cats_assigned = [cats_assigned]
-                    assigned_display = ", ".join(cats_assigned) if cats_assigned else ""
-                    cat_display = category_from_html if category_from_html else assigned_display
-                    if not cat_display:
-                        cat_display = "Kiti"
+            parts.append(
+                "<table>"
+                "<thead><tr>"
+                "<th class='date-col'>Data</th>"
+                "<th class='title-col'>Antraštė / nuoroda</th>"
+                "<th>Santrauka</th>"
+                "</tr></thead><tbody>"
+            )
 
-                    cats_for_attr = set()
-                    if category_from_html:
-                        cats_for_attr.add(category_from_html.strip().lower())
-                    for cc in cats_assigned:
-                        cats_for_attr.add(str(cc).strip().lower())
-                    if not cats_for_attr:
-                        cats_for_attr.add("kiti")
-                    cats_attr = ";".join(sorted([html_lib.escape(c) for c in cats_for_attr]))
+            for r in rows:
+                date_raw = r.get("date", "")
+                date_fmt = ""
 
-                    title_html = highlight_keywords(title_raw)
-                    summary_html = highlight_keywords(summary_raw)
+                dt = pd.to_datetime(date_raw, errors="coerce")
 
-                    if url:
-                        url_escaped = html_lib.escape(str(url))
-                        link_html = f"<a href='{url_escaped}' target='_blank' rel='noreferrer'>{title_html or url_escaped}</a>"
-                    else:
-                        link_html = title_html or ""
+                if pd.notna(dt):
+                    date_fmt = dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    date_fmt = str(date_raw)
 
-                    link_html = f"{link_html}<div class='small' style='margin-top:6px'>{html_lib.escape(cat_display)}</div>"
+                title_raw = r.get("title", "")
+                url = r.get("url", "")
+                summary_raw = r.get("summary", "")
 
-                    parts.append(
-                        f"<tr data-cats='{cats_attr}'>"
-                        f"<td class='date-col'>{html_lib.escape(date_fmt)}</td>"
-                        f"<td class='title-col'>{link_html}</td>"
-                        f"<td>{summary_html}</td>"
-                        f"</tr>"
+                category_from_html = (r.get("category_src") or "").strip()
+                cats_assigned = r.get("categories") or []
+
+                if isinstance(cats_assigned, str):
+                    cats_assigned = [cats_assigned]
+
+                assigned_display = ", ".join(cats_assigned) if cats_assigned else ""
+                cat_display = category_from_html if category_from_html else assigned_display
+
+                if not cat_display:
+                    cat_display = "Kiti"
+
+                cats_for_attr = set()
+
+                if category_from_html:
+                    cats_for_attr.add(category_from_html.strip().lower())
+
+                for cc in cats_assigned:
+                    cats_for_attr.add(str(cc).strip().lower())
+
+                if not cats_for_attr:
+                    cats_for_attr.add("kiti")
+
+                cats_attr = ";".join(sorted([
+                    html_lib.escape(c)
+                    for c in cats_for_attr
+                ]))
+
+                title_html = highlight_keywords(title_raw)
+                summary_html = highlight_keywords(summary_raw)
+
+                if url:
+                    url_escaped = html_lib.escape(str(url))
+                    link_html = (
+                        f"<a href='{url_escaped}' target='_blank' rel='noreferrer'>"
+                        f"{title_html or url_escaped}</a>"
                     )
-                parts.append("</tbody></table>")
+                else:
+                    link_html = title_html or ""
+
+                link_html = (
+                    f"{link_html}"
+                    f"<div class='small' style='margin-top:6px'>"
+                    f"{html_lib.escape(cat_display)}</div>"
+                )
+
+                parts.append(
+                    f"<tr data-cats='{cats_attr}'>"
+                    f"<td class='date-col'>{html_lib.escape(date_fmt)}</td>"
+                    f"<td class='title-col'>{link_html}</td>"
+                    f"<td>{summary_html}</td>"
+                    f"</tr>"
+                )
+
+            parts.append("</tbody></table>")
             parts.append("</div>")
 
         parts.append("</div>")
@@ -543,19 +689,128 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Emitentų atranka pagal CR
 
     parts.append("</main></div></div>")
     parts.append(f"<script>{js}</script></body></html>")
+
     return "\n".join(parts)
 
 
 # ============================================================
-# VIESOS FUNKCIJOS STREAMLIT INTEGRACIJAI
+# STREAMLIT LENTELĖS PARUOŠIMAS
 # ============================================================
 
-
-def generate_emitentu_ataskaita(start_date: date, end_date: date, title: Optional[str] = None) -> dict:
+def prepare_streamlit_view_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Sugeneruoja emitentų atrankos ataskaita is Supabase.
+    Paruošia dataframe patogiam rodymui Streamlit lentelėje.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[
+            "data",
+            "emitentas",
+            "kategorijos",
+            "tipas",
+            "antraste",
+            "santrauka",
+            "raktazodziai",
+            "nuoroda",
+        ])
 
-    Grazina dict:
+    out = df.copy()
+
+    out["date_parsed"] = parse_dates_safe(out["date"])
+    out["data"] = out["date_parsed"].dt.strftime("%Y-%m-%d %H:%M")
+    out["data"] = out["data"].fillna(out["date"].astype(str))
+
+    out["kategorijos"] = out["categories"].apply(
+        lambda x: ", ".join(x) if isinstance(x, list) else str(x)
+    )
+
+    out["emitentas"] = out["issuer"].fillna("Unknown").astype(str)
+    out["tipas"] = out["type"].fillna("").astype(str)
+    out["antraste"] = out["title"].fillna("").astype(str)
+    out["santrauka"] = out["summary"].fillna("").astype(str)
+    out["raktazodziai"] = out["matched_keywords"].fillna("").astype(str)
+    out["nuoroda"] = out["url"].fillna("").astype(str)
+
+    out = out.sort_values(
+        by=["date_parsed", "orig_order"],
+        ascending=[False, True],
+    )
+
+    return out[[
+        "data",
+        "emitentas",
+        "kategorijos",
+        "tipas",
+        "antraste",
+        "santrauka",
+        "raktazodziai",
+        "nuoroda",
+    ]]
+
+
+def filter_streamlit_df(
+    df_view: pd.DataFrame,
+    search: str = "",
+    selected_issuers: Optional[list] = None,
+    selected_categories: Optional[list] = None,
+) -> pd.DataFrame:
+    """
+    Filtruoja Streamlit lentelės dataframe pagal paieškos žodį,
+    emitentus ir kategorijas.
+    """
+    if df_view is None or df_view.empty:
+        return df_view
+
+    out = df_view.copy()
+
+    if selected_issuers:
+        out = out[out["emitentas"].isin(selected_issuers)]
+
+    if selected_categories:
+        mask_cat = out["kategorijos"].astype(str).apply(
+            lambda val: any(cat in val for cat in selected_categories)
+        )
+        out = out[mask_cat]
+
+    if search and search.strip():
+        q = search.strip().lower()
+
+        searchable_cols = [
+            "data",
+            "emitentas",
+            "kategorijos",
+            "tipas",
+            "antraste",
+            "santrauka",
+            "raktazodziai",
+        ]
+
+        mask = False
+
+        for col in searchable_cols:
+            mask = mask | out[col].astype(str).str.lower().str.contains(
+                q,
+                na=False,
+                regex=False,
+            )
+
+        out = out[mask]
+
+    return out
+
+
+# ============================================================
+# VIEŠOS FUNKCIJOS STREAMLIT INTEGRACIJAI
+# ============================================================
+
+def generate_emitentu_ataskaita(
+    start_date: date,
+    end_date: date,
+    title: Optional[str] = None,
+) -> dict:
+    """
+    Sugeneruoja emitentų atrankos ataskaitą iš Supabase.
+
+    Grąžina dict:
     - html
     - df
     - summary
@@ -564,6 +819,7 @@ def generate_emitentu_ataskaita(start_date: date, end_date: date, title: Optiona
     """
     if start_date is None or end_date is None:
         raise ValueError("Reikia nurodyti start_date ir end_date.")
+
     if start_date > end_date:
         raise ValueError("Data 'Nuo' negali būti vėlesnė už datą 'Iki'.")
 
@@ -576,11 +832,16 @@ def generate_emitentu_ataskaita(start_date: date, end_date: date, title: Optiona
     html = build_pretty_html(df, title=title)
 
     expl = defaultdict(int)
+
     if not df.empty and "categories" in df.columns:
         for cats in df["categories"]:
             for c in cats:
                 expl[c] += 1
-    summary = pd.DataFrame(sorted(expl.items(), key=lambda x: -x[1]), columns=["category", "count"])
+
+    summary = pd.DataFrame(
+        sorted(expl.items(), key=lambda x: -x[1]),
+        columns=["category", "count"],
+    )
 
     return {
         "html": html,
@@ -591,20 +852,27 @@ def generate_emitentu_ataskaita(start_date: date, end_date: date, title: Optiona
     }
 
 
-def save_emitentu_ataskaita_html(start_date: date, end_date: date, output_path: str | Path) -> Path:
-    """Sugeneruoja ir issaugo HTML faila lokaliai."""
+def save_emitentu_ataskaita_html(
+    start_date: date,
+    end_date: date,
+    output_path: str | Path,
+) -> Path:
+    """Sugeneruoja ir išsaugo HTML failą lokaliai."""
     result = generate_emitentu_ataskaita(start_date, end_date)
+
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(result["html"], encoding="utf-8")
+
     return path
 
 
 def render_emitentu_atranka_page(default_days: int = 30):
     """
-    Pilnas Streamlit puslapio blokas. Galima kviesti is app.py.
+    Pilnas Streamlit puslapio blokas.
 
     Pvz. app.py:
+
         from emitentu_atranka import render_emitentu_atranka_page
         render_emitentu_atranka_page()
     """
@@ -615,24 +883,125 @@ def render_emitentu_atranka_page(default_days: int = 30):
     st.caption("Duomenys imami iš Supabase market_news lentelės, source='crib'.")
 
     today = date.today()
+
     col1, col2 = st.columns(2)
+
     with col1:
-        start = st.date_input("Nuo", today - timedelta(days=default_days), key="crib_cls_start")
+        start = st.date_input(
+            "Nuo",
+            today - timedelta(days=default_days),
+            key="crib_cls_start",
+        )
+
     with col2:
-        end = st.date_input("Iki", today, key="crib_cls_end")
+        end = st.date_input(
+            "Iki",
+            today,
+            key="crib_cls_end",
+        )
 
     if start > end:
         st.error("Data 'Nuo' negali būti vėlesnė už datą 'Iki'.")
         return
 
-    if st.button("Generuoti klasifikavimo ataskaitą", key="crib_cls_generate"):
+    generate_clicked = st.button(
+        "Generuoti klasifikavimo ataskaitą",
+        key="crib_cls_generate",
+    )
+
+    if generate_clicked:
         with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama ataskaita..."):
-            result = generate_emitentu_ataskaita(start, end)
+            st.session_state["crib_cls_result"] = generate_emitentu_ataskaita(start, end)
 
-        st.success(f"Rasta įrašų: {len(result['df'])}")
+    result = st.session_state.get("crib_cls_result")
 
-        if not result["summary"].empty:
-            st.dataframe(result["summary"], use_container_width=True, hide_index=True)
+    if not result:
+        st.info("Pasirinkite laikotarpį ir spauskite „Generuoti klasifikavimo ataskaitą“.")
+        return
+
+    st.success(f"Rasta įrašų: {len(result['df'])}")
+
+    tab_table, tab_html, tab_export = st.tabs([
+        "📋 Interaktyvi lentelė",
+        "🌐 HTML peržiūra",
+        "⬇️ Atsisiuntimas",
+    ])
+
+    with tab_table:
+        df_view = prepare_streamlit_view_df(result["df"])
+
+        if df_view.empty:
+            st.info("Pasirinktu laikotarpiu įrašų nerasta.")
+        else:
+            st.markdown("#### Paieška ir filtrai")
+
+            search = st.text_input(
+                "Paieškos žodis",
+                placeholder="Pvz. teism, dividendai, vadovas, nuostoliai, obligacijos...",
+                key="crib_cls_search",
+            )
+
+            filter_col1, filter_col2 = st.columns(2)
+
+            with filter_col1:
+                issuers = sorted(df_view["emitentas"].dropna().unique().tolist())
+
+                selected_issuers = st.multiselect(
+                    "Emitentai",
+                    options=issuers,
+                    default=[],
+                    key="crib_cls_issuers_filter",
+                )
+
+            with filter_col2:
+                all_categories = sorted({
+                    cat.strip()
+                    for value in df_view["kategorijos"].dropna().astype(str)
+                    for cat in value.split(",")
+                    if cat.strip()
+                })
+
+                selected_categories = st.multiselect(
+                    "Kategorijos",
+                    options=all_categories,
+                    default=[],
+                    key="crib_cls_categories_filter",
+                )
+
+            filtered = filter_streamlit_df(
+                df_view=df_view,
+                search=search,
+                selected_issuers=selected_issuers,
+                selected_categories=selected_categories,
+            )
+
+            st.caption(f"Rodoma įrašų: {len(filtered)} iš {len(df_view)}")
+
+            st.dataframe(
+                filtered,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "data": st.column_config.TextColumn("Data", width="small"),
+                    "emitentas": st.column_config.TextColumn("Emitentas", width="medium"),
+                    "kategorijos": st.column_config.TextColumn("Kategorijos", width="medium"),
+                    "tipas": st.column_config.TextColumn("Tipas", width="medium"),
+                    "antraste": st.column_config.TextColumn("Antraštė", width="large"),
+                    "santrauka": st.column_config.TextColumn("Santrauka", width="large"),
+                    "raktazodziai": st.column_config.TextColumn("Raktažodžiai", width="medium"),
+                    "nuoroda": st.column_config.LinkColumn("Nuoroda"),
+                },
+            )
+
+    with tab_html:
+        components.html(
+            result["html"],
+            height=900,
+            scrolling=True,
+        )
+
+    with tab_export:
+        st.markdown("#### Atsisiuntimai")
 
         st.download_button(
             "Atsisiųsti HTML ataskaitą",
@@ -641,14 +1010,30 @@ def render_emitentu_atranka_page(default_days: int = 30):
             mime="text/html",
         )
 
-        components.html(result["html"], height=900, scrolling=True)
+        df_export = prepare_streamlit_view_df(result["df"])
+
+        csv_data = df_export.to_csv(index=False).encode("utf-8-sig")
+
+        st.download_button(
+            "Atsisiųsti lentelę CSV formatu",
+            data=csv_data,
+            file_name=f"crib_klasifikacija_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
 
 
 if __name__ == "__main__":
-    # Lokalus testas:
-    # python emitentu_atranka.py
-    res = generate_emitentu_ataskaita(date.today() - timedelta(days=30), date.today())
+    res = generate_emitentu_ataskaita(
+        date.today() - timedelta(days=30),
+        date.today(),
+    )
+
     out = Path(f"crib_klasifikacija_{date.today().strftime('%Y%m%d')}.html")
     out.write_text(res["html"], encoding="utf-8")
+
     print(f"Išsaugota: {out.resolve()}")
-    print(res["summary"].to_string(index=False) if not res["summary"].empty else "Nėra įrašų.")
+
+    if not res["summary"].empty:
+        print(res["summary"].to_string(index=False))
+    else:
+        print("Nėra įrašų.")
