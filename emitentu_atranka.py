@@ -286,57 +286,80 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
 # HTML GENERAVIMAS
 # ============================================================
 
+
 def build_pretty_html(
     df: pd.DataFrame,
     title: str = "Emitentų atranka pagal CRIB naujienas",
 ) -> str:
-    """Moderni HTML ataskaita su paieska, filtrais, kortelemis ir lentele.
-
-    Viskas veikia viename HTML faile: nereikia Streamlit interaktyvios lenteles.
-    Paieska atlieka paprasta lietuvisku galuniu tolerancija ir paryskina rastus zodzius.
-    """
+    """Moderni pilno plocio HTML ataskaita be vidiniu nepatogiu slankikliu."""
     if df is None or df.empty:
         return f"""
         <!doctype html>
         <html>
         <head><meta charset='utf-8'></head>
-        <body style='font-family:Inter,Segoe UI,Arial,sans-serif;padding:24px;background:#f6f8fb;color:#111827'>
+        <body style='font-family:Arial,sans-serif;padding:24px;background:#f6f8fb;color:#111827'>
             <h2>{html_lib.escape(title)}</h2>
             <p>Nurodytame laikotarpyje CRIB naujienų duomenų bazėje nerasta.</p>
         </body>
         </html>
         """
 
-    df_tmp = df.copy()
-    df_tmp["date_parsed"] = parse_dates_safe(df_tmp["date"])
-    df_tmp = df_tmp.sort_values(["date_parsed", "orig_order"], ascending=[False, True]).reset_index(drop=True)
+    import json
 
-    def row_categories(row):
-        vals = []
+    df_tmp = df.copy().reset_index(drop=True)
+    if "date_parsed" not in df_tmp.columns:
+        df_tmp["date_parsed"] = parse_dates_safe(df_tmp["date"])
+
+    df_tmp["issuer"] = df_tmp["issuer"].fillna("Unknown").astype(str).replace({"": "Unknown"})
+    df_tmp["title"] = df_tmp["title"].fillna("").astype(str)
+    df_tmp["summary"] = df_tmp["summary"].fillna("").astype(str)
+    df_tmp["type"] = df_tmp.get("type", "").fillna("").astype(str)
+    df_tmp["matched_keywords"] = df_tmp.get("matched_keywords", "").fillna("").astype(str)
+
+    df_tmp = df_tmp.sort_values(
+        by=["date_parsed", "orig_order"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    def row_categories(row) -> list[str]:
+        cats = []
+        raw = row.get("categories", [])
+        if isinstance(raw, (list, tuple, set)):
+            cats.extend([str(x).strip() for x in raw if str(x).strip()])
+        elif raw:
+            cats.extend([x.strip() for x in str(raw).replace(";", ",").split(",") if x.strip()])
         src = str(row.get("category_src", "") or "").strip()
         if src:
-            vals.append(src)
-        cats = row.get("categories") or []
-        if isinstance(cats, str):
-            cats = [cats]
-        for c in cats:
-            c = str(c or "").strip()
-            if c and c not in vals:
-                vals.append(c)
-        return vals or ["Kiti"]
+            cats.append(src)
+        out = []
+        seen = set()
+        for c in cats or ["Kiti"]:
+            if c.lower() not in seen:
+                seen.add(c.lower())
+                out.append(c)
+        return out or ["Kiti"]
 
-    all_categories = sorted({c for _, r in df_tmp.iterrows() for c in row_categories(r)}) or CATEGORY_ORDER.copy()
-    issuers = df_tmp["issuer"].fillna("Unknown").astype(str).tolist()
-    issuer_order = df_tmp["issuer"].fillna("Unknown").astype(str).drop_duplicates().tolist()
+    issuers = sorted(df_tmp["issuer"].dropna().astype(str).unique().tolist())
+    all_categories = []
+    seen_categories = set()
+    for _, r in df_tmp.iterrows():
+        for cat in row_categories(r):
+            key = cat.lower()
+            if key not in seen_categories:
+                seen_categories.add(key)
+                all_categories.append(cat)
+    all_categories = sorted(all_categories, key=lambda x: x.lower())
 
-    # JSON duomenys JS filtrams. Tekstai HTML'e jau saugiai escapinami atskirai.
-    import json
     rows_json = []
     for i, r in df_tmp.iterrows():
         cats = row_categories(r)
         combined = " ".join([
-            str(r.get("issuer", "")), str(r.get("title", "")), str(r.get("summary", "")),
-            str(r.get("type", "")), str(r.get("matched_keywords", "")), " ".join(cats)
+            str(r.get("issuer", "")),
+            str(r.get("title", "")),
+            str(r.get("summary", "")),
+            str(r.get("type", "")),
+            str(r.get("matched_keywords", "")),
+            " ".join(cats),
         ])
         rows_json.append({
             "id": f"row_{i}",
@@ -351,62 +374,40 @@ def build_pretty_html(
     :root{
       --bg:#f5f7fb;--panel:#ffffff;--text:#111827;--muted:#64748b;--line:#e5edf6;
       --blue:#075985;--blue2:#0f75bc;--soft:#eef7ff;--red:#c1121f;--amber:#fff7ed;
-      --shadow:0 14px 35px rgba(15,23,42,.08);--radius:18px;
+      --green:#047857;--shadow:0 14px 35px rgba(15,23,42,.08);--radius:18px;
     }
     *{box-sizing:border-box}
-    html,body{margin:0;min-height:100%;font-family:Inter,Segoe UI,Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
+    html,body{margin:0;min-height:100%;font-family:Inter,Segoe UI,Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden}
     a{color:#075985;text-decoration:none} a:hover{text-decoration:underline}
-    .app{width:100%;max-width:none;margin:0;padding:18px}
-    .hero{background:linear-gradient(135deg,#ffffff 0%,#eff8ff 56%,#dceeff 100%);border:1px solid #d7e8f7;border-radius:22px;padding:18px 20px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:14px}
-    .hero h1{margin:0;color:#06243d;font-size:26px;line-height:1.15}.hero .meta{margin-top:8px;color:var(--muted);font-size:13px}.stats{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}.stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:10px 14px;min-width:110px}.stat b{font-size:22px;color:#06243d}.stat span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
-    .toolbar{position:sticky;top:0;z-index:20;background:rgba(245,247,251,.94);backdrop-filter:blur(10px);border:1px solid var(--line);border-radius:18px;box-shadow:0 10px 28px rgba(15,23,42,.07);padding:12px;margin-bottom:14px}
-    .toolbar-grid{display:grid;grid-template-columns:minmax(260px,1.4fr) minmax(200px,.7fr) minmax(190px,.7fr) auto;gap:10px;align-items:end}.field label{display:block;font-size:12px;color:#475569;font-weight:800;margin:0 0 5px 2px}.field input,.field select{width:100%;height:42px;border:1px solid #cfddeb;background:#fff;border-radius:12px;padding:0 12px;color:#0f172a;font-size:14px}.buttons{display:flex;gap:8px;flex-wrap:wrap}.btn{height:42px;border:0;border-radius:12px;background:#075985;color:#fff;font-weight:900;padding:0 13px;cursor:pointer}.btn.secondary{background:#eaf2f8;color:#06324d;border:1px solid #cde0ef}.btn.warn{background:#fff7ed;color:#9a3412;border:1px solid #fed7aa}.hint{color:var(--muted);font-size:12px;margin-top:8px;line-height:1.35}.chipbar{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.chip{border:1px solid #cfe0ef;background:#fff;border-radius:999px;padding:6px 9px;font-size:12px;color:#164e63;cursor:pointer}.chip.active{background:#075985;color:#fff;border-color:#075985}
-    .layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:14px}.side{position:sticky;top:118px;align-self:start;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:13px;max-height:calc(100vh - 135px);overflow:auto}.side h3{margin:0 0 10px;color:#0f2f45;font-size:15px}.issuer-link{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 9px;border-radius:12px;color:#0f3f5b;font-size:13px}.issuer-link:hover{background:#eef7ff;text-decoration:none}.count{background:#e2edf7;color:#075985;border-radius:999px;padding:2px 7px;font-size:11px;font-weight:900}.content{min-width:0}.section-title{font-size:13px;color:#64748b;text-transform:uppercase;letter-spacing:.04em;font-weight:900;margin:4px 0 10px}.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:13px}.card{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:14px;display:flex;flex-direction:column;gap:10px}.card-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.issuer{font-weight:950;color:#06243d;font-size:16px}.date{white-space:nowrap;color:#64748b;font-size:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:999px;padding:5px 8px}.badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.badge{background:#eef7ff;color:#075985;border:1px solid #cde5f8;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:800}.badge.type{background:#f8fafc;color:#475569;border-color:#e2e8f0}.title{font-size:15px;font-weight:900;line-height:1.35}.summary{font-size:14px;line-height:1.55;color:#1f2937;white-space:pre-wrap}.keywords{font-size:12px;line-height:1.45;color:#475569;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:8px}.source{margin-top:auto;font-size:12px}.kw,.hit{color:var(--red);font-weight:950;background:#ffe4e6;border-radius:4px;padding:0 2px}.table-wrap{display:none;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:auto}.table-view{width:100%;border-collapse:collapse;table-layout:auto}.table-view th{position:sticky;top:0;background:#06243d;color:#fff;text-align:left;padding:10px;font-size:12px;z-index:3}.table-view td{border-bottom:1px solid #eef2f7;padding:10px;vertical-align:top;font-size:13px;line-height:1.45}.table-view .summary-cell{min-width:420px}.hidden{display:none!important}.no-results{display:none;background:#fff;border:1px dashed #cbd5e1;border-radius:18px;padding:26px;text-align:center;color:#64748b}.compact .summary{max-height:110px;overflow:auto}.compact .card{gap:8px}.view-table .cards{display:none}.view-table .table-wrap{display:block}
-    @media(max-width:1100px){.toolbar-grid{grid-template-columns:1fr 1fr}.layout{grid-template-columns:1fr}.side{position:static;max-height:260px}.cards{grid-template-columns:1fr}}
-    @media(max-width:650px){.app{padding:10px}.hero{flex-direction:column}.toolbar-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.date{white-space:normal}.card-top{flex-direction:column}.side{display:none}}
-    @media print{.toolbar,.side{display:none}.layout{display:block}.cards{grid-template-columns:1fr}.card{break-inside:avoid;box-shadow:none}.app{padding:0}.hero{box-shadow:none}}
+    .app{width:100%;max-width:none;margin:0;padding:14px 14px 28px}
+    .hero{background:linear-gradient(135deg,#ffffff 0%,#eff8ff 56%,#dceeff 100%);border:1px solid #d7e8f7;border-radius:22px;padding:18px 20px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:12px}
+    .hero h1{margin:0;color:#06243d;font-size:26px;line-height:1.15}.hero .meta{margin-top:8px;color:var(--muted);font-size:13px;line-height:1.4}.stats{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}.stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:10px 14px;min-width:105px}.stat b{font-size:22px;color:#06243d}.stat span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+    .toolbar{position:sticky;top:0;z-index:20;background:rgba(245,247,251,.96);backdrop-filter:blur(10px);border:1px solid var(--line);border-radius:18px;box-shadow:0 10px 28px rgba(15,23,42,.07);padding:12px;margin-bottom:12px}
+    .toolbar-grid{display:grid;grid-template-columns:minmax(320px,1.6fr) minmax(210px,.8fr) minmax(210px,.8fr) auto;gap:10px;align-items:end}.field label{display:block;font-size:12px;color:#475569;font-weight:800;margin:0 0 5px 2px}.field input,.field select{width:100%;height:42px;border:1px solid #cfddeb;background:#fff;border-radius:12px;padding:0 12px;color:#0f172a;font-size:14px}.buttons{display:flex;gap:8px;flex-wrap:wrap}.btn{height:42px;border:0;border-radius:12px;background:#075985;color:#fff;font-weight:900;padding:0 13px;cursor:pointer;white-space:nowrap}.btn.secondary{background:#eaf2f8;color:#06324d;border:1px solid #cde0ef}.btn:hover,.chip:hover{filter:brightness(.98)}.hint{color:var(--muted);font-size:12px;margin-top:8px;line-height:1.35}.chipbar{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.chip{border:1px solid #cfe0ef;background:#fff;border-radius:999px;padding:7px 10px;font-size:12px;color:#164e63;cursor:pointer;font-weight:800}.chip.active{background:#075985;color:#fff;border-color:#075985}.chip.category{background:#f8fafc}.chip.category.active{background:#0f766e;border-color:#0f766e;color:#fff}
+    .content{width:100%;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;color:#64748b;text-transform:uppercase;letter-spacing:.04em;font-weight:900;margin:2px 0 10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:13px;width:100%}.card{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:14px;display:flex;flex-direction:column;gap:10px;min-width:0}.card-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.issuer{font-weight:950;color:#06243d;font-size:16px;line-height:1.25}.date{white-space:nowrap;color:#64748b;font-size:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:999px;padding:5px 8px}.badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.badge{background:#eef7ff;color:#075985;border:1px solid #cde5f8;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:800}.badge.type{background:#f8fafc;color:#475569;border-color:#e2e8f0}.title{font-size:15px;font-weight:900;line-height:1.38}.summary{font-size:14px;line-height:1.58;color:#1f2937;white-space:pre-wrap;overflow-wrap:anywhere}.keywords{font-size:12px;line-height:1.45;color:#475569;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:8px}.source{margin-top:auto;font-size:12px}.kw,.hit{color:var(--red);font-weight:950;background:#ffe4e6;border-radius:4px;padding:0 2px}.hidden{display:none!important}.no-results{display:none;background:#fff;border:1px dashed #cbd5e1;border-radius:18px;padding:26px;text-align:center;color:#64748b}
+    .table-wrap{display:none;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);width:100%;overflow:visible}.table-view{width:100%;border-collapse:collapse;table-layout:fixed}.table-view th{position:sticky;top:72px;background:#06243d;color:#fff;text-align:left;padding:10px;font-size:12px;z-index:3}.table-view td{border-bottom:1px solid #eef2f7;padding:10px;vertical-align:top;font-size:13px;line-height:1.5;overflow-wrap:anywhere}.table-view th:nth-child(1),.table-view td:nth-child(1){width:115px}.table-view th:nth-child(2),.table-view td:nth-child(2){width:170px}.table-view th:nth-child(3),.table-view td:nth-child(3){width:170px}.table-view th:nth-child(4),.table-view td:nth-child(4){width:26%}.view-table .cards{display:none}.view-table .table-wrap{display:block}.compact .summary{display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden}.compact .card{gap:8px}
+    @media(max-width:1100px){.toolbar-grid{grid-template-columns:1fr 1fr}.buttons{grid-column:1/-1}.hero{flex-direction:column}.stats{justify-content:flex-start}.table-view{table-layout:auto}.table-view th,.table-view td{width:auto!important}}
+    @media(max-width:720px){.app{padding:10px}.toolbar{position:static}.toolbar-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.hero h1{font-size:21px}.table-wrap{overflow-x:auto}.table-view{min-width:850px}}
+    @media print{.toolbar{display:none}.app{padding:0}.card{break-inside:avoid;box-shadow:none}.table-view th{position:static}}
     """
 
-    js = r"""
+    js = """
     const ROWS = __DATA__;
-    const LT_ENDINGS = ['iaus','iui','ių','io','iu','į','is','ys','us','as','ais','uose','ose','oje','ėje','omis','ams','iems','es','ės','ė','ą','ų','ui','uo','a','o','e','ai','ei','am','em',''];
-    function escReg(s){return (s||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
-    function tokens(q){return (q||'').toLowerCase().match(/[\wąčęėįšųūž]+/giu)||[]}
-    function stem(w){w=(w||'').toLowerCase(); if(w.length<=4) return w; const sorted=[...LT_ENDINGS].sort((a,b)=>b.length-a.length); for(const e of sorted){ if(e && w.endsWith(e) && w.length-e.length>=4) return w.slice(0,-e.length)} return w}
-    function patternsFor(q){const out=[]; for(const t of tokens(q)){const vars=[...new Set([t,stem(t)])]; for(const v of vars){if(v.length<3) continue; const ends=LT_ENDINGS.filter(Boolean).sort((a,b)=>b.length-a.length).map(escReg).join('|'); out.push(new RegExp('\\b'+escReg(v)+'(?:'+ends+')?\\b','giu'))}} return out}
-    function rowMatches(row, q, issuer, cat){
-      const txt=(row.text||'').toLowerCase();
-      if(issuer && row.issuer!==issuer) return false;
-      if(cat && !(row.cats||[]).includes(cat)) return false;
-      const ts=tokens(q); if(!ts.length) return true;
-      return ts.every(t=>patternsFor(t).some(p=>p.test(txt)));
-    }
-    function clearHighlights(el){
-      if(!el) return; el.querySelectorAll('mark.hit').forEach(m=>{m.replaceWith(document.createTextNode(m.textContent));}); el.normalize();
-    }
-    function highlightIn(el, q){
-      if(!el) return; clearHighlights(el); const pats=patternsFor(q); if(!pats.length) return;
-      const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,{acceptNode:n=> n.parentElement && !['SCRIPT','STYLE','A'].includes(n.parentElement.tagName) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT});
-      const nodes=[]; while(walker.nextNode()) nodes.push(walker.currentNode);
-      for(const node of nodes){let text=node.nodeValue; let html=text; for(const p of pats){html=html.replace(p,m=>`<mark class="hit">${m}</mark>`)} if(html!==text){const span=document.createElement('span'); span.innerHTML=html; node.replaceWith(span)}}
-    }
-    function applyFilters(){
-      const q=document.getElementById('q').value||'';
-      const issuer=document.getElementById('issuerFilter').value||'';
-      const cat=document.getElementById('catFilter').value||'';
-      let visible=0;
-      for(const row of ROWS){
-        const keep=rowMatches(row,q,issuer,cat); visible+=keep?1:0;
-        document.querySelectorAll(`[data-row="${row.id}"]`).forEach(el=>{el.classList.toggle('hidden',!keep); highlightIn(el,q);});
-      }
-      document.getElementById('visibleCount').textContent=visible;
-      document.getElementById('noResults').style.display=visible?'none':'block';
-      document.querySelectorAll('.issuer-link').forEach(a=>{const iss=a.dataset.issuer; const cnt=ROWS.filter(r=>r.issuer===iss && rowMatches(r,q,'',cat)).length; a.querySelector('.count').textContent=cnt; a.classList.toggle('hidden',cnt===0)});
-    }
-    function resetFilters(){document.getElementById('q').value='';document.getElementById('issuerFilter').value='';document.getElementById('catFilter').value='';applyFilters()}
-    function setView(v){document.body.classList.toggle('view-table',v==='table');document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===v))}
+    const LT_ENDINGS=['as','is','us','ys','ias','ė','a','o','ui','ų','u','iu','ių','e','ei','ėms','ems','ame','uose','ose','oje','ėje','os','es','omis','ais','iais','ai','ą','į','ę','ės','io','čio','čią','čių','imas','imo','imui','imu','imai','imų',''];
+    let activeCategory = '';
+    function escReg(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
+    function stem(t){t=(t||'').toLowerCase().trim(); if(t.length<=4) return t; const sorted=[...LT_ENDINGS].sort((a,b)=>b.length-a.length); for(const e of sorted){if(e && t.endsWith(e) && t.length-e.length>=4) return t.slice(0,-e.length)} return t}
+    function tokens(q){return (q||'').toLowerCase().split(/\s+/).map(x=>x.trim()).filter(Boolean)}
+    function patternsFor(q){return tokens(q).map(t=>new RegExp(escReg(stem(t))+'[a-ząčęėįšųūž]*','iu'))}
+    function rowMatches(row,q,issuer,cat){const txt=(row.text||'').toLowerCase(); if(issuer && row.issuer!==issuer) return false; if(cat && !(row.cats||[]).includes(cat)) return false; const ps=patternsFor(q); if(!ps.length) return true; return ps.every(p=>p.test(txt))}
+    function clearHighlights(el){if(!el) return; el.querySelectorAll('mark.hit').forEach(m=>{m.replaceWith(document.createTextNode(m.textContent));}); el.normalize()}
+    function highlightIn(el,q){if(!el) return; clearHighlights(el); const ps=patternsFor(q); if(!ps.length) return; const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,{acceptNode:n=> n.parentElement && !['SCRIPT','STYLE'].includes(n.parentElement.tagName) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT}); const nodes=[]; while(walker.nextNode()) nodes.push(walker.currentNode); for(const node of nodes){let text=node.nodeValue; let html=text; for(const p of ps){html=html.replace(p,m=>`<mark class="hit">${m}</mark>`)} if(html!==text){const span=document.createElement('span'); span.innerHTML=html; node.replaceWith(span)}}}
+    function applyFilters(){const q=document.getElementById('q').value||''; const issuer=document.getElementById('issuerFilter').value||''; const cat=activeCategory || (document.getElementById('catFilter').value||''); let visible=0; for(const row of ROWS){const keep=rowMatches(row,q,issuer,cat); visible+=keep?1:0; document.querySelectorAll(`[data-row="${row.id}"]`).forEach(el=>{el.classList.toggle('hidden',!keep); highlightIn(el,q);});} document.getElementById('visibleCount').textContent=visible; document.getElementById('noResults').style.display=visible?'none':'block'}
+    function resetFilters(){document.getElementById('q').value='';document.getElementById('issuerFilter').value='';document.getElementById('catFilter').value='';activeCategory='';document.querySelectorAll('.chip.category').forEach(b=>b.classList.remove('active'));applyFilters()}
+    function setView(v){document.body.classList.toggle('view-table',v==='table');document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===v)); setTimeout(()=>window.dispatchEvent(new Event('resize')),50)}
     function toggleCompact(){document.body.classList.toggle('compact')}
-    function goIssuer(issuer){document.getElementById('issuerFilter').value=issuer; applyFilters(); window.scrollTo({top:0,behavior:'smooth'});}
+    function setCategory(cat){activeCategory = activeCategory===cat ? '' : cat; document.getElementById('catFilter').value=activeCategory; document.querySelectorAll('.chip.category').forEach(b=>b.classList.toggle('active',b.dataset.cat===activeCategory)); applyFilters()}
+    function syncCategorySelect(){activeCategory=document.getElementById('catFilter').value||''; document.querySelectorAll('.chip.category').forEach(b=>b.classList.toggle('active',b.dataset.cat===activeCategory)); applyFilters()}
     document.addEventListener('DOMContentLoaded',()=>{applyFilters();});
     """.replace('__DATA__', data_json)
 
@@ -415,32 +416,31 @@ def build_pretty_html(
     parts.append(f"<title>{html_lib.escape(title)}</title><style>{css}</style></head><body>")
     parts.append("<div class='app'>")
     parts.append("<section class='hero'><div><h1>" + html_lib.escape(title) + "</h1>")
-    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Visi tekstai rodomi pilnai · raudonai pažymėti raktiniai žodžiai ir paieškos atitikmenys</div></div>")
+    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Vaizdas naudoja visą lango plotį · nėra vidinio emitentų meniu ir nepatogių slankiklių · raudonai pažymėti raktiniai žodžiai ir paieškos atitikmenys</div></div>")
     parts.append("<div class='stats'>")
     parts.append(f"<div class='stat'><b id='visibleCount'>{len(df_tmp)}</b><span>rodoma</span></div>")
     parts.append(f"<div class='stat'><b>{len(df_tmp)}</b><span>iš viso įrašų</span></div>")
-    parts.append(f"<div class='stat'><b>{len(set(issuers))}</b><span>emitentų</span></div>")
+    parts.append(f"<div class='stat'><b>{len(issuers)}</b><span>emitentų</span></div>")
     parts.append("</div></section>")
 
     parts.append("<section class='toolbar'><div class='toolbar-grid'>")
     parts.append("<div class='field'><label>Paieška pagal žodį ar frazę</label><input id='q' oninput='applyFilters()' placeholder='Pvz. teism, teisminis, dividendai, vadovo, obligacijų...' autocomplete='off'></div>")
     parts.append("<div class='field'><label>Emitentas</label><select id='issuerFilter' onchange='applyFilters()'><option value=''>Visi emitentai</option>")
-    for issuer in issuer_order:
+    for issuer in issuers:
         parts.append(f"<option value='{html_lib.escape(str(issuer), quote=True)}'>{html_lib.escape(str(issuer))}</option>")
     parts.append("</select></div>")
-    parts.append("<div class='field'><label>Kategorija</label><select id='catFilter' onchange='applyFilters()'><option value=''>Visos kategorijos</option>")
+    parts.append("<div class='field'><label>Kategorija</label><select id='catFilter' onchange='syncCategorySelect()'><option value=''>Visos kategorijos</option>")
     for cat in all_categories:
         parts.append(f"<option value='{html_lib.escape(cat, quote=True)}'>{html_lib.escape(cat)}</option>")
     parts.append("</select></div>")
     parts.append("<div class='buttons'><button class='btn secondary' onclick='resetFilters()'>Išvalyti</button><button class='btn secondary' onclick='toggleCompact()'>Kompaktiškai</button></div>")
-    parts.append("</div><div class='chipbar'><button class='chip active' data-view='cards' onclick=\"setView('cards')\">Kortelės</button><button class='chip' data-view='table' onclick=\"setView('table')\">Lentelė</button><span class='hint'>Paieška tikrina antraštę, santrauką, emitentą, kategorijas ir raktinius žodžius. Pvz., įvedus <b>teism</b>, ras ir „teismo“, „teismui“, „teisminis“ tipo atitikmenis pagal kamieną.</span></div></section>")
+    parts.append("</div><div class='chipbar'><button class='chip active' data-view='cards' onclick=\"setView('cards')\">Kortelės</button><button class='chip' data-view='table' onclick=\"setView('table')\">Lentelė</button>")
+    for cat in all_categories[:12]:
+        parts.append(f"<button class='chip category' data-cat='{html_lib.escape(cat, quote=True)}' onclick=\"setCategory('{html_lib.escape(cat, quote=True)}')\">{html_lib.escape(cat)}</button>")
+    parts.append("<span class='hint'>Paieška tikrina antraštę, santrauką, emitentą, kategorijas ir raktinius žodžius. Įvedus kamieną, pvz. <b>teism</b>, randamos ir kitos galūnės.</span></div></section>")
 
-    parts.append("<div class='layout'><aside class='side'><h3>Emitentai</h3>")
-    for issuer in issuer_order:
-        cnt = int((df_tmp['issuer'].fillna('Unknown').astype(str) == str(issuer)).sum())
-        parts.append(f"<a class='issuer-link' data-issuer='{html_lib.escape(str(issuer), quote=True)}' href='javascript:void(0)' onclick=\"goIssuer('{html_lib.escape(str(issuer), quote=True)}')\"><span>{html_lib.escape(str(issuer))}</span><span class='count'>{cnt}</span></a>")
-    parts.append("</aside><main class='content'>")
-    parts.append("<div class='section-title'>Kortelių vaizdas</div><section class='cards'>")
+    parts.append("<main class='content'>")
+    parts.append("<div class='section-title'><span>Kortelių vaizdas</span><span>Pasirinkite lentelės režimą, jeigu norite tankesnio palyginimo.</span></div><section class='cards'>")
 
     table_rows = []
     for i, r in df_tmp.iterrows():
@@ -475,14 +475,14 @@ def build_pretty_html(
         table_rows.append(f"""
         <tr data-row='{rid}'>
           <td>{html_lib.escape(date_fmt)}</td><td>{html_lib.escape(issuer)}</td><td>{badges}</td>
-          <td><b>{title_block}</b></td><td class='summary-cell'>{summary_html}{keywords}</td>
+          <td><b>{title_block}</b></td><td>{summary_html}{keywords}</td>
         </tr>
         """)
     parts.append("</section><div id='noResults' class='no-results'>Pagal pasirinktą paiešką ir filtrus įrašų nerasta.</div>")
     parts.append("<section class='table-wrap'><table class='table-view'><thead><tr><th>Data</th><th>Emitentas</th><th>Kategorijos</th><th>Antraštė</th><th>Santrauka / raktiniai žodžiai</th></tr></thead><tbody>")
     parts.extend(table_rows)
     parts.append("</tbody></table></section>")
-    parts.append("</main></div></div>")
+    parts.append("</main></div>")
     parts.append(f"<script>{js}</script></body></html>")
     return "\n".join(parts)
 
