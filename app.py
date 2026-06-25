@@ -74,24 +74,38 @@ section[data-testid="stSidebar"] {
     min-width: 350px !important;
     max-width: 350px !important;
 }
+
+/* Kai Streamlit soninis meniu suskleistas, nepaliekamas tuscias 350 px plotas. */
+section[data-testid="stSidebar"][aria-expanded="false"],
+section[data-testid="stSidebar"][data-expanded="false"] {
+    min-width: 0 !important;
+    max-width: 0 !important;
+    width: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"] > div,
+section[data-testid="stSidebar"][data-expanded="false"] > div {
+    display: none !important;
+}
+[data-testid="stSidebarCollapsedControl"] {
+    left: 0.75rem !important;
+}
+
 section[data-testid="stSidebar"] * { color: #ffffff; }
 
-/* Date input laukai sidebar'e: tekstas turi būti matomas vedant laikotarpį */
+/* DateInput teksto spalva: kad vedant laikotarpi tekstas nebutu baltas */
 section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
     color: #061b34 !important;
     background: #ffffff !important;
     caret-color: #061b34 !important;
     -webkit-text-fill-color: #061b34 !important;
 }
-
 section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
     color: #6b7280 !important;
-    -webkit-text-fill-color: #6b7280 !important;
 }
-
 section[data-testid="stSidebar"] [data-testid="stDateInput"] svg {
     color: #061b34 !important;
-    fill: #061b34 !important;
 }
 
 .sidebar-card {
@@ -575,7 +589,11 @@ with st.sidebar:
             st.session_state.emitentu_result = None
 
             st.session_state.news_update_message = (
-                f"Atnaujinta"
+                f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
+                f"(patikrinta puslapių: {crib_pages});"
+                f"{manager_note} "
+                f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
+                f"{vz_note}"
             )
 
             st.rerun()
@@ -732,86 +750,19 @@ if report_mode == "Emitentų atranka":
 
     st.success(f"Rasta CRIB įrašų: {len(emit_result['df'])}")
 
-    tab1, tab2, tab3 = st.tabs([
-        "📋 Interaktyvi lentelė",
+    tab1, tab2 = st.tabs([
         "🧾 HTML ataskaita",
         "⬇️ Atsisiuntimas",
     ])
 
     with tab1:
-        df_view = prepare_emitentu_table_df(emit_result["df"])
-
-        if df_view.empty:
-            st.info("Pasirinktam laikotarpiui įrašų nerasta.")
-        else:
-            st.markdown("#### Paieška ir filtrai")
-
-            search = st.text_input(
-                "Paieškos žodis",
-                placeholder="Pvz. teism, dividendai, vadovas, nuostoliai, obligacijos...",
-                key="emitentu_search",
-            )
-
-            fcol1, fcol2 = st.columns(2)
-
-            with fcol1:
-                issuers = sorted(df_view["emitentas"].dropna().unique().tolist())
-
-                selected_issuers = st.multiselect(
-                    "Emitentai",
-                    options=issuers,
-                    default=[],
-                    key="emitentu_issuer_filter",
-                )
-
-            with fcol2:
-                all_categories = sorted({
-                    cat.strip()
-                    for value in df_view["kategorijos"].dropna().astype(str)
-                    for cat in value.replace(";", ",").split(",")
-                    if cat.strip()
-                })
-
-                selected_categories = st.multiselect(
-                    "Kategorijos",
-                    options=all_categories,
-                    default=[],
-                    key="emitentu_category_filter",
-                )
-
-            filtered = filter_emitentu_table_df(
-                df_view=df_view,
-                search=search,
-                selected_issuers=selected_issuers,
-                selected_categories=selected_categories,
-            )
-
-            st.caption(f"Rodoma įrašų: {len(filtered)} iš {len(df_view)}")
-
-            st.dataframe(
-                filtered,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "data": st.column_config.TextColumn("Data", width="small"),
-                    "emitentas": st.column_config.TextColumn("Emitentas", width="medium"),
-                    "kategorijos": st.column_config.TextColumn("Kategorijos", width="medium"),
-                    "tipas": st.column_config.TextColumn("Tipas", width="medium"),
-                    "antraste": st.column_config.TextColumn("Antraštė", width="large"),
-                    "santrauka": st.column_config.TextColumn("Santrauka", width="large"),
-                    "raktazodziai": st.column_config.TextColumn("Raktažodžiai", width="medium"),
-                    "nuoroda": st.column_config.LinkColumn("Nuoroda"),
-                },
-            )
-
-    with tab2:
         components.html(
             emit_result["html"],
-            height=900,
+            height=1250,
             scrolling=True,
         )
 
-    with tab3:
+    with tab2:
         df_export = prepare_emitentu_table_df(emit_result["df"])
         csv_data = df_export.to_csv(index=False).encode("utf-8-sig")
 
