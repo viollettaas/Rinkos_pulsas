@@ -575,11 +575,7 @@ with st.sidebar:
             st.session_state.emitentu_result = None
 
             st.session_state.news_update_message = (
-                f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
-                f"(patikrinta puslapių: {crib_pages});"
-                f"{manager_note} "
-                f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
-                f"{vz_note}"
+                f"Atnaujinta"
             )
 
             st.rerun()
