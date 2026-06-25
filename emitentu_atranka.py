@@ -346,6 +346,10 @@ def build_pretty_html(
     .toc{width:330px;background:var(--card);padding:14px;border-radius:12px;box-shadow:0 6px 18px rgba(12,40,60,0.06);position:sticky;top:10px;max-height:92vh;overflow:auto}
     .toc h3{margin:0 0 8px 0}
     .toc input[type="text"]{width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid #e7eef6}
+    .keyword-search{margin-top:12px;padding:10px;border:1px solid #d9e8f5;border-radius:10px;background:#fbfdff}
+    .keyword-search input{margin-top:6px}
+    .search-note{font-size:0.82rem;color:var(--muted);margin-top:6px;line-height:1.35}
+    mark.search-hit{background:#ffe08a;color:#111;padding:0 2px;border-radius:3px}
     .toc ul{list-style:none;padding:8px 0;margin:10px 0;max-height:360px;overflow:auto}
     .toc li{margin:6px 0}
     .toc a{display:flex;justify-content:space-between;text-decoration:none;color:#0b4860;padding:6px 8px;border-radius:8px}
@@ -430,32 +434,99 @@ def build_pretty_html(
       });
     }
 
+    function normalizeLt(s){
+      return (s || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/ą/g,'a').replace(/č/g,'c').replace(/ę/g,'e')
+        .replace(/ė/g,'e').replace(/į/g,'i').replace(/š/g,'s')
+        .replace(/ų/g,'u').replace(/ū/g,'u').replace(/ž/g,'z')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function searchStems(q){
+      const endings = ['omis','uose','iuose','uose','ams','ems','ais','iais','ose','oje','ame','imu','imas','imo','imui','imai','imas','as','is','us','ys','ai','ui','uo','iu','io','ią','ia','ą','ė','e','a','o','ų','u','i'];
+      const words = normalizeLt(q).split(' ').filter(Boolean);
+      return words.map(w=>{
+        let stem = w;
+        endings.forEach(end=>{
+          if(stem.length > end.length + 3 && stem.endsWith(end)){
+            stem = stem.slice(0, -end.length);
+          }
+        });
+        return stem.length >= 3 ? stem : w;
+      });
+    }
+
+    function rowMatchesKeyword(row, stems){
+      if(!stems.length) return true;
+      const txt = normalizeLt(row.dataset.search || row.innerText || '');
+      return stems.every(stem => txt.includes(stem));
+    }
+
     function getSelectedCategories(){
       return Array.from(
         document.querySelectorAll('.cat-filter input[type="checkbox"]:checked')
       ).map(n=>n.value);
     }
 
-    function filterByCategories(){
+    function applyFilters(){
       const selected = getSelectedCategories();
-      const rows = document.querySelectorAll('tr[data-cats]');
+      const q = document.getElementById('keyword_search') ? document.getElementById('keyword_search').value : '';
+      const stems = searchStems(q);
+      let visibleCount = 0;
 
-      rows.forEach(row=>{
+      document.querySelectorAll('tr[data-cats]').forEach(row=>{
         const cats = (row.dataset.cats || '')
           .toLowerCase()
           .split(';')
           .map(x=>x.trim())
           .filter(Boolean);
 
-        const keep = cats.some(c => selected.includes(c));
+        const catKeep = cats.some(c => selected.includes(c));
+        const keywordKeep = rowMatchesKeyword(row, stems);
+        const keep = catKeep && keywordKeep;
         row.style.display = keep ? '' : 'none';
+        if(keep) visibleCount += 1;
+      });
+
+      document.querySelectorAll('.cat-block').forEach(block=>{
+        const rows = Array.from(block.querySelectorAll('tr[data-cats]'));
+        const anyVisible = rows.some(tr => tr.style.display !== 'none');
+        block.style.display = anyVisible ? '' : 'none';
       });
 
       document.querySelectorAll('.issuer-card').forEach(card=>{
         const trs = Array.from(card.querySelectorAll('tr[data-cats]'));
         const anyVisible = trs.length ? trs.some(tr => tr.style.display !== 'none') : false;
         card.style.display = anyVisible ? '' : 'none';
+        const coll = card.querySelector('.collapsible');
+        const btn = card.querySelector('[data-toggle]');
+        if(anyVisible && stems.length && coll){
+          coll.style.maxHeight = coll.scrollHeight + 'px';
+          if(btn) btn.innerText = 'Slėpti';
+        }
       });
+
+      const countEl = document.getElementById('visible_count');
+      if(countEl) countEl.innerText = visibleCount;
+    }
+
+    function filterByCategories(){
+      applyFilters();
+    }
+
+    function filterByKeyword(){
+      applyFilters();
+    }
+
+    function clearKeywordSearch(){
+      const inp = document.getElementById('keyword_search');
+      if(inp) inp.value = '';
+      applyFilters();
     }
 
     function toggleSelectAllCats(){
@@ -478,7 +549,12 @@ def build_pretty_html(
         cb.addEventListener('change', filterByCategories);
       });
 
-      filterByCategories();
+      const keywordInput = document.getElementById('keyword_search');
+      if(keywordInput){
+        keywordInput.addEventListener('input', filterByKeyword);
+      }
+
+      applyFilters();
     });
     """
 
@@ -500,6 +576,13 @@ def build_pretty_html(
     parts.append("<aside class='toc'>")
     parts.append("<h3>Emitentų sąrašas</h3>")
     parts.append("<input id='toc_search' placeholder='Ieškoti emitento...' oninput='tocFilter()' />")
+
+    parts.append("<div class='keyword-search'>")
+    parts.append("<strong>Paieška pagal žodį</strong>")
+    parts.append("<input id='keyword_search' placeholder='Pvz. teism, dividend, vadov, obligacij...' />")
+    parts.append("<div class='search-note'>Ieško antraštėse, santraukose, emitente, kategorijoje ir raktiniuose žodžiuose. Paieška toleruoja lietuviškas galūnes.</div>")
+    parts.append("<div class='filter-controls'><button class='toggle-btn' onclick='clearKeywordSearch()'>Išvalyti paiešką</button></div>")
+    parts.append("</div>")
 
     parts.append("<div style='margin-top:12px'><strong>Filtruoti pagal kategorijas</strong>")
     parts.append("<div class='small'>Pasirinkite kategorijas — rodys tik pažymėtas.</div>")
@@ -534,7 +617,8 @@ def build_pretty_html(
     parts.append("<main class='content'>")
     parts.append(
         f"<div class='summary-card'><strong>Įrašų skaičius:</strong> "
-        f"<strong>{len(df)}</strong></div>"
+        f"<strong>{len(df)}</strong> | <strong>Rodoma:</strong> "
+        f"<strong id='visible_count'>{len(df)}</strong></div>"
     )
 
     for issuer in issuer_order:
@@ -654,8 +738,19 @@ def build_pretty_html(
                     f"{html_lib.escape(cat_display)}</div>"
                 )
 
+                search_text = " ".join([
+                    str(date_fmt),
+                    str(r.get("issuer", "")),
+                    str(title_raw),
+                    str(summary_raw),
+                    str(cat_display),
+                    str(r.get("matched_keywords", "")),
+                    str(r.get("type", "")),
+                ])
+                search_attr = html_lib.escape(search_text, quote=True)
+
                 parts.append(
-                    f"<tr data-cats='{cats_attr}'>"
+                    f"<tr data-cats='{cats_attr}' data-search='{search_attr}'>"
                     f"<td class='date-col'>{html_lib.escape(date_fmt)}</td>"
                     f"<td class='title-col'>{link_html}</td>"
                     f"<td>{highlight_keywords(summary_raw)}</td>"
@@ -869,77 +964,10 @@ def render_emitentu_atranka_page(default_days: int = 30):
 
     st.success(f"Rasta įrašų: {len(result['df'])}")
 
-    tab_table, tab_html, tab_export = st.tabs([
-        "📋 Interaktyvi lentelė",
+    tab_html, tab_export = st.tabs([
         "🌐 HTML peržiūra",
         "⬇️ Atsisiuntimas",
     ])
-
-    with tab_table:
-        df_view = prepare_streamlit_view_df(result["df"])
-
-        if df_view.empty:
-            st.info("Pasirinktu laikotarpiu įrašų nerasta.")
-        else:
-            st.markdown("#### Paieška ir filtrai")
-
-            search = st.text_input(
-                "Paieškos žodis",
-                placeholder="Pvz. teism, dividendai, vadovas, nuostoliai, obligacijos...",
-                key="crib_cls_search",
-            )
-
-            filter_col1, filter_col2 = st.columns(2)
-
-            with filter_col1:
-                issuers = sorted(df_view["emitentas"].dropna().unique().tolist())
-
-                selected_issuers = st.multiselect(
-                    "Emitentai",
-                    options=issuers,
-                    default=[],
-                    key="crib_cls_issuers_filter",
-                )
-
-            with filter_col2:
-                all_categories = sorted({
-                    cat.strip()
-                    for value in df_view["kategorijos"].dropna().astype(str)
-                    for cat in value.split(",")
-                    if cat.strip()
-                })
-
-                selected_categories = st.multiselect(
-                    "Kategorijos",
-                    options=all_categories,
-                    default=[],
-                    key="crib_cls_categories_filter",
-                )
-
-            filtered = filter_streamlit_df(
-                df_view=df_view,
-                search=search,
-                selected_issuers=selected_issuers,
-                selected_categories=selected_categories,
-            )
-
-            st.caption(f"Rodoma įrašų: {len(filtered)} iš {len(df_view)}")
-
-            st.dataframe(
-                filtered,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "data": st.column_config.TextColumn("Data", width="small"),
-                    "emitentas": st.column_config.TextColumn("Emitentas", width="medium"),
-                    "kategorijos": st.column_config.TextColumn("Kategorijos", width="medium"),
-                    "tipas": st.column_config.TextColumn("Tipas", width="medium"),
-                    "antraste": st.column_config.TextColumn("Antraštė", width="large"),
-                    "santrauka": st.column_config.TextColumn("Santrauka", width="large"),
-                    "raktazodziai": st.column_config.TextColumn("Raktažodžiai", width="medium"),
-                    "nuoroda": st.column_config.LinkColumn("Nuoroda"),
-                },
-            )
 
     with tab_html:
         components.html(
