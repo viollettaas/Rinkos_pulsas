@@ -290,482 +290,200 @@ def build_pretty_html(
     df: pd.DataFrame,
     title: str = "Emitentų atranka pagal CRIB naujienas",
 ) -> str:
+    """Moderni HTML ataskaita su paieska, filtrais, kortelemis ir lentele.
+
+    Viskas veikia viename HTML faile: nereikia Streamlit interaktyvios lenteles.
+    Paieska atlieka paprasta lietuvisku galuniu tolerancija ir paryskina rastus zodzius.
+    """
     if df is None or df.empty:
         return f"""
         <!doctype html>
         <html>
         <head><meta charset='utf-8'></head>
-        <body style='font-family:Arial,sans-serif;padding:24px'>
+        <body style='font-family:Inter,Segoe UI,Arial,sans-serif;padding:24px;background:#f6f8fb;color:#111827'>
             <h2>{html_lib.escape(title)}</h2>
             <p>Nurodytame laikotarpyje CRIB naujienų duomenų bazėje nerasta.</p>
         </body>
         </html>
         """
 
-    cats_from_src = sorted({
-        c.strip()
-        for c in df["category_src"].unique()
-        if c and str(c).strip()
-    })
-
-    cats_assigned = set()
-
-    for row in df.get("categories", []):
-        if isinstance(row, (list, tuple)):
-            for c in row:
-                cats_assigned.add(str(c))
-        elif row:
-            cats_assigned.add(str(row))
-
-    cats_assigned = sorted(cats_assigned)
-    all_categories = sorted(set(cats_from_src + cats_assigned))
-
-    if not all_categories:
-        all_categories = CATEGORY_ORDER.copy()
-
     df_tmp = df.copy()
     df_tmp["date_parsed"] = parse_dates_safe(df_tmp["date"])
+    df_tmp = df_tmp.sort_values(["date_parsed", "orig_order"], ascending=[False, True]).reset_index(drop=True)
 
-    issuer_order = (
-        df_tmp.sort_values("date_parsed", ascending=False)["issuer"]
-        .drop_duplicates()
-        .tolist()
-    )
+    def row_categories(row):
+        vals = []
+        src = str(row.get("category_src", "") or "").strip()
+        if src:
+            vals.append(src)
+        cats = row.get("categories") or []
+        if isinstance(cats, str):
+            cats = [cats]
+        for c in cats:
+            c = str(c or "").strip()
+            if c and c not in vals:
+                vals.append(c)
+        return vals or ["Kiti"]
+
+    all_categories = sorted({c for _, r in df_tmp.iterrows() for c in row_categories(r)}) or CATEGORY_ORDER.copy()
+    issuers = df_tmp["issuer"].fillna("Unknown").astype(str).tolist()
+    issuer_order = df_tmp["issuer"].fillna("Unknown").astype(str).drop_duplicates().tolist()
+
+    # JSON duomenys JS filtrams. Tekstai HTML'e jau saugiai escapinami atskirai.
+    import json
+    rows_json = []
+    for i, r in df_tmp.iterrows():
+        cats = row_categories(r)
+        combined = " ".join([
+            str(r.get("issuer", "")), str(r.get("title", "")), str(r.get("summary", "")),
+            str(r.get("type", "")), str(r.get("matched_keywords", "")), " ".join(cats)
+        ])
+        rows_json.append({
+            "id": f"row_{i}",
+            "issuer": str(r.get("issuer", "Unknown") or "Unknown"),
+            "cats": cats,
+            "text": combined,
+        })
+
+    data_json = json.dumps(rows_json, ensure_ascii=False)
 
     css = """
     :root{
-      --bg:#f6f8fb; --card:#ffffff; --accent:#0b6ea8; --muted:#6b7680;
-      --danger:#b30000; --radius:12px; --glass: rgba(11,110,168,0.06);
+      --bg:#f5f7fb;--panel:#ffffff;--text:#111827;--muted:#64748b;--line:#e5edf6;
+      --blue:#075985;--blue2:#0f75bc;--soft:#eef7ff;--red:#c1121f;--amber:#fff7ed;
+      --shadow:0 14px 35px rgba(15,23,42,.08);--radius:18px;
     }
-    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Arial,Helvetica,sans-serif;background:var(--bg);color:#111}
-    .container{max-width:1250px;margin:20px auto;padding:18px}
-    header{display:flex;align-items:center;justify-content:space-between;padding:12px 0}
-    header h1{margin:0;font-size:1.55rem;color:var(--accent)}
-    .meta{color:var(--muted);font-size:0.92rem}
-    .top{display:flex;gap:18px;align-items:flex-start}
-    .toc{width:330px;background:var(--card);padding:14px;border-radius:12px;box-shadow:0 6px 18px rgba(12,40,60,0.06);position:sticky;top:10px;max-height:92vh;overflow:auto}
-    .toc h3{margin:0 0 8px 0}
-    .toc input[type="text"]{width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid #e7eef6}
-    .keyword-search{margin-top:12px;padding:10px;border:1px solid #d9e8f5;border-radius:10px;background:#fbfdff}
-    .keyword-search input{margin-top:6px}
-    .search-note{font-size:0.82rem;color:var(--muted);margin-top:6px;line-height:1.35}
-    mark.search-hit{background:#ffe08a;color:#111;padding:0 2px;border-radius:3px}
-    .toc ul{list-style:none;padding:8px 0;margin:10px 0;max-height:360px;overflow:auto}
-    .toc li{margin:6px 0}
-    .toc a{display:flex;justify-content:space-between;text-decoration:none;color:#0b4860;padding:6px 8px;border-radius:8px}
-    .toc a:hover{background:var(--glass)}
-    .content{flex:1;margin-left:8px;min-width:0}
-    .summary-card{background:linear-gradient(180deg,#fff,#fbfdff);padding:12px;border-radius:12px;box-shadow:0 6px 20px rgba(12,40,60,0.04);margin-bottom:12px}
-    .issuer-card{background:var(--card);padding:14px;margin-bottom:14px;border-radius:12px;box-shadow:0 6px 18px rgba(12,40,60,0.04)}
-    .issuer-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
-    .issuer-title{font-size:1.16rem;font-weight:800;color:#083b50}
-    .badge{background:var(--accent);color:white;padding:5px 9px;border-radius:999px;font-weight:600;font-size:0.82rem}
-    .cat-title{font-size:1rem;margin:10px 0 6px 0;color:#0b5575}
-    table{width:100%;border-collapse:collapse;margin-bottom:8px;table-layout:fixed}
-    th,td{padding:8px;border-bottom:1px solid #eef6fb;text-align:left;vertical-align:top;font-size:0.92rem;word-wrap:break-word}
-    th{background:#fbfdff;font-weight:700;color:#234}
-    th.date-col, td.date-col{width:125px}
-    th.title-col, td.title-col{width:40%}
-    .controls{display:flex;gap:8px;align-items:center}
-    .btn{background:var(--accent);color:white;padding:8px 10px;border-radius:8px;text-decoration:none;font-weight:600;cursor:pointer;border:none}
-    .small{font-size:0.84rem;color:var(--muted)}
-    .toggle-btn{background:#f3f7fb;border-radius:8px;padding:6px 8px;border:1px solid #e7eef6;cursor:pointer}
-    .collapsible{overflow:hidden;transition:max-height .25s ease-out}
-    strong.kw{font-weight:800;color:var(--danger)}
-    .filter-controls{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    .cat-checkbox{display:flex;align-items:center;gap:8px;padding:4px 0}
-    @media(max-width:900px){.top{flex-direction:column}.toc{width:auto;position:static}.content{margin-left:0;width:100%}}
-    @media print{.toc,.controls{display:none}.container{max-width:100%}.collapsible{max-height:none!important}}
+    *{box-sizing:border-box}
+    html,body{margin:0;min-height:100%;font-family:Inter,Segoe UI,Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
+    a{color:#075985;text-decoration:none} a:hover{text-decoration:underline}
+    .app{width:100%;max-width:none;margin:0;padding:18px}
+    .hero{background:linear-gradient(135deg,#ffffff 0%,#eff8ff 56%,#dceeff 100%);border:1px solid #d7e8f7;border-radius:22px;padding:18px 20px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:14px}
+    .hero h1{margin:0;color:#06243d;font-size:26px;line-height:1.15}.hero .meta{margin-top:8px;color:var(--muted);font-size:13px}.stats{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}.stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:10px 14px;min-width:110px}.stat b{font-size:22px;color:#06243d}.stat span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+    .toolbar{position:sticky;top:0;z-index:20;background:rgba(245,247,251,.94);backdrop-filter:blur(10px);border:1px solid var(--line);border-radius:18px;box-shadow:0 10px 28px rgba(15,23,42,.07);padding:12px;margin-bottom:14px}
+    .toolbar-grid{display:grid;grid-template-columns:minmax(260px,1.4fr) minmax(200px,.7fr) minmax(190px,.7fr) auto;gap:10px;align-items:end}.field label{display:block;font-size:12px;color:#475569;font-weight:800;margin:0 0 5px 2px}.field input,.field select{width:100%;height:42px;border:1px solid #cfddeb;background:#fff;border-radius:12px;padding:0 12px;color:#0f172a;font-size:14px}.buttons{display:flex;gap:8px;flex-wrap:wrap}.btn{height:42px;border:0;border-radius:12px;background:#075985;color:#fff;font-weight:900;padding:0 13px;cursor:pointer}.btn.secondary{background:#eaf2f8;color:#06324d;border:1px solid #cde0ef}.btn.warn{background:#fff7ed;color:#9a3412;border:1px solid #fed7aa}.hint{color:var(--muted);font-size:12px;margin-top:8px;line-height:1.35}.chipbar{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.chip{border:1px solid #cfe0ef;background:#fff;border-radius:999px;padding:6px 9px;font-size:12px;color:#164e63;cursor:pointer}.chip.active{background:#075985;color:#fff;border-color:#075985}
+    .layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:14px}.side{position:sticky;top:118px;align-self:start;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:13px;max-height:calc(100vh - 135px);overflow:auto}.side h3{margin:0 0 10px;color:#0f2f45;font-size:15px}.issuer-link{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 9px;border-radius:12px;color:#0f3f5b;font-size:13px}.issuer-link:hover{background:#eef7ff;text-decoration:none}.count{background:#e2edf7;color:#075985;border-radius:999px;padding:2px 7px;font-size:11px;font-weight:900}.content{min-width:0}.section-title{font-size:13px;color:#64748b;text-transform:uppercase;letter-spacing:.04em;font-weight:900;margin:4px 0 10px}.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:13px}.card{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:14px;display:flex;flex-direction:column;gap:10px}.card-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.issuer{font-weight:950;color:#06243d;font-size:16px}.date{white-space:nowrap;color:#64748b;font-size:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:999px;padding:5px 8px}.badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.badge{background:#eef7ff;color:#075985;border:1px solid #cde5f8;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:800}.badge.type{background:#f8fafc;color:#475569;border-color:#e2e8f0}.title{font-size:15px;font-weight:900;line-height:1.35}.summary{font-size:14px;line-height:1.55;color:#1f2937;white-space:pre-wrap}.keywords{font-size:12px;line-height:1.45;color:#475569;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:8px}.source{margin-top:auto;font-size:12px}.kw,.hit{color:var(--red);font-weight:950;background:#ffe4e6;border-radius:4px;padding:0 2px}.table-wrap{display:none;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:auto}.table-view{width:100%;border-collapse:collapse;table-layout:auto}.table-view th{position:sticky;top:0;background:#06243d;color:#fff;text-align:left;padding:10px;font-size:12px;z-index:3}.table-view td{border-bottom:1px solid #eef2f7;padding:10px;vertical-align:top;font-size:13px;line-height:1.45}.table-view .summary-cell{min-width:420px}.hidden{display:none!important}.no-results{display:none;background:#fff;border:1px dashed #cbd5e1;border-radius:18px;padding:26px;text-align:center;color:#64748b}.compact .summary{max-height:110px;overflow:auto}.compact .card{gap:8px}.view-table .cards{display:none}.view-table .table-wrap{display:block}
+    @media(max-width:1100px){.toolbar-grid{grid-template-columns:1fr 1fr}.layout{grid-template-columns:1fr}.side{position:static;max-height:260px}.cards{grid-template-columns:1fr}}
+    @media(max-width:650px){.app{padding:10px}.hero{flex-direction:column}.toolbar-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.date{white-space:normal}.card-top{flex-direction:column}.side{display:none}}
+    @media print{.toolbar,.side{display:none}.layout{display:block}.cards{grid-template-columns:1fr}.card{break-inside:avoid;box-shadow:none}.app{padding:0}.hero{box-shadow:none}}
     """
 
-    js = """
-    function scrollToId(id){
-      document.querySelector('#'+id).scrollIntoView({behavior:'smooth',block:'start'});
+    js = r"""
+    const ROWS = __DATA__;
+    const LT_ENDINGS = ['iaus','iui','ių','io','iu','į','is','ys','us','as','ais','uose','ose','oje','ėje','omis','ams','iems','es','ės','ė','ą','ų','ui','uo','a','o','e','ai','ei','am','em',''];
+    function escReg(s){return (s||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
+    function tokens(q){return (q||'').toLowerCase().match(/[\wąčęėįšųūž]+/giu)||[]}
+    function stem(w){w=(w||'').toLowerCase(); if(w.length<=4) return w; const sorted=[...LT_ENDINGS].sort((a,b)=>b.length-a.length); for(const e of sorted){ if(e && w.endsWith(e) && w.length-e.length>=4) return w.slice(0,-e.length)} return w}
+    function patternsFor(q){const out=[]; for(const t of tokens(q)){const vars=[...new Set([t,stem(t)])]; for(const v of vars){if(v.length<3) continue; const ends=LT_ENDINGS.filter(Boolean).sort((a,b)=>b.length-a.length).map(escReg).join('|'); out.push(new RegExp('\\b'+escReg(v)+'(?:'+ends+')?\\b','giu'))}} return out}
+    function rowMatches(row, q, issuer, cat){
+      const txt=(row.text||'').toLowerCase();
+      if(issuer && row.issuer!==issuer) return false;
+      if(cat && !(row.cats||[]).includes(cat)) return false;
+      const ts=tokens(q); if(!ts.length) return true;
+      return ts.every(t=>patternsFor(t).some(p=>p.test(txt)));
     }
-
-    function expandAll(){
-      document.querySelectorAll('.collapsible').forEach(div=>{
-        div.style.maxHeight = div.scrollHeight + 'px';
-      });
-      document.querySelectorAll('[data-toggle]').forEach(btn => btn.innerText = 'Slėpti');
-      let g = document.getElementById('global_toggle');
-      if(g) g.innerText = 'Slėpti visus';
+    function clearHighlights(el){
+      if(!el) return; el.querySelectorAll('mark.hit').forEach(m=>{m.replaceWith(document.createTextNode(m.textContent));}); el.normalize();
     }
-
-    function collapseAll(){
-      document.querySelectorAll('.collapsible').forEach(div=>{
-        div.style.maxHeight = '0px';
-      });
-      document.querySelectorAll('[data-toggle]').forEach(btn => btn.innerText = 'Rodyti');
-      let g = document.getElementById('global_toggle');
-      if(g) g.innerText = 'Rodyti visus';
+    function highlightIn(el, q){
+      if(!el) return; clearHighlights(el); const pats=patternsFor(q); if(!pats.length) return;
+      const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,{acceptNode:n=> n.parentElement && !['SCRIPT','STYLE','A'].includes(n.parentElement.tagName) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT});
+      const nodes=[]; while(walker.nextNode()) nodes.push(walker.currentNode);
+      for(const node of nodes){let text=node.nodeValue; let html=text; for(const p of pats){html=html.replace(p,m=>`<mark class="hit">${m}</mark>`)} if(html!==text){const span=document.createElement('span'); span.innerHTML=html; node.replaceWith(span)}}
     }
-
-    function toggleAll(){
-      let anyClosed = false;
-      document.querySelectorAll('.collapsible').forEach(div=>{
-        if(!div.style.maxHeight || div.style.maxHeight === '0px') anyClosed = true;
-      });
-      if(anyClosed) expandAll(); else collapseAll();
-    }
-
-    document.addEventListener('click', function(e){
-      if(e.target.matches('[data-toggle]') || e.target.closest('[data-toggle]')){
-        let btn = e.target.closest('[data-toggle]');
-        let target = document.querySelector(btn.dataset.toggle);
-        if(!target) return;
-
-        if(target.style.maxHeight && target.style.maxHeight !== '0px'){
-          target.style.maxHeight = '0px';
-          btn.innerText = 'Rodyti';
-        } else {
-          target.style.maxHeight = target.scrollHeight + 'px';
-          btn.innerText = 'Slėpti';
-        }
-      }
-    });
-
-    function tocFilter(){
-      let q = document.getElementById('toc_search').value.trim().toLowerCase();
-
-      document.querySelectorAll('.toc li').forEach(li=>{
-        let txt = li.dataset.issuer || '';
-        li.style.display = txt.indexOf(q) !== -1 ? '' : 'none';
-      });
-    }
-
-    function normalizeLt(s){
-      return (s || '')
-        .toLowerCase()
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/ą/g,'a').replace(/č/g,'c').replace(/ę/g,'e')
-        .replace(/ė/g,'e').replace(/į/g,'i').replace(/š/g,'s')
-        .replace(/ų/g,'u').replace(/ū/g,'u').replace(/ž/g,'z')
-        .replace(/[^a-z0-9]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
-
-    function searchStems(q){
-      const endings = ['omis','uose','iuose','uose','ams','ems','ais','iais','ose','oje','ame','imu','imas','imo','imui','imai','imas','as','is','us','ys','ai','ui','uo','iu','io','ią','ia','ą','ė','e','a','o','ų','u','i'];
-      const words = normalizeLt(q).split(' ').filter(Boolean);
-      return words.map(w=>{
-        let stem = w;
-        endings.forEach(end=>{
-          if(stem.length > end.length + 3 && stem.endsWith(end)){
-            stem = stem.slice(0, -end.length);
-          }
-        });
-        return stem.length >= 3 ? stem : w;
-      });
-    }
-
-    function rowMatchesKeyword(row, stems){
-      if(!stems.length) return true;
-      const txt = normalizeLt(row.dataset.search || row.innerText || '');
-      return stems.every(stem => txt.includes(stem));
-    }
-
-    function getSelectedCategories(){
-      return Array.from(
-        document.querySelectorAll('.cat-filter input[type="checkbox"]:checked')
-      ).map(n=>n.value);
-    }
-
     function applyFilters(){
-      const selected = getSelectedCategories();
-      const q = document.getElementById('keyword_search') ? document.getElementById('keyword_search').value : '';
-      const stems = searchStems(q);
-      let visibleCount = 0;
-
-      document.querySelectorAll('tr[data-cats]').forEach(row=>{
-        const cats = (row.dataset.cats || '')
-          .toLowerCase()
-          .split(';')
-          .map(x=>x.trim())
-          .filter(Boolean);
-
-        const catKeep = cats.some(c => selected.includes(c));
-        const keywordKeep = rowMatchesKeyword(row, stems);
-        const keep = catKeep && keywordKeep;
-        row.style.display = keep ? '' : 'none';
-        if(keep) visibleCount += 1;
-      });
-
-      document.querySelectorAll('.cat-block').forEach(block=>{
-        const rows = Array.from(block.querySelectorAll('tr[data-cats]'));
-        const anyVisible = rows.some(tr => tr.style.display !== 'none');
-        block.style.display = anyVisible ? '' : 'none';
-      });
-
-      document.querySelectorAll('.issuer-card').forEach(card=>{
-        const trs = Array.from(card.querySelectorAll('tr[data-cats]'));
-        const anyVisible = trs.length ? trs.some(tr => tr.style.display !== 'none') : false;
-        card.style.display = anyVisible ? '' : 'none';
-        const coll = card.querySelector('.collapsible');
-        const btn = card.querySelector('[data-toggle]');
-        if(anyVisible && stems.length && coll){
-          coll.style.maxHeight = coll.scrollHeight + 'px';
-          if(btn) btn.innerText = 'Slėpti';
-        }
-      });
-
-      const countEl = document.getElementById('visible_count');
-      if(countEl) countEl.innerText = visibleCount;
-    }
-
-    function filterByCategories(){
-      applyFilters();
-    }
-
-    function filterByKeyword(){
-      applyFilters();
-    }
-
-    function clearKeywordSearch(){
-      const inp = document.getElementById('keyword_search');
-      if(inp) inp.value = '';
-      applyFilters();
-    }
-
-    function toggleSelectAllCats(){
-      const inputs = Array.from(document.querySelectorAll('.cat-filter input[type="checkbox"]'));
-      const anyUnchecked = inputs.some(i=>!i.checked);
-      inputs.forEach(i=> i.checked = anyUnchecked);
-      filterByCategories();
-
-      const btn = document.getElementById('cat_select_all_btn');
-      if(btn) btn.innerText = anyUnchecked ? 'Atžymėti viską' : 'Pažymėti viską';
-    }
-
-    document.addEventListener('DOMContentLoaded', function(){
-      document.querySelectorAll('.collapsible').forEach(div => div.style.maxHeight = '0px');
-
-      let g = document.getElementById('global_toggle');
-      if(g) g.innerText = 'Rodyti visus';
-
-      document.querySelectorAll('.cat-filter input[type="checkbox"]').forEach(cb=>{
-        cb.addEventListener('change', filterByCategories);
-      });
-
-      const keywordInput = document.getElementById('keyword_search');
-      if(keywordInput){
-        keywordInput.addEventListener('input', filterByKeyword);
+      const q=document.getElementById('q').value||'';
+      const issuer=document.getElementById('issuerFilter').value||'';
+      const cat=document.getElementById('catFilter').value||'';
+      let visible=0;
+      for(const row of ROWS){
+        const keep=rowMatches(row,q,issuer,cat); visible+=keep?1:0;
+        document.querySelectorAll(`[data-row="${row.id}"]`).forEach(el=>{el.classList.toggle('hidden',!keep); highlightIn(el,q);});
       }
-
-      applyFilters();
-    });
-    """
+      document.getElementById('visibleCount').textContent=visible;
+      document.getElementById('noResults').style.display=visible?'none':'block';
+      document.querySelectorAll('.issuer-link').forEach(a=>{const iss=a.dataset.issuer; const cnt=ROWS.filter(r=>r.issuer===iss && rowMatches(r,q,'',cat)).length; a.querySelector('.count').textContent=cnt; a.classList.toggle('hidden',cnt===0)});
+    }
+    function resetFilters(){document.getElementById('q').value='';document.getElementById('issuerFilter').value='';document.getElementById('catFilter').value='';applyFilters()}
+    function setView(v){document.body.classList.toggle('view-table',v==='table');document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===v))}
+    function toggleCompact(){document.body.classList.toggle('compact')}
+    function goIssuer(issuer){document.getElementById('issuerFilter').value=issuer; applyFilters(); window.scrollTo({top:0,behavior:'smooth'});}
+    document.addEventListener('DOMContentLoaded',()=>{applyFilters();});
+    """.replace('__DATA__', data_json)
 
     parts = []
-    parts.append("<!doctype html>")
-    parts.append("<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>")
+    parts.append("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>")
     parts.append(f"<title>{html_lib.escape(title)}</title><style>{css}</style></head><body>")
-    parts.append("<div class='container'>")
+    parts.append("<div class='app'>")
+    parts.append("<section class='hero'><div><h1>" + html_lib.escape(title) + "</h1>")
+    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Visi tekstai rodomi pilnai · raudonai pažymėti raktiniai žodžiai ir paieškos atitikmenys</div></div>")
+    parts.append("<div class='stats'>")
+    parts.append(f"<div class='stat'><b id='visibleCount'>{len(df_tmp)}</b><span>rodoma</span></div>")
+    parts.append(f"<div class='stat'><b>{len(df_tmp)}</b><span>iš viso įrašų</span></div>")
+    parts.append(f"<div class='stat'><b>{len(set(issuers))}</b><span>emitentų</span></div>")
+    parts.append("</div></section>")
 
-    parts.append("<header>")
-    parts.append("<div style='display:flex;flex-direction:column'>")
-    parts.append(f"<h1>{html_lib.escape(title)}</h1>")
-    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>")
-    parts.append("</div>")
-    parts.append("<div class='controls'><button id='global_toggle' class='btn' onclick='toggleAll()'>Rodyti visus</button></div>")
-    parts.append("</header>")
-
-    parts.append("<div class='top'>")
-    parts.append("<aside class='toc'>")
-    parts.append("<h3>Emitentų sąrašas</h3>")
-    parts.append("<input id='toc_search' placeholder='Ieškoti emitento...' oninput='tocFilter()' />")
-
-    parts.append("<div class='keyword-search'>")
-    parts.append("<strong>Paieška pagal žodį</strong>")
-    parts.append("<input id='keyword_search' placeholder='Pvz. teism, dividend, vadov, obligacij...' />")
-    parts.append("<div class='search-note'>Ieško antraštėse, santraukose, emitente, kategorijoje ir raktiniuose žodžiuose. Paieška toleruoja lietuviškas galūnes.</div>")
-    parts.append("<div class='filter-controls'><button class='toggle-btn' onclick='clearKeywordSearch()'>Išvalyti paiešką</button></div>")
-    parts.append("</div>")
-
-    parts.append("<div style='margin-top:12px'><strong>Filtruoti pagal kategorijas</strong>")
-    parts.append("<div class='small'>Pasirinkite kategorijas — rodys tik pažymėtas.</div>")
-    parts.append("<div class='filter-controls'><button id='cat_select_all_btn' class='toggle-btn' onclick='toggleSelectAllCats()'>Atžymėti viską</button></div>")
-    parts.append("<div style='max-height:220px;overflow:auto;margin-top:8px' class='cat-filter'>")
-
+    parts.append("<section class='toolbar'><div class='toolbar-grid'>")
+    parts.append("<div class='field'><label>Paieška pagal žodį ar frazę</label><input id='q' oninput='applyFilters()' placeholder='Pvz. teism, teisminis, dividendai, vadovo, obligacijų...' autocomplete='off'></div>")
+    parts.append("<div class='field'><label>Emitentas</label><select id='issuerFilter' onchange='applyFilters()'><option value=''>Visi emitentai</option>")
+    for issuer in issuer_order:
+        parts.append(f"<option value='{html_lib.escape(str(issuer), quote=True)}'>{html_lib.escape(str(issuer))}</option>")
+    parts.append("</select></div>")
+    parts.append("<div class='field'><label>Kategorija</label><select id='catFilter' onchange='applyFilters()'><option value=''>Visos kategorijos</option>")
     for cat in all_categories:
-        v = html_lib.escape(cat)
-        v_lower = html_lib.escape(cat.lower())
-        parts.append(
-            f"<div class='cat-checkbox'>"
-            f"<label><input type='checkbox' value='{v_lower}' checked/> "
-            f"<span style='margin-left:6px'>{v}</span></label></div>"
-        )
+        parts.append(f"<option value='{html_lib.escape(cat, quote=True)}'>{html_lib.escape(cat)}</option>")
+    parts.append("</select></div>")
+    parts.append("<div class='buttons'><button class='btn secondary' onclick='resetFilters()'>Išvalyti</button><button class='btn secondary' onclick='toggleCompact()'>Kompaktiškai</button></div>")
+    parts.append("</div><div class='chipbar'><button class='chip active' data-view='cards' onclick=\"setView('cards')\">Kortelės</button><button class='chip' data-view='table' onclick=\"setView('table')\">Lentelė</button><span class='hint'>Paieška tikrina antraštę, santrauką, emitentą, kategorijas ir raktinius žodžius. Pvz., įvedus <b>teism</b>, ras ir „teismo“, „teismui“, „teisminis“ tipo atitikmenis pagal kamieną.</span></div></section>")
 
-    parts.append("</div></div>")
-
-    parts.append("<ul style='margin-top:10px'>")
-
+    parts.append("<div class='layout'><aside class='side'><h3>Emitentai</h3>")
     for issuer in issuer_order:
-        safe = slugify(issuer)
-        cnt = int((df["issuer"] == issuer).sum())
+        cnt = int((df_tmp['issuer'].fillna('Unknown').astype(str) == str(issuer)).sum())
+        parts.append(f"<a class='issuer-link' data-issuer='{html_lib.escape(str(issuer), quote=True)}' href='javascript:void(0)' onclick=\"goIssuer('{html_lib.escape(str(issuer), quote=True)}')\"><span>{html_lib.escape(str(issuer))}</span><span class='count'>{cnt}</span></a>")
+    parts.append("</aside><main class='content'>")
+    parts.append("<div class='section-title'>Kortelių vaizdas</div><section class='cards'>")
 
-        parts.append(
-            f"<li data-issuer='{html_lib.escape(issuer.lower())}'>"
-            f"<a href='javascript:void(0)' onclick=\"scrollToId('{safe}')\">"
-            f"{html_lib.escape(issuer)} <span class='badge'>{cnt}</span></a></li>"
-        )
-
-    parts.append("</ul></aside>")
-
-    parts.append("<main class='content'>")
-    parts.append(
-        f"<div class='summary-card'><strong>Įrašų skaičius:</strong> "
-        f"<strong>{len(df)}</strong> | <strong>Rodoma:</strong> "
-        f"<strong id='visible_count'>{len(df)}</strong></div>"
-    )
-
-    for issuer in issuer_order:
-        issuer_rows = df[df["issuer"] == issuer].copy()
-        issuer_rows["date_parsed"] = parse_dates_safe(issuer_rows["date"])
-        issuer_rows = issuer_rows.sort_values(
-            by=["date_parsed", "orig_order"],
-            ascending=[False, True],
-        )
-
-        safe = slugify(issuer)
-
-        parts.append(f"<section id='{safe}' class='issuer-card'>")
-        parts.append("<div class='issuer-header'>")
-        parts.append(
-            f"<div><div class='issuer-title'>{html_lib.escape(issuer)}</div>"
-            f"<div class='small'>{len(issuer_rows)} įrašai</div></div>"
-        )
-        parts.append(
-            f"<div class='controls'>"
-            f"<button class='toggle-btn' data-toggle='#ct_{safe}'>Rodyti</button>"
-            f"</div>"
-        )
-        parts.append("</div>")
-        parts.append(f"<div id='ct_{safe}' class='collapsible'>")
-
-        cat_map = defaultdict(list)
-
-        for _, r in issuer_rows.iterrows():
-            cats = r.get("categories") or ["Kiti"]
-
-            for c in cats:
-                cat_map[c].append(r)
-
-        display_order = CATEGORY_ORDER + [
-            c for c in sorted(cat_map.keys())
-            if c not in CATEGORY_ORDER
-        ]
-
-        for cat in display_order:
-            rows = cat_map.get(cat, [])
-
-            if not rows:
-                continue
-
-            parts.append(
-                f"<div class='cat-block'>"
-                f"<div class='cat-title'>{html_lib.escape(cat)} "
-                f"<span class='small'>({len(rows)})</span></div>"
-            )
-
-            parts.append(
-                "<table>"
-                "<thead><tr>"
-                "<th class='date-col'>Data</th>"
-                "<th class='title-col'>Antraštė / nuoroda</th>"
-                "<th>Santrauka</th>"
-                "</tr></thead><tbody>"
-            )
-
-            for r in rows:
-                date_raw = r.get("date", "")
-                dt = pd.to_datetime(date_raw, errors="coerce")
-
-                if pd.notna(dt):
-                    date_fmt = dt.strftime("%Y-%m-%d %H:%M")
-                else:
-                    date_fmt = str(date_raw)
-
-                title_raw = r.get("title", "")
-                url = r.get("url", "")
-                summary_raw = r.get("summary", "")
-
-                category_from_html = (r.get("category_src") or "").strip()
-                cats_assigned = r.get("categories") or []
-
-                if isinstance(cats_assigned, str):
-                    cats_assigned = [cats_assigned]
-
-                assigned_display = ", ".join(cats_assigned) if cats_assigned else ""
-                cat_display = category_from_html if category_from_html else assigned_display
-
-                if not cat_display:
-                    cat_display = "Kiti"
-
-                cats_for_attr = set()
-
-                if category_from_html:
-                    cats_for_attr.add(category_from_html.strip().lower())
-
-                for cc in cats_assigned:
-                    cats_for_attr.add(str(cc).strip().lower())
-
-                if not cats_for_attr:
-                    cats_for_attr.add("kiti")
-
-                cats_attr = ";".join(sorted([
-                    html_lib.escape(c)
-                    for c in cats_for_attr
-                ]))
-
-                title_html = highlight_keywords(title_raw)
-                summary_html = highlight_keywords(summary_raw)
-
-                if url:
-                    url_escaped = html_lib.escape(str(url))
-                    link_html = (
-                        f"<a href='{url_escaped}' target='_blank' rel='noreferrer'>"
-                        f"{title_html or url_escaped}</a>"
-                    )
-                else:
-                    link_html = title_html or ""
-
-                link_html = (
-                    f"{link_html}"
-                    f"<div class='small' style='margin-top:6px'>"
-                    f"{html_lib.escape(cat_display)}</div>"
-                )
-
-                search_text = " ".join([
-                    str(date_fmt),
-                    str(r.get("issuer", "")),
-                    str(title_raw),
-                    str(summary_raw),
-                    str(cat_display),
-                    str(r.get("matched_keywords", "")),
-                    str(r.get("type", "")),
-                ])
-                search_attr = html_lib.escape(search_text, quote=True)
-
-                parts.append(
-                    f"<tr data-cats='{cats_attr}' data-search='{search_attr}'>"
-                    f"<td class='date-col'>{html_lib.escape(date_fmt)}</td>"
-                    f"<td class='title-col'>{link_html}</td>"
-                    f"<td>{highlight_keywords(summary_raw)}</td>"
-                    f"</tr>"
-                )
-
-            parts.append("</tbody></table>")
-            parts.append("</div>")
-
-        parts.append("</div>")
-        parts.append("</section>")
-
+    table_rows = []
+    for i, r in df_tmp.iterrows():
+        rid = f"row_{i}"
+        issuer = str(r.get('issuer','Unknown') or 'Unknown')
+        date_raw = r.get('date','')
+        dt = pd.to_datetime(date_raw, errors='coerce')
+        date_fmt = dt.strftime('%Y-%m-%d %H:%M') if pd.notna(dt) else str(date_raw)
+        title_raw = str(r.get('title','') or '')
+        summary_raw = str(r.get('summary','') or '')
+        url = str(r.get('url','') or '').strip()
+        typ = str(r.get('type','') or '').strip()
+        cats = row_categories(r)
+        matched = str(r.get('matched_keywords','') or '').strip()
+        title_html = highlight_keywords(title_raw)
+        summary_html = highlight_keywords(summary_raw)
+        matched_html = highlight_keywords(matched)
+        badges = ''.join(f"<span class='badge'>{html_lib.escape(c)}</span>" for c in cats)
+        if typ:
+            badges += f"<span class='badge type'>{html_lib.escape(typ)}</span>"
+        title_block = f"<a href='{html_lib.escape(url, quote=True)}' target='_blank' rel='noreferrer'>{title_html}</a>" if url else title_html
+        source = f"<div class='source'><a href='{html_lib.escape(url, quote=True)}' target='_blank' rel='noreferrer'>Atidaryti šaltinį ↗</a></div>" if url else ""
+        keywords = f"<div class='keywords'><b>Raktiniai žodžiai:</b> {matched_html}</div>" if matched else ""
+        parts.append(f"""
+        <article class='card' data-row='{rid}'>
+          <div class='card-top'><div><div class='issuer'>{html_lib.escape(issuer)}</div><div class='badges'>{badges}</div></div><div class='date'>{html_lib.escape(date_fmt)}</div></div>
+          <div class='title'>{title_block}</div>
+          <div class='summary'>{summary_html}</div>
+          {keywords}{source}
+        </article>
+        """)
+        table_rows.append(f"""
+        <tr data-row='{rid}'>
+          <td>{html_lib.escape(date_fmt)}</td><td>{html_lib.escape(issuer)}</td><td>{badges}</td>
+          <td><b>{title_block}</b></td><td class='summary-cell'>{summary_html}{keywords}</td>
+        </tr>
+        """)
+    parts.append("</section><div id='noResults' class='no-results'>Pagal pasirinktą paiešką ir filtrus įrašų nerasta.</div>")
+    parts.append("<section class='table-wrap'><table class='table-view'><thead><tr><th>Data</th><th>Emitentas</th><th>Kategorijos</th><th>Antraštė</th><th>Santrauka / raktiniai žodžiai</th></tr></thead><tbody>")
+    parts.extend(table_rows)
+    parts.append("</tbody></table></section>")
     parts.append("</main></div></div>")
     parts.append(f"<script>{js}</script></body></html>")
-
     return "\n".join(parts)
 
 
@@ -964,10 +682,77 @@ def render_emitentu_atranka_page(default_days: int = 30):
 
     st.success(f"Rasta įrašų: {len(result['df'])}")
 
-    tab_html, tab_export = st.tabs([
+    tab_table, tab_html, tab_export = st.tabs([
+        "📋 Interaktyvi lentelė",
         "🌐 HTML peržiūra",
         "⬇️ Atsisiuntimas",
     ])
+
+    with tab_table:
+        df_view = prepare_streamlit_view_df(result["df"])
+
+        if df_view.empty:
+            st.info("Pasirinktu laikotarpiu įrašų nerasta.")
+        else:
+            st.markdown("#### Paieška ir filtrai")
+
+            search = st.text_input(
+                "Paieškos žodis",
+                placeholder="Pvz. teism, dividendai, vadovas, nuostoliai, obligacijos...",
+                key="crib_cls_search",
+            )
+
+            filter_col1, filter_col2 = st.columns(2)
+
+            with filter_col1:
+                issuers = sorted(df_view["emitentas"].dropna().unique().tolist())
+
+                selected_issuers = st.multiselect(
+                    "Emitentai",
+                    options=issuers,
+                    default=[],
+                    key="crib_cls_issuers_filter",
+                )
+
+            with filter_col2:
+                all_categories = sorted({
+                    cat.strip()
+                    for value in df_view["kategorijos"].dropna().astype(str)
+                    for cat in value.split(",")
+                    if cat.strip()
+                })
+
+                selected_categories = st.multiselect(
+                    "Kategorijos",
+                    options=all_categories,
+                    default=[],
+                    key="crib_cls_categories_filter",
+                )
+
+            filtered = filter_streamlit_df(
+                df_view=df_view,
+                search=search,
+                selected_issuers=selected_issuers,
+                selected_categories=selected_categories,
+            )
+
+            st.caption(f"Rodoma įrašų: {len(filtered)} iš {len(df_view)}")
+
+            st.dataframe(
+                filtered,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "data": st.column_config.TextColumn("Data", width="small"),
+                    "emitentas": st.column_config.TextColumn("Emitentas", width="medium"),
+                    "kategorijos": st.column_config.TextColumn("Kategorijos", width="medium"),
+                    "tipas": st.column_config.TextColumn("Tipas", width="medium"),
+                    "antraste": st.column_config.TextColumn("Antraštė", width="large"),
+                    "santrauka": st.column_config.TextColumn("Santrauka", width="large"),
+                    "raktazodziai": st.column_config.TextColumn("Raktažodžiai", width="medium"),
+                    "nuoroda": st.column_config.LinkColumn("Nuoroda"),
+                },
+            )
 
     with tab_html:
         components.html(
