@@ -793,3 +793,187 @@ if __name__ == "__main__":
 
     print(f"Išsaugota: {out.resolve()}")
     print(f"Įrašų skaičius: {len(res['df'])}")
+# ============================================================
+# STREAMLIT PATOGUS HTML VAIZDAS BE JAVASCRIPT
+# ============================================================
+
+def _strip_lt_ending_for_search(token: str) -> str:
+    token = norm_text(token).lower()
+    if len(token) <= 4:
+        return token
+    endings = sorted(set(_LIT_ENDINGS + [
+        'ė','ą','ę','į','ės','io','ių','iu','iais','omis','uose','ėje','imas','imo','imui','imu','imai','imų'
+    ]), key=len, reverse=True)
+    for ending in endings:
+        if ending and token.endswith(ending) and len(token) - len(ending) >= 4:
+            return token[:-len(ending)]
+    return token
+
+
+def _query_matches_text(query: str, text: str) -> bool:
+    query = norm_text(query).lower()
+    if not query:
+        return True
+    text = norm_text(text).lower()
+    words = [w for w in re.split(r"\s+", query) if w]
+    for word in words:
+        stem = re.escape(_strip_lt_ending_for_search(word))
+        if not re.search(stem + r"[a-ząčęėįšųūž]*", text, flags=re.I | re.U):
+            return False
+    return True
+
+
+def filter_emitentu_html_df(
+    df: pd.DataFrame,
+    search: str = '',
+    selected_issuers: Optional[list] = None,
+    selected_categories: Optional[list] = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if selected_issuers:
+        out = out[out['issuer'].astype(str).isin(selected_issuers)]
+    if selected_categories:
+        def has_cat(row):
+            cats = row.get('categories') or []
+            if isinstance(cats, str):
+                cats = [cats]
+            src = str(row.get('category_src', '') or '')
+            all_cats = set(str(c) for c in cats)
+            if src:
+                all_cats.add(src)
+            return any(c in all_cats for c in selected_categories)
+        out = out[out.apply(has_cat, axis=1)]
+    if search and search.strip():
+        def row_text(row):
+            cats = row.get('categories') or []
+            if isinstance(cats, (list, tuple)):
+                cats_txt = ' '.join(map(str, cats))
+            else:
+                cats_txt = str(cats)
+            return ' '.join([
+                str(row.get('date','') or ''),
+                str(row.get('issuer','') or ''),
+                str(row.get('type','') or ''),
+                str(row.get('title','') or ''),
+                str(row.get('summary','') or ''),
+                str(row.get('matched_keywords','') or ''),
+                cats_txt,
+            ])
+        out = out[out.apply(lambda r: _query_matches_text(search, row_text(r)), axis=1)]
+    if 'date_parsed' not in out.columns:
+        out['date_parsed'] = parse_dates_safe(out['date'])
+    return out.sort_values(['date_parsed', 'orig_order'], ascending=[False, True])
+
+
+def build_streamlit_emitentu_html(
+    df: pd.DataFrame,
+    title: str = 'Emitentų atranka',
+    view_mode: str = 'Kortelės',
+    compact: bool = False,
+) -> str:
+    if df is None or df.empty:
+        return """
+        <div class='emit-report'><div class='empty'>Pagal pasirinktus filtrus įrašų nerasta.</div></div>
+        """
+
+    df_tmp = df.copy()
+    if 'date_parsed' not in df_tmp.columns:
+        df_tmp['date_parsed'] = parse_dates_safe(df_tmp['date'])
+    df_tmp = df_tmp.sort_values(['date_parsed', 'orig_order'], ascending=[False, True])
+
+    css = f"""
+    <style>
+    .emit-report {{width:100%; max-width:none; margin:0; padding:0 0 28px 0; font-family:Inter, Segoe UI, Arial, sans-serif; color:#111827;}}
+    .emit-hero {{background:linear-gradient(135deg,#ffffff 0%,#eef8ff 58%,#dbeeff 100%); border:1px solid #d7e8f7; border-radius:22px; padding:18px 20px; margin:10px 0 14px; box-shadow:0 14px 34px rgba(15,23,42,.08); display:flex; justify-content:space-between; gap:16px; align-items:flex-start;}}
+    .emit-hero h2 {{margin:0; color:#06243d; font-size:25px; line-height:1.15;}}
+    .emit-meta {{margin-top:7px; color:#64748b; font-size:13px; line-height:1.45;}}
+    .emit-stats {{display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end;}}
+    .emit-stat {{background:#fff; border:1px solid #e5edf6; border-radius:15px; padding:10px 14px; min-width:100px;}}
+    .emit-stat b {{font-size:22px; color:#06243d;}}
+    .emit-stat span {{display:block; color:#64748b; font-size:12px; margin-top:2px;}}
+    .emit-cards {{display:grid; grid-template-columns:repeat(auto-fit,minmax(370px,1fr)); gap:13px; width:100%;}}
+    .emit-card {{background:#fff; border:1px solid #e5edf6; border-radius:18px; box-shadow:0 12px 28px rgba(15,23,42,.07); padding:14px; display:flex; flex-direction:column; gap:10px; min-width:0;}}
+    .emit-card-top {{display:flex; justify-content:space-between; gap:10px; align-items:flex-start;}}
+    .emit-issuer {{font-weight:950; color:#06243d; font-size:16px; line-height:1.25;}}
+    .emit-date {{white-space:nowrap; color:#64748b; font-size:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:999px; padding:5px 8px;}}
+    .emit-badges {{display:flex; gap:6px; flex-wrap:wrap; margin-top:7px;}}
+    .emit-badge {{background:#eef7ff; color:#075985; border:1px solid #cde5f8; border-radius:999px; padding:4px 8px; font-size:11px; font-weight:800;}}
+    .emit-badge.type {{background:#f8fafc; color:#475569; border-color:#e2e8f0;}}
+    .emit-title {{font-size:15px; font-weight:900; line-height:1.38;}}
+    .emit-summary {{font-size:14px; line-height:1.58; color:#1f2937; white-space:pre-wrap; overflow-wrap:anywhere;}}
+    .emit-keywords {{font-size:12px; line-height:1.45; color:#475569; background:#fff7ed; border:1px solid #fed7aa; border-radius:12px; padding:8px;}}
+    .emit-source {{margin-top:auto; font-size:12px;}}
+    .kw {{color:#c1121f; font-weight:950; background:#ffe4e6; border-radius:4px; padding:0 2px;}}
+    .emit-table-wrap {{background:#fff; border:1px solid #e5edf6; border-radius:18px; box-shadow:0 12px 28px rgba(15,23,42,.07); width:100%; overflow-x:auto;}}
+    .emit-table {{width:100%; border-collapse:collapse; table-layout:fixed; min-width:980px;}}
+    .emit-table th {{position:sticky; top:0; background:#06243d; color:#fff; text-align:left; padding:10px; font-size:12px; z-index:2;}}
+    .emit-table td {{border-bottom:1px solid #eef2f7; padding:10px; vertical-align:top; font-size:13px; line-height:1.52; overflow-wrap:anywhere;}}
+    .emit-table th:nth-child(1), .emit-table td:nth-child(1) {{width:120px;}}
+    .emit-table th:nth-child(2), .emit-table td:nth-child(2) {{width:170px;}}
+    .emit-table th:nth-child(3), .emit-table td:nth-child(3) {{width:160px;}}
+    .emit-table th:nth-child(4), .emit-table td:nth-child(4) {{width:26%;}}
+    .empty {{background:#fff; border:1px dashed #cbd5e1; border-radius:18px; padding:28px; color:#64748b; text-align:center;}}
+    {'.emit-summary{display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;}' if compact else ''}
+    @media(max-width:760px) {{.emit-hero{{flex-direction:column}} .emit-stats{{justify-content:flex-start}} .emit-cards{{grid-template-columns:1fr}}}}
+    </style>
+    """
+
+    parts = [css, "<div class='emit-report'>"]
+    issuers_count = int(df_tmp['issuer'].nunique()) if 'issuer' in df_tmp.columns else 0
+    parts.append("<section class='emit-hero'>")
+    parts.append(f"<div><h2>{html_lib.escape(title)}</h2><div class='emit-meta'>Rodomi pilni tekstai, raudonai pažymėti raktiniai žodžiai. Filtrai ir paieška vykdomi Streamlit valdikliais virš ataskaitos, todėl mygtukai patikimai veikia ir be JavaScript.</div></div>")
+    parts.append("<div class='emit-stats'>")
+    parts.append(f"<div class='emit-stat'><b>{len(df_tmp)}</b><span>įrašų</span></div>")
+    parts.append(f"<div class='emit-stat'><b>{issuers_count}</b><span>emitentų</span></div>")
+    parts.append("</div></section>")
+
+    def row_common(r):
+        issuer = str(r.get('issuer','Unknown') or 'Unknown')
+        dt = r.get('date_parsed')
+        if pd.notna(dt):
+            date_fmt = pd.to_datetime(dt).strftime('%Y-%m-%d %H:%M')
+        else:
+            date_fmt = str(r.get('date','') or '')
+        cats = r.get('categories') or []
+        if isinstance(cats, str):
+            cats = [cats]
+        typ = str(r.get('type','') or '').strip()
+        title_raw = str(r.get('title','') or '')
+        summary_raw = str(r.get('summary','') or '')
+        url = str(r.get('url','') or '').strip()
+        matched = str(r.get('matched_keywords','') or '')
+        badges = ''.join(f"<span class='emit-badge'>{html_lib.escape(str(c))}</span>" for c in cats if str(c).strip())
+        if typ:
+            badges += f"<span class='emit-badge type'>{html_lib.escape(typ)}</span>"
+        title_html = highlight_keywords(title_raw)
+        if url:
+            title_html = f"<a href='{html_lib.escape(url, quote=True)}' target='_blank' rel='noreferrer'>{title_html or html_lib.escape(url)}</a>"
+        return issuer, date_fmt, badges, typ, title_html, summary_raw, matched, url
+
+    if view_mode == 'Lentelė':
+        parts.append("<div class='emit-table-wrap'><table class='emit-table'><thead><tr><th>Data</th><th>Emitentas</th><th>Kategorijos</th><th>Antraštė / nuoroda</th><th>Santrauka</th></tr></thead><tbody>")
+        for _, r in df_tmp.iterrows():
+            issuer, date_fmt, badges, typ, title_html, summary_raw, matched, url = row_common(r)
+            parts.append("<tr>")
+            parts.append(f"<td>{html_lib.escape(date_fmt)}</td><td><b>{html_lib.escape(issuer)}</b></td><td>{badges}</td><td>{title_html}</td><td>{highlight_keywords(summary_raw)}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table></div>")
+    else:
+        parts.append("<section class='emit-cards'>")
+        for _, r in df_tmp.iterrows():
+            issuer, date_fmt, badges, typ, title_html, summary_raw, matched, url = row_common(r)
+            parts.append("<article class='emit-card'>")
+            parts.append(f"<div class='emit-card-top'><div><div class='emit-issuer'>{html_lib.escape(issuer)}</div><div class='emit-badges'>{badges}</div></div><div class='emit-date'>{html_lib.escape(date_fmt)}</div></div>")
+            parts.append(f"<div class='emit-title'>{title_html}</div>")
+            parts.append(f"<div class='emit-summary'>{highlight_keywords(summary_raw)}</div>")
+            if matched:
+                parts.append(f"<div class='emit-keywords'><b>Raktiniai žodžiai:</b> {highlight_keywords(matched)}</div>")
+            if url:
+                parts.append(f"<div class='emit-source'><a href='{html_lib.escape(url, quote=True)}' target='_blank' rel='noreferrer'>Atidaryti šaltinį</a></div>")
+            parts.append("</article>")
+        parts.append("</section>")
+
+    parts.append("</div>")
+    return '\n'.join(parts)
