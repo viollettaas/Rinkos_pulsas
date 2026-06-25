@@ -75,6 +75,25 @@ section[data-testid="stSidebar"] {
     max-width: 350px !important;
 }
 section[data-testid="stSidebar"] * { color: #ffffff; }
+
+/* Date input laukai sidebar'e: tekstas turi būti matomas vedant laikotarpį */
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
+    color: #061b34 !important;
+    background: #ffffff !important;
+    caret-color: #061b34 !important;
+    -webkit-text-fill-color: #061b34 !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
+    color: #6b7280 !important;
+    -webkit-text-fill-color: #6b7280 !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] svg {
+    color: #061b34 !important;
+    fill: #061b34 !important;
+}
+
 .sidebar-card {
     background: rgba(255,255,255,0.055);
     border: 1px solid rgba(157, 190, 230, 0.28);
