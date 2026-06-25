@@ -1,685 +1,409 @@
+# -*- coding: utf-8 -*-
+
+from datetime import date
 import re
 import html as html_lib
-from collections import defaultdict
-from datetime import datetime, date, timedelta
-from pathlib import Path
-from typing import Optional
-
 import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
 
-from supabase_cache import load_news_df
+from rinkos_logika import generate_report, download_nasdaq_statistics_excel
+from emitentu_atranka import generate_emitentu_ataskaita
+from crib_update import update_crib_news, get_latest_crib_news_date
+from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
+from vz_update import update_vz_news_fast
+
+try:
+    from manager_transactions_update import update_manager_transactions_from_recent_crib
+except Exception:
+    update_manager_transactions_from_recent_crib = None
+
+try:
+    from vadovu_sandoriai import show_manager_transactions_page
+except Exception:
+    show_manager_transactions_page = None
+
+
+st.set_page_config(
+    page_title="Rinkos pulsas",
+    page_icon="🏦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
 # ============================================================
-# KATEGORIJOS IR RAKTAZODZIAI
+# SESSION STATE
 # ============================================================
 
-_LIT_ENDINGS = [
-    "as", "is", "us", "ys", "a", "o", "ui", "ų", "e", "ei", "em", "ame", "ais",
-    "ose", "oje", "os", "om", "ųją", "ai", "iu", "čia", "čią", "",
-]
+if "report_result" not in st.session_state:
+    st.session_state.report_result = None
+
+if "report_filename" not in st.session_state:
+    st.session_state.report_filename = None
+
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 1
+
+if "uploaded_file_cache" not in st.session_state:
+    st.session_state.uploaded_file_cache = None
+
+if "emitentu_result" not in st.session_state:
+    st.session_state.emitentu_result = None
+
+if "emitentu_dates" not in st.session_state:
+    st.session_state.emitentu_dates = None
+
+if "news_update_message" not in st.session_state:
+    st.session_state.news_update_message = None
 
 
-def inflect_pattern(stem: str) -> str:
-    if any(ch in stem for ch in r".^$*+?{}[]\|()"):
-        return stem
+# ============================================================
+# CSS
+# ============================================================
 
-    esc_stem = re.escape(stem)
-    nonempty = [re.escape(e) for e in sorted(set(_LIT_ENDINGS)) if e]
-    group = "|".join(nonempty)
+CSS = """
+<style>
+.stApp { background: #ffffff; }
+.block-container {
+    padding-top: 1.2rem;
+    padding-left: 2rem;
+    padding-right: 2rem;
+    max-width: 100% !important;
+}
+section[data-testid="stSidebar"] {
+    background: radial-gradient(circle at top left, #0c356b 0%, #061d3a 35%, #03162d 100%) !important;
+    min-width: 350px !important;
+    max-width: 350px !important;
+}
+section[data-testid="stSidebar"] * { color: #ffffff; }
 
-    if group:
-        return rf"\b{esc_stem}(?:{group})?\b"
-
-    return rf"\b{esc_stem}\b"
-
-
-RAW_CATEGORIES = {
-    "Teismo_procesai": [
-        "teism", "byl", "ieškin", "skund", "apeliac", "nutartis", "sprendim", "priteis",
-        r"teism(?:o|ui|e|ą).*ieškin", r"prašymas.*teism", r"civilin(?:ė|is).*byl",
-    ],
-    "Verslo_jungimai_ir_pardavimai": [
-        "įsigij", "įsigy", "pirk", "pardav", "sandor", "susijung", "perleid", "kontrolin",
-        "akcijų pirk", r"\b(spin[- ]?off|M&A|merger|acquisit)\b", r"perleidim.*akcij",
-        r"pardavim.*versl",
-    ],
-    "Restruktūrizavimas": [
-        "restruktūriz", "refinans", "bankrot", "likvidav", "skol",
-        r"restruktūrizavimo plan", r"creditor.*agreement",
-    ],
-    "Finansiniai_signalai": [
-        "nuostol", "grynasis peln", "peln", "EBITDA", "EBIT", "pajam", "sumažėj",
-        "rekord", "smuk", "nuosmuk", "write[- ]?off", "impairment", "likvidum", "profit warning",
-        r"prognoz.*(sumaž|sumažėj)", r"rezultat.*pablog",
-    ],
-    "Apskaitos_politikos_keitimas": [
-        "apskaitos politika", "apskaitos pakeit", "perklasifikav", "restatement", "koregavim",
-        "finansin.*koreg", r"ankstesni.*koregavim",
-    ],
-    "Valdymo_pokyciai": [
-        "generalin", "direktori", "finansų direktori", "CEO", "CFO", "vadov",
-        "atsistatydin", "atleid", "paskirt", "valdyb", "stebėtoj", "laikinas vadov", r"prieš kadenc",
-    ],
-    "Audito_nutraukimas": [
-        "audito sutart", "audito įmon", "auditor", "nutrauk", "atsisak",
-        "neigiama auditoriaus", "sąlyginė nuomon", r"audito pakeit",
-    ],
-    "Kiti": [
-        "dividend", "akcijų išpirk", "emisij", "obligacij", "kredito linij", "garantij", "covenant",
-    ],
+/* Date input laukai sidebar'e: tekstas turi būti matomas vedant laikotarpį */
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
+    color: #061b34 !important;
+    background: #ffffff !important;
+    caret-color: #061b34 !important;
+    -webkit-text-fill-color: #061b34 !important;
 }
 
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
+    color: #6b7280 !important;
+    -webkit-text-fill-color: #6b7280 !important;
+}
 
-COMPILED = {}
+section[data-testid="stSidebar"] [data-testid="stDateInput"] svg {
+    color: #061b34 !important;
+    fill: #061b34 !important;
+}
 
-for cat, tokens in RAW_CATEGORIES.items():
-    compiled_list = []
+.sidebar-card {
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(157, 190, 230, 0.28);
+    border-radius: 17px;
+    padding: 20px 16px;
+    box-shadow: 0 18px 45px rgba(0,0,0,0.24);
+    margin-bottom: 22px;
+}
+.sidebar-card-title {
+    font-size: 16px;
+    font-weight: 900;
+    margin-bottom: 10px;
+}
+.sidebar-card-subtitle {
+    color: #b8c9df !important;
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+.sidebar-section-title {
+    font-size: 16px;
+    font-weight: 950;
+    margin: 16px 0 8px 0;
+}
+.sidebar-section-subtitle {
+    color: #b8c9df !important;
+    font-size: 13px;
+    line-height: 1.45;
+    margin: 0 0 12px 0;
+}
+.status-ok {
+    color: #23d996 !important;
+    font-weight: 800;
+    margin-top: 12px;
+    font-size: 13px;
+}
+.status-empty {
+    color: #c1cee0 !important;
+    font-weight: 700;
+    margin-top: 12px;
+    font-size: 13px;
+}
+.latest-news-date {
+    margin-top: 12px;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(157,190,230,0.22);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #cfe2ff !important;
+    font-size: 13px;
+    font-weight: 700;
+}
+.latest-news-date span {
+    color: #ffffff !important;
+    font-weight: 900;
+}
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] button {
+    background: linear-gradient(135deg, #1478ff, #0066ff) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 12px !important;
+    height: 48px !important;
+    font-weight: 900 !important;
+}
+.hero-card {
+    background: linear-gradient(135deg, #ffffff 0%, #f2f8ff 52%, #dcecff 100%);
+    border: 1px solid #dbe7f5;
+    border-radius: 18px;
+    padding: 28px 32px;
+    min-height: 172px;
+    box-shadow: 0 8px 28px rgba(8, 44, 84, 0.08);
+}
+.hero-inner {
+    display: flex;
+    align-items: flex-start;
+    gap: 18px;
+}
+.hero-icon {
+    width: 58px;
+    height: 58px;
+    border-radius: 14px;
+    background: #e3efff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 30px;
+}
+.hero-title {
+    font-size: 36px;
+    line-height: 1.05;
+    font-weight: 950;
+    color: #071f3d;
+    margin: 0;
+}
+.hero-text {
+    color: #34435a;
+    margin-top: 8px;
+    font-size: 15px;
+    max-width: 760px;
+}
+.hero-download button {
+    background: #061b34 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    min-height: 52px !important;
+    font-weight: 900 !important;
+}
+.info-box {
+    background: #eaf3ff;
+    color: #0b3f77;
+    border: 1px solid #c9dff8;
+    border-radius: 14px;
+    padding: 18px 20px;
+    margin-top: 24px;
+    font-weight: 700;
+}
+.report-nav-title {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 25px;
+    font-weight: 950;
+    margin: 0 0 14px 0;
+}
+.report-nav-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: rgba(255,255,255,0.16);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 21px;
+}
+.report-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 18px;
+}
+.report-nav a { text-decoration: none !important; }
+.report-nav-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 56px;
+    padding: 0 18px;
+    border-radius: 16px;
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(157,190,230,0.26);
+    color: #ffffff !important;
+    font-weight: 900;
+    font-size: 16px;
+}
+.report-nav-item.active {
+    background: rgba(20,120,255,0.14);
+    border: 3px solid #68bdff;
+}
+.report-nav-item .nav-icon {
+    font-size: 24px;
+    width: 28px;
+    text-align: center;
+}
+.report-table-wrapper {
+    background: white;
+    border: 1px solid #dbe7f5;
+    border-radius: 16px;
+    padding: 14px;
+    margin-top: 16px;
+    box-shadow: 0 10px 28px rgba(8, 44, 84, 0.08);
+    overflow-x: auto;
+}
+.report-table-wrapper table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.report-table-wrapper th {
+    background: #061b34 !important;
+    color: white !important;
+    padding: 12px 10px !important;
+    font-size: 12px !important;
+    text-align: left !important;
+}
+.report-table-wrapper td {
+    padding: 10px !important;
+    font-size: 12px !important;
+    color: #102033 !important;
+    border-bottom: 1px solid #e7eef7 !important;
+}
 
-    for token in tokens:
-        if " " in token or any(ch in token for ch in r".^$*+?{}[]\|()"):
-            try:
-                compiled_list.append(re.compile(token, flags=re.I | re.U))
-            except re.error:
-                compiled_list.append(re.compile(re.escape(token), flags=re.I | re.U))
-        else:
-            compiled_list.append(re.compile(inflect_pattern(token), flags=re.I | re.U))
+/* Emitentų atrankos kortelės: patogus HTML tipo atvaizdavimas */
+.emit-filter-help {
+    background: #eef6ff;
+    color: #0b3f77;
+    border: 1px solid #c9dff8;
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 700;
+    margin: 8px 0 14px 0;
+}
+.emit-card {
+    background: #ffffff;
+    border: 1px solid #dbe7f5;
+    border-radius: 16px;
+    padding: 16px 18px;
+    margin: 14px 0;
+    box-shadow: 0 8px 24px rgba(8, 44, 84, 0.07);
+}
+.emit-card-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+}
+.emit-issuer {
+    font-size: 18px;
+    font-weight: 950;
+    color: #061b34;
+}
+.emit-date {
+    color: #5f6f83;
+    font-size: 13px;
+    font-weight: 800;
+    white-space: nowrap;
+}
+.emit-badges {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin: 8px 0 10px 0;
+}
+.emit-badge {
+    background: #e9f3ff;
+    color: #0b3f77;
+    border: 1px solid #c9dff8;
+    border-radius: 999px;
+    padding: 4px 9px;
+    font-size: 12px;
+    font-weight: 850;
+}
+.emit-title {
+    color: #071f3d;
+    font-size: 16px;
+    font-weight: 900;
+    line-height: 1.35;
+    margin: 8px 0;
+}
+.emit-title a {
+    color: #075aa8 !important;
+    text-decoration: none !important;
+}
+.emit-title a:hover { text-decoration: underline !important; }
+.emit-summary {
+    color: #102033;
+    font-size: 14px;
+    line-height: 1.58;
+    white-space: pre-wrap;
+    margin-top: 8px;
+}
+.emit-keywords {
+    background: #fff7f7;
+    border-left: 4px solid #c00000;
+    color: #102033;
+    padding: 9px 11px;
+    border-radius: 10px;
+    margin-top: 12px;
+    font-size: 13px;
+    line-height: 1.45;
+}
+.emit-link {
+    margin-top: 12px;
+    font-size: 13px;
+    font-weight: 800;
+}
+.emit-link a { color: #075aa8 !important; }
+strong.kw {
+    color: #c00000 !important;
+    background: #ffe4e4;
+    border-radius: 4px;
+    padding: 0 3px;
+    font-weight: 950;
+}
 
-    COMPILED[cat] = compiled_list
+</style>
+"""
 
-
-CATEGORY_ORDER = list(RAW_CATEGORIES.keys())
+st.markdown(CSS, unsafe_allow_html=True)
 
 
 # ============================================================
 # PAGALBINĖS FUNKCIJOS
 # ============================================================
 
-def norm_text(s) -> str:
-    if s is None:
+def format_size(size_bytes: int) -> str:
+    if size_bytes is None:
         return ""
-    return re.sub(r"\s+", " ", str(s)).strip()
-
-
-def slugify(s) -> str:
-    s = str(s).strip().lower()
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^\w\-_\.]", "", s)
-    return s[:120] or "unknown"
-
-
-def parse_dates_safe(series: pd.Series) -> pd.Series:
-    parsed = pd.to_datetime(series, format="%Y-%m-%d %H:%M:%S", errors="coerce")
-
-    if parsed.isna().any():
-        rem_idx = parsed[parsed.isna()].index
-        if not rem_idx.empty:
-            remainder = series.loc[rem_idx]
-            parsed_remainder = pd.to_datetime(remainder, dayfirst=True, errors="coerce")
-            parsed.loc[parsed_remainder.index] = parsed_remainder
-
-    if parsed.isna().any():
-        rem_idx = parsed[parsed.isna()].index
-        if not rem_idx.empty:
-            remainder = series.loc[rem_idx]
-            parsed_remainder = pd.to_datetime(remainder, errors="coerce")
-            parsed.loc[parsed_remainder.index] = parsed_remainder
-
-    return parsed
-
-
-def score_categories(text: str) -> dict:
-    scores = defaultdict(int)
-
-    for cat, pats in COMPILED.items():
-        for pat in pats:
-            if pat.search(text or ""):
-                scores[cat] += 1
-
-    return scores
-
-
-def classify_row_text(text: str, allow_multiple: bool = True):
-    scores = score_categories(text)
-
-    if not scores:
-        return ["Kiti"]
-
-    max_score = max(scores.values()) if scores else 0
-
-    if max_score == 0:
-        return ["Kiti"]
-
-    winners = [cat for cat, sc in scores.items() if sc == max_score and sc > 0]
-
-    return winners if allow_multiple else (winners[:1] if winners else ["Kiti"])
-
-
-def highlight_keywords(text: str) -> str:
-    if not text:
-        return ""
-
-    escaped = html_lib.escape(str(text))
-
-    for pats in COMPILED.values():
-        for pat in pats:
-            try:
-                escaped = pat.sub(
-                    lambda m: f"<strong class='kw'>{m.group(0)}</strong>",
-                    escaped,
-                )
-            except re.error:
-                continue
-
-    return escaped
-
-
-def find_matched_keywords(text: str) -> str:
-    if not text:
-        return ""
-
-    found = []
-
-    for _, pats in COMPILED.items():
-        for pat in pats:
-            for m in pat.finditer(text):
-                val = norm_text(m.group(0))
-                existing = [x.lower() for x in found]
-
-                if val and val.lower() not in existing:
-                    found.append(val)
-
-    return ", ".join(found[:12])
-
-
-# ============================================================
-# SUPABASE -> ATASKAITOS DATAFRAME
-# ============================================================
-
-def load_crib_news_for_report(start_date: date, end_date: date) -> pd.DataFrame:
-    raw = load_news_df("crib", start_date, end_date)
-
-    if raw is None or raw.empty:
-        return pd.DataFrame(columns=[
-            "date", "issuer", "type", "category_src", "title", "url", "summary", "orig_order",
-        ])
-
-    df = raw.copy()
-
-    def col(name, default=""):
-        if name in df.columns:
-            return df[name]
-        return pd.Series([default] * len(df), index=df.index)
-
-    out = pd.DataFrame({
-        "date": col("published_at"),
-        "issuer": col("company", "Unknown"),
-        "type": col("category", ""),
-        "category_src": col("category", ""),
-        "title": col("title", ""),
-        "url": col("url", ""),
-        "summary": col("content", ""),
-    })
-
-    out["issuer"] = out["issuer"].fillna("Unknown").astype(str).replace({"": "Unknown"})
-    out["title"] = out["title"].fillna("").astype(str)
-    out["url"] = out["url"].fillna("").astype(str)
-    out["summary"] = out["summary"].fillna("").astype(str)
-    out["type"] = out["type"].fillna("").astype(str)
-    out["category_src"] = out["category_src"].fillna("").astype(str)
-
-    out["date_parsed"] = parse_dates_safe(out["date"])
-    out = out.sort_values("date_parsed", ascending=False).reset_index(drop=True)
-    out["orig_order"] = out.index
-
-    return out
-
-
-def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "date", "issuer", "type", "category_src", "title", "url", "summary",
-            "orig_order", "combined_text", "categories", "categories_str", "matched_keywords",
-        ])
-
-    df = df.copy().reset_index(drop=True)
-
-    df["title"] = df["title"].fillna("").astype(str)
-    df["summary"] = df["summary"].fillna("").astype(str)
-    df["type"] = df.get("type", "").fillna("").astype(str)
-    df["issuer"] = df["issuer"].fillna("Unknown").astype(str)
-    df["category_src"] = df.get("category_src", "").fillna("").astype(str)
-
-    if "orig_order" not in df.columns:
-        df["orig_order"] = df.index
-
-    df["combined_text"] = (
-        df["title"] + " " + df["summary"] + " " + df["type"] + " " + df["issuer"]
-    ).str.lower()
-
-    assigned = []
-    matched = []
-
-    for _, row in df.iterrows():
-        text = (
-            row["title"] + " " +
-            row["summary"] + " " +
-            row["type"] + " " +
-            row["issuer"]
-        ).lower()
-
-        cats = classify_row_text(text, allow_multiple=True)
-
-        assigned.append(cats)
-        matched.append(find_matched_keywords(text))
-
-    df["categories"] = assigned
-    df["categories_str"] = df["categories"].apply(
-        lambda x: ";".join(x) if isinstance(x, (list, tuple)) else str(x)
-    )
-    df["matched_keywords"] = matched
-
-    return df
-
-
-# ============================================================
-# HTML GENERAVIMAS
-# ============================================================
-
-def build_pretty_html(
-    df: pd.DataFrame,
-    title: str = "Emitentų atranka pagal CRIB naujienas",
-) -> str:
-    if df is None or df.empty:
-        return f"""
-        <!doctype html>
-        <html>
-        <head><meta charset='utf-8'></head>
-        <body style='font-family:Arial,sans-serif;padding:24px'>
-            <h2>{html_lib.escape(title)}</h2>
-            <p>Nurodytame laikotarpyje CRIB naujienų duomenų bazėje nerasta.</p>
-        </body>
-        </html>
-        """
-
-    cats_from_src = sorted({
-        c.strip()
-        for c in df["category_src"].unique()
-        if c and str(c).strip()
-    })
-
-    cats_assigned = set()
-
-    for row in df.get("categories", []):
-        if isinstance(row, (list, tuple)):
-            for c in row:
-                cats_assigned.add(str(c))
-        elif row:
-            cats_assigned.add(str(row))
-
-    cats_assigned = sorted(cats_assigned)
-    all_categories = sorted(set(cats_from_src + cats_assigned))
-
-    if not all_categories:
-        all_categories = CATEGORY_ORDER.copy()
-
-    df_tmp = df.copy()
-    df_tmp["date_parsed"] = parse_dates_safe(df_tmp["date"])
-
-    issuer_order = (
-        df_tmp.sort_values("date_parsed", ascending=False)["issuer"]
-        .drop_duplicates()
-        .tolist()
-    )
-
-    css = """
-    :root{
-      --bg:#f6f8fb; --card:#ffffff; --accent:#0b6ea8; --muted:#6b7680;
-      --danger:#b30000; --radius:12px; --glass: rgba(11,110,168,0.06);
-    }
-    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Arial,Helvetica,sans-serif;background:var(--bg);color:#111}
-    .container{max-width:1250px;margin:20px auto;padding:18px}
-    header{display:flex;align-items:center;justify-content:space-between;padding:12px 0}
-    header h1{margin:0;font-size:1.55rem;color:var(--accent)}
-    .meta{color:var(--muted);font-size:0.92rem}
-    .top{display:flex;gap:18px;align-items:flex-start}
-    .toc{width:330px;background:var(--card);padding:14px;border-radius:12px;box-shadow:0 6px 18px rgba(12,40,60,0.06);position:sticky;top:10px;max-height:92vh;overflow:auto}
-    .toc h3{margin:0 0 8px 0}
-    .toc input[type="text"]{width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid #e7eef6}
-    .toc ul{list-style:none;padding:8px 0;margin:10px 0;max-height:360px;overflow:auto}
-    .toc li{margin:6px 0}
-    .toc a{display:flex;justify-content:space-between;text-decoration:none;color:#0b4860;padding:6px 8px;border-radius:8px}
-    .toc a:hover{background:var(--glass)}
-    .content{flex:1;margin-left:8px;min-width:0}
-    .summary-card{background:linear-gradient(180deg,#fff,#fbfdff);padding:12px;border-radius:12px;box-shadow:0 6px 20px rgba(12,40,60,0.04);margin-bottom:12px}
-    .issuer-card{background:var(--card);padding:14px;margin-bottom:14px;border-radius:12px;box-shadow:0 6px 18px rgba(12,40,60,0.04)}
-    .issuer-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
-    .issuer-title{font-size:1.16rem;font-weight:800;color:#083b50}
-    .badge{background:var(--accent);color:white;padding:5px 9px;border-radius:999px;font-weight:600;font-size:0.82rem}
-    .cat-title{font-size:1rem;margin:10px 0 6px 0;color:#0b5575}
-    table{width:100%;border-collapse:collapse;margin-bottom:8px;table-layout:fixed}
-    th,td{padding:8px;border-bottom:1px solid #eef6fb;text-align:left;vertical-align:top;font-size:0.92rem;word-wrap:break-word}
-    th{background:#fbfdff;font-weight:700;color:#234}
-    th.date-col, td.date-col{width:125px}
-    th.title-col, td.title-col{width:40%}
-    .controls{display:flex;gap:8px;align-items:center}
-    .btn{background:var(--accent);color:white;padding:8px 10px;border-radius:8px;text-decoration:none;font-weight:600;cursor:pointer;border:none}
-    .small{font-size:0.84rem;color:var(--muted)}
-    .toggle-btn{background:#f3f7fb;border-radius:8px;padding:6px 8px;border:1px solid #e7eef6;cursor:pointer}
-    .collapsible{overflow:hidden;transition:max-height .25s ease-out}
-    strong.kw{font-weight:800;color:var(--danger)}
-    .filter-controls{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    .cat-checkbox{display:flex;align-items:center;gap:8px;padding:4px 0}
-    @media(max-width:900px){.top{flex-direction:column}.toc{width:auto;position:static}.content{margin-left:0;width:100%}}
-    @media print{.toc,.controls{display:none}.container{max-width:100%}.collapsible{max-height:none!important}}
-    """
-
-    js = """
-    function scrollToId(id){
-      document.querySelector('#'+id).scrollIntoView({behavior:'smooth',block:'start'});
-    }
-
-    function expandAll(){
-      document.querySelectorAll('.collapsible').forEach(div=>{
-        div.style.maxHeight = div.scrollHeight + 'px';
-      });
-      document.querySelectorAll('[data-toggle]').forEach(btn => btn.innerText = 'Slėpti');
-      let g = document.getElementById('global_toggle');
-      if(g) g.innerText = 'Slėpti visus';
-    }
-
-    function collapseAll(){
-      document.querySelectorAll('.collapsible').forEach(div=>{
-        div.style.maxHeight = '0px';
-      });
-      document.querySelectorAll('[data-toggle]').forEach(btn => btn.innerText = 'Rodyti');
-      let g = document.getElementById('global_toggle');
-      if(g) g.innerText = 'Rodyti visus';
-    }
-
-    function toggleAll(){
-      let anyClosed = false;
-      document.querySelectorAll('.collapsible').forEach(div=>{
-        if(!div.style.maxHeight || div.style.maxHeight === '0px') anyClosed = true;
-      });
-      if(anyClosed) expandAll(); else collapseAll();
-    }
-
-    document.addEventListener('click', function(e){
-      if(e.target.matches('[data-toggle]') || e.target.closest('[data-toggle]')){
-        let btn = e.target.closest('[data-toggle]');
-        let target = document.querySelector(btn.dataset.toggle);
-        if(!target) return;
-
-        if(target.style.maxHeight && target.style.maxHeight !== '0px'){
-          target.style.maxHeight = '0px';
-          btn.innerText = 'Rodyti';
-        } else {
-          target.style.maxHeight = target.scrollHeight + 'px';
-          btn.innerText = 'Slėpti';
-        }
-      }
-    });
-
-    function tocFilter(){
-      let q = document.getElementById('toc_search').value.trim().toLowerCase();
-
-      document.querySelectorAll('.toc li').forEach(li=>{
-        let txt = li.dataset.issuer || '';
-        li.style.display = txt.indexOf(q) !== -1 ? '' : 'none';
-      });
-    }
-
-    function getSelectedCategories(){
-      return Array.from(
-        document.querySelectorAll('.cat-filter input[type="checkbox"]:checked')
-      ).map(n=>n.value);
-    }
-
-    function filterByCategories(){
-      const selected = getSelectedCategories();
-      const rows = document.querySelectorAll('tr[data-cats]');
-
-      rows.forEach(row=>{
-        const cats = (row.dataset.cats || '')
-          .toLowerCase()
-          .split(';')
-          .map(x=>x.trim())
-          .filter(Boolean);
-
-        const keep = cats.some(c => selected.includes(c));
-        row.style.display = keep ? '' : 'none';
-      });
-
-      document.querySelectorAll('.issuer-card').forEach(card=>{
-        const trs = Array.from(card.querySelectorAll('tr[data-cats]'));
-        const anyVisible = trs.length ? trs.some(tr => tr.style.display !== 'none') : false;
-        card.style.display = anyVisible ? '' : 'none';
-      });
-    }
-
-    function toggleSelectAllCats(){
-      const inputs = Array.from(document.querySelectorAll('.cat-filter input[type="checkbox"]'));
-      const anyUnchecked = inputs.some(i=>!i.checked);
-      inputs.forEach(i=> i.checked = anyUnchecked);
-      filterByCategories();
-
-      const btn = document.getElementById('cat_select_all_btn');
-      if(btn) btn.innerText = anyUnchecked ? 'Atžymėti viską' : 'Pažymėti viską';
-    }
-
-    document.addEventListener('DOMContentLoaded', function(){
-      document.querySelectorAll('.collapsible').forEach(div => div.style.maxHeight = '0px');
-
-      let g = document.getElementById('global_toggle');
-      if(g) g.innerText = 'Rodyti visus';
-
-      document.querySelectorAll('.cat-filter input[type="checkbox"]').forEach(cb=>{
-        cb.addEventListener('change', filterByCategories);
-      });
-
-      filterByCategories();
-    });
-    """
-
-    parts = []
-    parts.append("<!doctype html>")
-    parts.append("<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>")
-    parts.append(f"<title>{html_lib.escape(title)}</title><style>{css}</style></head><body>")
-    parts.append("<div class='container'>")
-
-    parts.append("<header>")
-    parts.append("<div style='display:flex;flex-direction:column'>")
-    parts.append(f"<h1>{html_lib.escape(title)}</h1>")
-    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>")
-    parts.append("</div>")
-    parts.append("<div class='controls'><button id='global_toggle' class='btn' onclick='toggleAll()'>Rodyti visus</button></div>")
-    parts.append("</header>")
-
-    parts.append("<div class='top'>")
-    parts.append("<aside class='toc'>")
-    parts.append("<h3>Emitentų sąrašas</h3>")
-    parts.append("<input id='toc_search' placeholder='Ieškoti emitento...' oninput='tocFilter()' />")
-
-    parts.append("<div style='margin-top:12px'><strong>Filtruoti pagal kategorijas</strong>")
-    parts.append("<div class='small'>Pasirinkite kategorijas — rodys tik pažymėtas.</div>")
-    parts.append("<div class='filter-controls'><button id='cat_select_all_btn' class='toggle-btn' onclick='toggleSelectAllCats()'>Atžymėti viską</button></div>")
-    parts.append("<div style='max-height:220px;overflow:auto;margin-top:8px' class='cat-filter'>")
-
-    for cat in all_categories:
-        v = html_lib.escape(cat)
-        v_lower = html_lib.escape(cat.lower())
-        parts.append(
-            f"<div class='cat-checkbox'>"
-            f"<label><input type='checkbox' value='{v_lower}' checked/> "
-            f"<span style='margin-left:6px'>{v}</span></label></div>"
-        )
-
-    parts.append("</div></div>")
-
-    parts.append("<ul style='margin-top:10px'>")
-
-    for issuer in issuer_order:
-        safe = slugify(issuer)
-        cnt = int((df["issuer"] == issuer).sum())
-
-        parts.append(
-            f"<li data-issuer='{html_lib.escape(issuer.lower())}'>"
-            f"<a href='javascript:void(0)' onclick=\"scrollToId('{safe}')\">"
-            f"{html_lib.escape(issuer)} <span class='badge'>{cnt}</span></a></li>"
-        )
-
-    parts.append("</ul></aside>")
-
-    parts.append("<main class='content'>")
-    parts.append(
-        f"<div class='summary-card'><strong>Įrašų skaičius:</strong> "
-        f"<strong>{len(df)}</strong></div>"
-    )
-
-    for issuer in issuer_order:
-        issuer_rows = df[df["issuer"] == issuer].copy()
-        issuer_rows["date_parsed"] = parse_dates_safe(issuer_rows["date"])
-        issuer_rows = issuer_rows.sort_values(
-            by=["date_parsed", "orig_order"],
-            ascending=[False, True],
-        )
-
-        safe = slugify(issuer)
-
-        parts.append(f"<section id='{safe}' class='issuer-card'>")
-        parts.append("<div class='issuer-header'>")
-        parts.append(
-            f"<div><div class='issuer-title'>{html_lib.escape(issuer)}</div>"
-            f"<div class='small'>{len(issuer_rows)} įrašai</div></div>"
-        )
-        parts.append(
-            f"<div class='controls'>"
-            f"<button class='toggle-btn' data-toggle='#ct_{safe}'>Rodyti</button>"
-            f"</div>"
-        )
-        parts.append("</div>")
-        parts.append(f"<div id='ct_{safe}' class='collapsible'>")
-
-        cat_map = defaultdict(list)
-
-        for _, r in issuer_rows.iterrows():
-            cats = r.get("categories") or ["Kiti"]
-
-            for c in cats:
-                cat_map[c].append(r)
-
-        display_order = CATEGORY_ORDER + [
-            c for c in sorted(cat_map.keys())
-            if c not in CATEGORY_ORDER
-        ]
-
-        for cat in display_order:
-            rows = cat_map.get(cat, [])
-
-            if not rows:
-                continue
-
-            parts.append(
-                f"<div class='cat-block'>"
-                f"<div class='cat-title'>{html_lib.escape(cat)} "
-                f"<span class='small'>({len(rows)})</span></div>"
-            )
-
-            parts.append(
-                "<table>"
-                "<thead><tr>"
-                "<th class='date-col'>Data</th>"
-                "<th class='title-col'>Antraštė / nuoroda</th>"
-                "<th>Santrauka</th>"
-                "</tr></thead><tbody>"
-            )
-
-            for r in rows:
-                date_raw = r.get("date", "")
-                dt = pd.to_datetime(date_raw, errors="coerce")
-
-                if pd.notna(dt):
-                    date_fmt = dt.strftime("%Y-%m-%d %H:%M")
-                else:
-                    date_fmt = str(date_raw)
-
-                title_raw = r.get("title", "")
-                url = r.get("url", "")
-                summary_raw = r.get("summary", "")
-
-                category_from_html = (r.get("category_src") or "").strip()
-                cats_assigned = r.get("categories") or []
-
-                if isinstance(cats_assigned, str):
-                    cats_assigned = [cats_assigned]
-
-                assigned_display = ", ".join(cats_assigned) if cats_assigned else ""
-                cat_display = category_from_html if category_from_html else assigned_display
-
-                if not cat_display:
-                    cat_display = "Kiti"
-
-                cats_for_attr = set()
-
-                if category_from_html:
-                    cats_for_attr.add(category_from_html.strip().lower())
-
-                for cc in cats_assigned:
-                    cats_for_attr.add(str(cc).strip().lower())
-
-                if not cats_for_attr:
-                    cats_for_attr.add("kiti")
-
-                cats_attr = ";".join(sorted([
-                    html_lib.escape(c)
-                    for c in cats_for_attr
-                ]))
-
-                title_html = highlight_keywords(title_raw)
-                summary_html = highlight_keywords(summary_raw)
-
-                if url:
-                    url_escaped = html_lib.escape(str(url))
-                    link_html = (
-                        f"<a href='{url_escaped}' target='_blank' rel='noreferrer'>"
-                        f"{title_html or url_escaped}</a>"
-                    )
-                else:
-                    link_html = title_html or ""
-
-                link_html = (
-                    f"{link_html}"
-                    f"<div class='small' style='margin-top:6px'>"
-                    f"{html_lib.escape(cat_display)}</div>"
-                )
-
-                parts.append(
-                    f"<tr data-cats='{cats_attr}'>"
-                    f"<td class='date-col'>{html_lib.escape(date_fmt)}</td>"
-                    f"<td class='title-col'>{link_html}</td>"
-                    f"<td>{highlight_keywords(summary_raw)}</td>"
-                    f"</tr>"
-                )
-
-            parts.append("</tbody></table>")
-            parts.append("</div>")
-
-        parts.append("</div>")
-        parts.append("</section>")
-
-    parts.append("</main></div></div>")
-    parts.append(f"<script>{js}</script></body></html>")
-
-    return "\n".join(parts)
-
-
-# ============================================================
-# STREAMLIT LENTELĖS PARUOŠIMAS
-# ============================================================
-
-def prepare_streamlit_view_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def prepare_emitentu_table_df(emit_df: pd.DataFrame) -> pd.DataFrame:
+    if emit_df is None or emit_df.empty:
         return pd.DataFrame(columns=[
             "data",
             "emitentas",
@@ -691,29 +415,40 @@ def prepare_streamlit_view_df(df: pd.DataFrame) -> pd.DataFrame:
             "nuoroda",
         ])
 
-    out = df.copy()
+    df = emit_df.copy()
 
-    out["date_parsed"] = parse_dates_safe(out["date"])
-    out["data"] = out["date_parsed"].dt.strftime("%Y-%m-%d %H:%M")
-    out["data"] = out["data"].fillna(out["date"].astype(str))
+    if "date" in df.columns:
+        dt = pd.to_datetime(df["date"], errors="coerce")
+        df["data"] = dt.dt.strftime("%Y-%m-%d %H:%M")
+        df["data"] = df["data"].fillna(df["date"].astype(str))
+    else:
+        df["data"] = ""
 
-    out["kategorijos"] = out["categories"].apply(
-        lambda x: ", ".join(x) if isinstance(x, list) else str(x)
-    )
+    if "categories" in df.columns:
+        df["kategorijos"] = df["categories"].apply(
+            lambda x: ", ".join(x) if isinstance(x, (list, tuple)) else str(x)
+        )
+    elif "categories_str" in df.columns:
+        df["kategorijos"] = df["categories_str"].fillna("").astype(str)
+    else:
+        df["kategorijos"] = ""
 
-    out["emitentas"] = out["issuer"].fillna("Unknown").astype(str)
-    out["tipas"] = out["type"].fillna("").astype(str)
-    out["antraste"] = out["title"].fillna("").astype(str)
-    out["santrauka"] = out["summary"].fillna("").astype(str)
-    out["raktazodziai"] = out["matched_keywords"].fillna("").astype(str)
-    out["nuoroda"] = out["url"].fillna("").astype(str)
+    rename_map = {
+        "issuer": "emitentas",
+        "type": "tipas",
+        "title": "antraste",
+        "summary": "santrauka",
+        "matched_keywords": "raktazodziai",
+        "url": "nuoroda",
+    }
 
-    out = out.sort_values(
-        by=["date_parsed", "data"],
-        ascending=[False, False],
-    )
+    for old, new in rename_map.items():
+        if old in df.columns:
+            df[new] = df[old].fillna("").astype(str)
+        elif new not in df.columns:
+            df[new] = ""
 
-    return out[[
+    return df[[
         "data",
         "emitentas",
         "kategorijos",
@@ -725,11 +460,11 @@ def prepare_streamlit_view_df(df: pd.DataFrame) -> pd.DataFrame:
     ]]
 
 
-def filter_streamlit_df(
+def filter_emitentu_table_df(
     df_view: pd.DataFrame,
     search: str = "",
-    selected_issuers: Optional[list] = None,
-    selected_categories: Optional[list] = None,
+    selected_issuers=None,
+    selected_categories=None,
 ) -> pd.DataFrame:
     if df_view is None or df_view.empty:
         return df_view
@@ -740,15 +475,18 @@ def filter_streamlit_df(
         out = out[out["emitentas"].isin(selected_issuers)]
 
     if selected_categories:
-        mask_cat = out["kategorijos"].astype(str).apply(
-            lambda val: any(cat in val for cat in selected_categories)
-        )
-        out = out[mask_cat]
+        out = out[
+            out["kategorijos"].astype(str).apply(
+                lambda x: any(cat in x for cat in selected_categories)
+            )
+        ]
 
     if search and search.strip():
         q = search.strip().lower()
 
-        searchable_cols = [
+        mask = pd.Series(False, index=out.index)
+
+        for col in [
             "data",
             "emitentas",
             "kategorijos",
@@ -756,11 +494,7 @@ def filter_streamlit_df(
             "antraste",
             "santrauka",
             "raktazodziai",
-        ]
-
-        mask = pd.Series(False, index=out.index)
-
-        for col in searchable_cols:
+        ]:
             mask = mask | out[col].astype(str).str.lower().str.contains(
                 q,
                 na=False,
@@ -773,139 +507,564 @@ def filter_streamlit_df(
 
 
 # ============================================================
-# VIEŠOS FUNKCIJOS STREAMLIT INTEGRACIJAI
+# EMITENTŲ KORTELIŲ ATVAIZDAVIMAS IR PAIEŠKA SU GALŪNĖMIS
 # ============================================================
 
-def generate_emitentu_ataskaita(
-    start_date: date,
-    end_date: date,
-    title: Optional[str] = None,
-) -> dict:
-    if start_date is None or end_date is None:
-        raise ValueError("Reikia nurodyti start_date ir end_date.")
-
-    if start_date > end_date:
-        raise ValueError("Data 'Nuo' negali būti vėlesnė už datą 'Iki'.")
-
-    raw_df = load_crib_news_for_report(start_date, end_date)
-    df = prepare_classified_df(raw_df)
-
-    if title is None:
-        title = f"Emitentų atranka pagal CRIB naujienas ({start_date} – {end_date})"
-
-    html = build_pretty_html(df, title=title)
-
-    return {
-        "html": html,
-        "df": df,
-        "start_date": start_date,
-        "end_date": end_date,
-    }
+_LT_ENDINGS = [
+    "iaus", "iui", "ių", "io", "iu", "į", "is", "ys", "us", "as",
+    "ais", "uose", "ose", "oje", "ėje", "omis", "ams", "iems", "es",
+    "ės", "ė", "ą", "ų", "ui", "uo", "a", "o", "e", "ai", "ei", "am", "em", "",
+]
 
 
-def save_emitentu_ataskaita_html(
-    start_date: date,
-    end_date: date,
-    output_path: str | Path,
-) -> Path:
-    result = generate_emitentu_ataskaita(start_date, end_date)
+def _strip_lithuanian_ending(word: str) -> str:
+    word = (word or "").strip().lower()
+    if len(word) <= 4:
+        return word
 
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(result["html"], encoding="utf-8")
+    for ending in sorted(set(_LT_ENDINGS), key=len, reverse=True):
+        if ending and word.endswith(ending) and len(word) - len(ending) >= 4:
+            return word[:-len(ending)]
 
-    return path
+    return word
 
 
-def render_emitentu_atranka_page(default_days: int = 30):
-    import streamlit as st
-    import streamlit.components.v1 as components
+def _search_tokens(query: str) -> list[str]:
+    return [x for x in re.findall(r"[\wąčęėįšųūžĄČĘĖĮŠŲŪŽ]+", query or "", flags=re.U) if x]
 
-    st.subheader("🧾 Emitentų atranka pagal CRIB naujienas")
-    st.caption("Duomenys imami iš Supabase market_news lentelės, source='crib'.")
 
-    today = date.today()
+def _query_patterns(query: str) -> list[re.Pattern]:
+    patterns = []
 
-    col1, col2 = st.columns(2)
+    for token in _search_tokens(query):
+        base = _strip_lithuanian_ending(token)
+        variants = {token.lower(), base}
 
-    with col1:
-        start = st.date_input(
-            "Nuo",
-            today - timedelta(days=default_days),
-            key="crib_cls_start",
-        )
+        for variant in variants:
+            if not variant or len(variant) < 3:
+                continue
 
-    with col2:
-        end = st.date_input(
-            "Iki",
-            today,
-            key="crib_cls_end",
-        )
+            endings = "|".join(re.escape(e) for e in sorted(set(_LT_ENDINGS), key=len, reverse=True) if e)
+            pattern = rf"\b{re.escape(variant)}(?:{endings})?\b" if endings else rf"\b{re.escape(variant)}\b"
+            try:
+                patterns.append(re.compile(pattern, flags=re.I | re.U))
+            except re.error:
+                continue
 
-    if start > end:
-        st.error("Data 'Nuo' negali būti vėlesnė už datą 'Iki'.")
-        return
+    return patterns
 
-    generate_clicked = st.button(
-        "Generuoti klasifikavimo ataskaitą",
-        key="crib_cls_generate",
+
+def _keyword_patterns_from_row(row: pd.Series, search: str = "") -> list[re.Pattern]:
+    patterns = []
+
+    for value in str(row.get("raktazodziai", "")).split(","):
+        token = value.strip()
+        if len(token) >= 3:
+            try:
+                patterns.append(re.compile(re.escape(token), flags=re.I | re.U))
+            except re.error:
+                pass
+
+    patterns.extend(_query_patterns(search))
+    return patterns
+
+
+def _highlight_text(text: str, patterns: list[re.Pattern]) -> str:
+    escaped = html_lib.escape("" if text is None else str(text))
+
+    for pat in patterns:
+        try:
+            escaped = pat.sub(lambda m: f"<strong class='kw'>{m.group(0)}</strong>", escaped)
+        except Exception:
+            continue
+
+    return escaped
+
+
+def _matches_flexible_search(row: pd.Series, search: str) -> bool:
+    if not search or not search.strip():
+        return True
+
+    patterns = _query_patterns(search)
+    if not patterns:
+        return True
+
+    haystack = " ".join(
+        str(row.get(col, ""))
+        for col in ["data", "emitentas", "kategorijos", "tipas", "antraste", "santrauka", "raktazodziai"]
     )
 
-    if generate_clicked:
-        st.session_state.pop("crib_cls_result", None)
+    # Kai įvedami keli žodžiai, visi jie turi būti rasti, bet su galūnių variacijomis.
+    token_count = len(_search_tokens(search))
+    if token_count <= 1:
+        return any(p.search(haystack) for p in patterns)
 
-        with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama ataskaita..."):
-            result = generate_emitentu_ataskaita(start, end)
+    for token in _search_tokens(search):
+        token_patterns = _query_patterns(token)
+        if token_patterns and not any(p.search(haystack) for p in token_patterns):
+            return False
 
-        st.session_state["crib_cls_result"] = result
-        st.session_state["crib_cls_start_used"] = start
-        st.session_state["crib_cls_end_used"] = end
+    return True
 
-    result = st.session_state.get("crib_cls_result")
 
-    if not result:
-        st.info("Pasirinkite laikotarpį ir spauskite „Generuoti klasifikavimo ataskaitą“.")
+def filter_emitentu_cards_df(
+    df_view: pd.DataFrame,
+    search: str = "",
+    selected_issuers=None,
+    selected_categories=None,
+) -> pd.DataFrame:
+    if df_view is None or df_view.empty:
+        return df_view
+
+    out = df_view.copy()
+
+    if selected_issuers:
+        out = out[out["emitentas"].isin(selected_issuers)]
+
+    if selected_categories:
+        out = out[
+            out["kategorijos"].astype(str).apply(
+                lambda x: any(cat in x for cat in selected_categories)
+            )
+        ]
+
+    if search and search.strip():
+        mask = out.apply(lambda row: _matches_flexible_search(row, search), axis=1)
+        out = out[mask]
+
+    return out
+
+
+def render_emitentu_cards(df_view: pd.DataFrame, search: str = ""):
+    if df_view is None or df_view.empty:
+        st.info("Pagal pasirinktus filtrus įrašų nerasta.")
         return
 
-    st.success(f"Rasta įrašų: {len(result['df'])}")
+    for _, row in df_view.iterrows():
+        patterns = _keyword_patterns_from_row(row, search=search)
+        badges = []
 
-    tab_table, tab_html, tab_export = st.tabs([
+        for cat in str(row.get("kategorijos", "")).replace(";", ",").split(","):
+            cat = cat.strip()
+            if cat:
+                badges.append(f"<span class='emit-badge'>{html_lib.escape(cat)}</span>")
+
+        tipas = str(row.get("tipas", "")).strip()
+        if tipas:
+            badges.append(f"<span class='emit-badge'>{html_lib.escape(tipas)}</span>")
+
+        title_html = _highlight_text(row.get("antraste", ""), patterns)
+        summary_html = _highlight_text(row.get("santrauka", ""), patterns)
+        keywords_html = _highlight_text(row.get("raktazodziai", ""), patterns)
+        url = str(row.get("nuoroda", "")).strip()
+
+        if url:
+            title_block = (
+                f"<a href='{html_lib.escape(url)}' target='_blank' rel='noreferrer'>{title_html}</a>"
+            )
+            link_block = (
+                f"<div class='emit-link'><a href='{html_lib.escape(url)}' target='_blank' rel='noreferrer'>Atidaryti šaltinį ↗</a></div>"
+            )
+        else:
+            title_block = title_html
+            link_block = ""
+
+        keywords_block = ""
+        if str(row.get("raktazodziai", "")).strip():
+            keywords_block = f"<div class='emit-keywords'><b>Raktiniai žodžiai:</b> {keywords_html}</div>"
+
+        html_card = f"""
+        <div class="emit-card">
+            <div class="emit-card-top">
+                <div>
+                    <div class="emit-issuer">{html_lib.escape(str(row.get('emitentas', '')))}</div>
+                    <div class="emit-badges">{''.join(badges)}</div>
+                </div>
+                <div class="emit-date">{html_lib.escape(str(row.get('data', '')))}</div>
+            </div>
+            <div class="emit-title">{title_block}</div>
+            <div class="emit-summary">{summary_html}</div>
+            {keywords_block}
+            {link_block}
+        </div>
+        """
+        st.markdown(html_card, unsafe_allow_html=True)
+
+
+def show_styled_table(styler):
+    st.markdown(
+        f'<div class="report-table-wrapper">{styler.to_html()}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# ATASKAITOS PASIRINKIMAS
+# ============================================================
+
+report_param = st.query_params.get("report", "rinkos")
+
+if isinstance(report_param, list):
+    report_param = report_param[0] if report_param else "rinkos"
+
+if report_param == "emitentai":
+    report_mode = "Emitentų atranka"
+elif report_param == "vadovai":
+    report_mode = "Vadovų sandoriai"
+else:
+    report_mode = "Rinkos apžvalga"
+
+
+# ============================================================
+# SIDEBAR NAVIGACIJA IR DB ATNAUJINIMAS
+# ============================================================
+
+with st.sidebar:
+    rinkos_active = "active" if report_mode == "Rinkos apžvalga" else ""
+    emitentai_active = "active" if report_mode == "Emitentų atranka" else ""
+    vadovai_active = "active" if report_mode == "Vadovų sandoriai" else ""
+
+    nav_html = f"""
+        <div class="report-nav-title">
+            <div class="report-nav-icon">📊</div>
+            <div>Ataskaitos</div>
+        </div>
+        <div class="report-nav">
+            <a href="?report=rinkos" target="_self">
+                <div class="report-nav-item {rinkos_active}">
+                    <div class="nav-icon">📈</div>
+                    <div>Rinkos apžvalga</div>
+                </div>
+            </a>
+            <a href="?report=emitentai" target="_self">
+                <div class="report-nav-item {emitentai_active}">
+                    <div class="nav-icon">👥</div>
+                    <div>Emitentų atranka</div>
+                </div>
+            </a>
+            <a href="?report=vadovai" target="_self">
+                <div class="report-nav-item {vadovai_active}">
+                    <div class="nav-icon">👔</div>
+                    <div>Vadovų sandoriai</div>
+                </div>
+            </a>
+        </div>
+    """
+    st.markdown(nav_html, unsafe_allow_html=True)
+
+    st.markdown(
+        """
+        <div class="sidebar-section-title">🔄 Naujienų bazė</div>
+        <div class="sidebar-section-subtitle">
+        Patikrina naujausius CRIB pranešimus ir atnaujina aktualius VŽ straipsnius.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    latest_crib_date = get_latest_crib_news_date()
+
+    if latest_crib_date is not None:
+        st.markdown(
+            f'<div class="latest-news-date">🕒 Paskutinė DB naujiena:<br><span>{latest_crib_date.strftime("%Y-%m-%d %H:%M")}</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="latest-news-date">🕒 Paskutinė DB naujiena:<br><span>nėra duomenų</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    if st.session_state.news_update_message:
+        st.success(st.session_state.news_update_message)
+        st.session_state.news_update_message = None
+
+    update_news_btn = st.button(
+        "🔄 Atnaujinti duomenis",
+        use_container_width=True,
+        key="update_crib_news_btn",
+    )
+
+    if update_news_btn:
+        try:
+            crib_inserted = 0
+            crib_pages = 0
+            vz_inserted = 0
+            vz_found = 0
+            vz_note = ""
+
+            with st.spinner("Tikrinami nauji CRIB pranešimai..."):
+                stats = update_crib_news(
+                    max_pages=20,
+                    stop_empty_pages=3,
+                    headless=True,
+                    progress=None,
+                )
+                crib_inserted = int(stats.get("records_inserted", 0) or 0)
+                crib_pages = int(stats.get("pages_processed", 0) or 0)
+
+            manager_note = ""
+
+            if update_manager_transactions_from_recent_crib is not None:
+                with st.spinner("Tikrinami vadovų sandorių CRIB pranešimai..."):
+                    mgr_stats = update_manager_transactions_from_recent_crib(
+                        days_back=45,
+                        max_messages=30,
+                        headless=True,
+                        progress=None,
+                    )
+
+                manager_found = int(mgr_stats.get("manager_messages_found", 0) or 0)
+                manager_processed = int(mgr_stats.get("manager_messages_processed", 0) or 0)
+                manager_saved = int(mgr_stats.get("manager_transactions_saved", 0) or 0)
+
+                manager_note = (
+                    f" Vadovų sandoriai: rasta CRIB pranešimų {manager_found}, "
+                    f"apdorota {manager_processed}, įrašyta {manager_saved};"
+                )
+            else:
+                manager_note = " Vadovų sandoriai neatnaujinti: modulis nerastas;"
+
+            df_issuers_for_vz = None
+
+            with st.spinner("Kraunamas emitentų sąrašas VŽ atrankai..."):
+                try:
+                    df_issuers_for_vz = load_issuer_df()
+                except Exception as issuer_exc:
+                    vz_note = f" VŽ neatnaujinta: nepavyko užkrauti emitentų sąrašo ({issuer_exc})."
+
+            if df_issuers_for_vz is not None and not df_issuers_for_vz.empty:
+                with st.spinner("Tikrinamas VŽ puslapis pagal emitentų sąrašą..."):
+                    vz_stats = update_vz_news_fast(
+                        df_issuers=df_issuers_for_vz,
+                        existing_url_limit=800,
+                        max_articles=80,
+                        progress=None,
+                    )
+
+                vz_found = int(vz_stats.get("found", 0) or 0)
+                vz_inserted = int(vz_stats.get("inserted", 0) or 0)
+                vz_checked = int(vz_stats.get("checked", 0) or 0)
+                vz_matched = int(vz_stats.get("matched", 0) or 0)
+
+                vz_note += (
+                    f" VŽ patikrinta {vz_checked} straipsnių, "
+                    f"aktualių kandidatų {vz_matched}."
+                )
+            elif not vz_note:
+                vz_note = " VŽ neatnaujinta: DB nėra emitentų sąrašo."
+
+            st.session_state.report_result = None
+            st.session_state.emitentu_result = None
+
+            st.session_state.news_update_message = (
+                f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
+                f"(patikrinta puslapių: {crib_pages});"
+                f"{manager_note} "
+                f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
+                f"{vz_note}"
+            )
+
+            st.rerun()
+
+        except Exception as exc:
+            st.error("Nepavyko atnaujinti naujienų bazės.")
+            st.exception(exc)
+
+
+# ============================================================
+# VADOVŲ SANDORIAI
+# ============================================================
+
+if report_mode == "Vadovų sandoriai":
+    if show_manager_transactions_page is None:
+        st.error("Nepavyko užkrauti vadovų sandorių modulio vadovu_sandoriai.py.")
+        st.stop()
+
+    show_manager_transactions_page()
+    st.stop()
+
+
+# ============================================================
+# EMITENTŲ ATRANKA
+# ============================================================
+
+if report_mode == "Emitentų atranka":
+    with st.sidebar:
+        st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-card-title">🧾 Emitentų atranka</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-card-subtitle">CRIB naujienos imamos iš Supabase DB. Pasirinkite laikotarpį.</div>',
+            unsafe_allow_html=True,
+        )
+
+        emit_start_date = st.date_input(
+            "Nuo",
+            value=date.today(),
+            key="emitentu_start_date",
+        )
+
+        emit_end_date = st.date_input(
+            "Iki",
+            value=date.today(),
+            key="emitentu_end_date",
+        )
+
+        st.markdown(
+            '<div class="status-ok">✅ Naudojama market_news lentelė, source=crib</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        emit_run_btn = st.button(
+            "🚀 Generuoti emitentų atranką",
+            type="primary",
+            use_container_width=True,
+            key="emitentu_run_btn",
+        )
+
+    emit_result = st.session_state.emitentu_result
+
+    if emit_result is not None:
+        emit_html_bytes = emit_result["html"].encode("utf-8")
+        emit_out_name = (
+            f"emitentu_atranka_{emit_result['start_date'].strftime('%Y%m%d')}_"
+            f"{emit_result['end_date'].strftime('%Y%m%d')}.html"
+        )
+    else:
+        emit_html_bytes = None
+        emit_out_name = "emitentu_atranka.html"
+
+    hero_col, download_col = st.columns([5, 1.35])
+
+    with hero_col:
+        st.markdown(
+            """
+            <div class="hero-card">
+                <div class="hero-inner">
+                    <div class="hero-icon">🧾</div>
+                    <div>
+                        <h1 class="hero-title">Emitentų atranka</h1>
+                        <div class="hero-text">
+                            CRIB pranešimų peržiūra su paieška, emitentų ir kategorijų filtrais.
+                            Kategorijų santraukos šiame vaizde nebėra.
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with download_col:
+        st.markdown('<div class="hero-download">', unsafe_allow_html=True)
+
+        if emit_html_bytes is not None:
+            st.download_button(
+                label="⬇ Atsisiųsti HTML",
+                data=emit_html_bytes,
+                file_name=emit_out_name,
+                mime="text/html",
+                use_container_width=True,
+            )
+        else:
+            st.button("⬇ Atsisiųsti HTML", disabled=True, use_container_width=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    col1.metric("🗓️ Nuo", str(emit_start_date or "-"))
+    col2.metric("🗓️ Iki", str(emit_end_date or "-"))
+
+    st.markdown("---")
+
+    if emit_run_btn:
+        if emit_start_date is None or emit_end_date is None:
+            st.error("Pasirinkite datas.")
+            st.stop()
+
+        if emit_start_date > emit_end_date:
+            st.error("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
+            st.stop()
+
+        try:
+            with st.spinner("Kraunamos CRIB naujienos iš Supabase ir generuojama emitentų atranka..."):
+                generated_emit = generate_emitentu_ataskaita(
+                    start_date=emit_start_date,
+                    end_date=emit_end_date,
+                )
+
+            st.session_state.emitentu_result = generated_emit
+            st.session_state.emitentu_dates = (emit_start_date, emit_end_date)
+            st.rerun()
+
+        except Exception as exc:
+            st.exception(exc)
+            st.stop()
+
+    emit_result = st.session_state.emitentu_result
+
+    if emit_result is None:
+        st.markdown(
+            """
+            <div class="info-box">
+                ℹ️ Pasirinkite laikotarpį ir paspauskite „Generuoti emitentų atranką“.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    st.success(f"Rasta CRIB įrašų: {len(emit_result['df'])}")
+
+    tab1, tab2, tab3 = st.tabs([
         "📋 Interaktyvi lentelė",
-        "🌐 HTML peržiūra",
+        "🧾 HTML ataskaita",
         "⬇️ Atsisiuntimas",
     ])
 
-    with tab_table:
-        df_view = prepare_streamlit_view_df(result["df"])
+    with tab1:
+        df_view = prepare_emitentu_table_df(emit_result["df"])
 
         if df_view.empty:
-            st.info("Pasirinktu laikotarpiu įrašų nerasta.")
+            st.info("Pasirinktam laikotarpiui įrašų nerasta.")
         else:
             st.markdown("#### Paieška ir filtrai")
+            st.markdown(
+                """
+                <div class="emit-filter-help">
+                    Paieška veikia pagal raktinį žodį ir jo galūnių variacijas, pvz. įvedus
+                    <b>dividend</b>, <b>teism</b> ar <b>vadov</b> bus randamos ir linksniuotos formos.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
             search = st.text_input(
                 "Paieškos žodis",
-                placeholder="Pvz. teism, dividendai, vadovas, nuostoliai, obligacijos...",
-                key="crib_cls_search",
+                placeholder="Pvz. teism, dividend, vadov, nuostol, obligacij...",
+                key="emitentu_search",
             )
 
-            filter_col1, filter_col2 = st.columns(2)
+            fcol1, fcol2 = st.columns(2)
 
-            with filter_col1:
+            with fcol1:
                 issuers = sorted(df_view["emitentas"].dropna().unique().tolist())
 
                 selected_issuers = st.multiselect(
                     "Emitentai",
                     options=issuers,
                     default=[],
-                    key="crib_cls_issuers_filter",
+                    key="emitentu_issuer_filter",
                 )
 
-            with filter_col2:
+            with fcol2:
                 all_categories = sorted({
                     cat.strip()
                     for value in df_view["kategorijos"].dropna().astype(str)
-                    for cat in value.split(",")
+                    for cat in value.replace(";", ",").split(",")
                     if cat.strip()
                 })
 
@@ -913,10 +1072,10 @@ def render_emitentu_atranka_page(default_days: int = 30):
                     "Kategorijos",
                     options=all_categories,
                     default=[],
-                    key="crib_cls_categories_filter",
+                    key="emitentu_category_filter",
                 )
 
-            filtered = filter_streamlit_df(
+            filtered = filter_emitentu_cards_df(
                 df_view=df_view,
                 search=search,
                 selected_issuers=selected_issuers,
@@ -924,59 +1083,298 @@ def render_emitentu_atranka_page(default_days: int = 30):
             )
 
             st.caption(f"Rodoma įrašų: {len(filtered)} iš {len(df_view)}")
+            render_emitentu_cards(filtered, search=search)
 
-            st.dataframe(
-                filtered,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "data": st.column_config.TextColumn("Data", width="small"),
-                    "emitentas": st.column_config.TextColumn("Emitentas", width="medium"),
-                    "kategorijos": st.column_config.TextColumn("Kategorijos", width="medium"),
-                    "tipas": st.column_config.TextColumn("Tipas", width="medium"),
-                    "antraste": st.column_config.TextColumn("Antraštė", width="large"),
-                    "santrauka": st.column_config.TextColumn("Santrauka", width="large"),
-                    "raktazodziai": st.column_config.TextColumn("Raktažodžiai", width="medium"),
-                    "nuoroda": st.column_config.LinkColumn("Nuoroda"),
-                },
-            )
-
-    with tab_html:
+    with tab2:
         components.html(
-            result["html"],
+            emit_result["html"],
             height=900,
             scrolling=True,
         )
 
-    with tab_export:
-        st.markdown("#### Atsisiuntimai")
-
-        st.download_button(
-            "Atsisiųsti HTML ataskaitą",
-            data=result["html"].encode("utf-8"),
-            file_name=f"crib_klasifikacija_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.html",
-            mime="text/html",
-        )
-
-        df_export = prepare_streamlit_view_df(result["df"])
+    with tab3:
+        df_export = prepare_emitentu_table_df(emit_result["df"])
         csv_data = df_export.to_csv(index=False).encode("utf-8-sig")
 
         st.download_button(
-            "Atsisiųsti lentelę CSV formatu",
+            "⬇ Atsisiųsti lentelę CSV formatu",
             data=csv_data,
-            file_name=f"crib_klasifikacija_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv",
+            file_name=(
+                f"emitentu_atranka_{emit_result['start_date'].strftime('%Y%m%d')}_"
+                f"{emit_result['end_date'].strftime('%Y%m%d')}.csv"
+            ),
             mime="text/csv",
+            use_container_width=True,
         )
 
+        st.download_button(
+            "⬇ Atsisiųsti HTML ataskaitą",
+            data=emit_result["html"].encode("utf-8"),
+            file_name=(
+                f"emitentu_atranka_{emit_result['start_date'].strftime('%Y%m%d')}_"
+                f"{emit_result['end_date'].strftime('%Y%m%d')}.html"
+            ),
+            mime="text/html",
+            use_container_width=True,
+        )
 
-if __name__ == "__main__":
-    res = generate_emitentu_ataskaita(
-        date.today() - timedelta(days=30),
-        date.today(),
+    st.stop()
+
+
+# ============================================================
+# RINKOS APŽVALGA
+# ============================================================
+
+with st.sidebar:
+    st.markdown('<div class="sidebar-section-title">🗓️ Laikotarpis</div>', unsafe_allow_html=True)
+
+    start_date = st.date_input(
+        "Nuo",
+        value=date.today(),
+        key="rinkos_start_date",
     )
 
-    out = Path(f"crib_klasifikacija_{date.today().strftime('%Y%m%d')}.html")
-    out.write_text(res["html"], encoding="utf-8")
+    end_date = st.date_input(
+        "Iki",
+        value=date.today(),
+        key="rinkos_end_date",
+    )
 
-    print(f"Išsaugota: {out.resolve()}")
-    print(f"Įrašų skaičius: {len(res['df'])}")
+    run_btn = st.button(
+        "🚀 Generuoti ataskaitą",
+        type="primary",
+        use_container_width=True,
+        key="rinkos_run_btn",
+    )
+
+    st.markdown(
+        """
+        <div class="sidebar-section-title">📌 Duomenų šaltinis</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    duomenu_saltinis = st.radio(
+        "Pasirinkite duomenų gavimo būdą",
+        ["Atsisiųsti iš Nasdaq Baltic", "Įkelti Excel rankiniu būdu"],
+        label_visibility="collapsed",
+        key="rinkos_duomenu_saltinis",
+    )
+
+    uploaded_file = None
+    filename = None
+
+    if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
+        st.markdown(
+            '<div class="status-ok">✅ Automatinis atsisiuntimas įjungtas</div>',
+            unsafe_allow_html=True,
+        )
+
+    else:
+        st.markdown(
+            '<div class="sidebar-section-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx).</div>',
+            unsafe_allow_html=True,
+        )
+
+        if st.session_state.uploaded_file_cache is None:
+            uploaded_file_temp = st.file_uploader(
+                "Statistikos Excel failas",
+                type=["xlsx"],
+                label_visibility="collapsed",
+                key=f"statistics_uploader_{st.session_state.uploader_key}",
+            )
+
+            if uploaded_file_temp is not None:
+                st.session_state.uploaded_file_cache = uploaded_file_temp
+                st.rerun()
+
+        else:
+            uploaded_file = st.session_state.uploaded_file_cache
+            st.markdown(
+                f'<div class="status-ok">✅ Failas įkeltas: {uploaded_file.name}</div>',
+                unsafe_allow_html=True,
+            )
+
+            if st.button(
+                "🔄 Pakeisti failą",
+                use_container_width=True,
+                key="change_statistics_file_btn",
+            ):
+                st.session_state.uploader_key += 1
+                st.session_state.uploaded_file_cache = None
+                st.session_state.report_result = None
+                st.session_state.report_filename = None
+                st.rerun()
+
+        if uploaded_file is None:
+            st.markdown(
+                '<div class="status-empty">🛡️ Failas neįkeltas</div>',
+                unsafe_allow_html=True,
+            )
+
+
+result = st.session_state.report_result
+
+if result is not None:
+    html_bytes = result["html"].encode("utf-8")
+    out_name = f"rinkos_ataskaita_{date.today().isoformat()}.html"
+else:
+    html_bytes = None
+    out_name = "rinkos_ataskaita.html"
+
+
+hero_col, download_col = st.columns([5, 1.35])
+
+with hero_col:
+    st.markdown(
+        """
+        <div class="hero-card">
+            <div class="hero-inner">
+                <div class="hero-icon">📈</div>
+                <div>
+                    <h1 class="hero-title">Rinkos pulsas</h1>
+                    <div class="hero-text">
+                        Įkelkite Nasdaq statistikos Excel failą arba leiskite programai jį atsisiųsti automatiškai.
+                        Aplikacija surinks CRIB, VŽ ir Nasdaq naujienas, suformuos lenteles ir HTML ataskaitą.
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with download_col:
+    st.markdown('<div class="hero-download">', unsafe_allow_html=True)
+
+    if html_bytes is not None:
+        st.download_button(
+            label="⬇ Atsisiųsti HTML",
+            data=html_bytes,
+            file_name=out_name,
+            mime="text/html",
+            use_container_width=True,
+        )
+    else:
+        st.button(
+            "⬇ Atsisiųsti HTML",
+            disabled=True,
+            use_container_width=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+col1, col2 = st.columns(2)
+col1.metric("🗓️ Nuo", str(start_date or "-"))
+col2.metric("🗓️ Iki", str(end_date or "-"))
+
+st.markdown("---")
+
+
+if run_btn:
+    if start_date is None or end_date is None:
+        st.error("Nepavyko nustatyti datų. Pasirinkite laikotarpį rankiniu būdu.")
+        st.stop()
+
+    if start_date > end_date:
+        st.error("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
+        st.stop()
+
+    progress_box = st.empty()
+
+    def progress(message: str):
+        progress_box.info(message)
+
+    try:
+        with st.spinner("Generuojama ataskaita..."):
+            if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
+                progress("📥 Atsisiunčiamas Nasdaq Baltic statistikos Excel failas...")
+
+                uploaded_file, filename = download_nasdaq_statistics_excel(
+                    start_date=start_date,
+                    end_date=end_date,
+                    download_dir="downloads",
+                    progress=progress,
+                )
+
+                progress(f"✅ Failas atsisiųstas: {filename}")
+
+            else:
+                if uploaded_file is None:
+                    st.error("Įkelkite Excel failą arba pasirinkite automatinį atsisiuntimą iš Nasdaq Baltic.")
+                    st.stop()
+
+                filename = uploaded_file.name
+
+            generated = generate_report(
+                excel_file=uploaded_file,
+                filename=filename,
+                start_date=start_date,
+                end_date=end_date,
+                progress=progress,
+            )
+
+        st.session_state.report_result = generated
+        st.session_state.report_filename = filename
+
+        try:
+            issuer_count = save_issuer_list_from_stat_df(generated.get("df_raw"))
+            progress_box.success(
+                f"Ataskaita sugeneruota. Emitentų sąrašas DB atnaujintas: {issuer_count} įrašų."
+            )
+        except Exception as issuer_exc:
+            progress_box.warning(
+                f"Ataskaita sugeneruota, bet emitentų sąrašo nepavyko išsaugoti DB: {issuer_exc}"
+            )
+
+        st.rerun()
+
+    except Exception as exc:
+        st.exception(exc)
+        st.stop()
+
+
+result = st.session_state.report_result
+
+if result is None:
+    st.markdown(
+        """
+        <div class="info-box">
+            ℹ️ Pasirinkite duomenų šaltinį ir paspauskite „Generuoti ataskaitą“.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📈 Akcijos",
+    "🏦 Obligacijos",
+    "🌱 First North",
+    "📰 Visos naujienos",
+    "🧾 Pilna HTML peržiūra",
+])
+
+
+with tab1:
+    show_styled_table(result["styled_akcijos"])
+
+with tab2:
+    show_styled_table(result["styled_obligacijos"])
+
+with tab3:
+    show_styled_table(result["styled_first_north"])
+
+with tab4:
+    show_styled_table(result["styled_visos"])
+
+with tab5:
+    components.html(
+        result["html"],
+        height=900,
+        scrolling=True,
+    )
