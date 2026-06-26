@@ -1752,10 +1752,18 @@ def _show_tables(df: pd.DataFrame):
     styler = display_df.style
     if format_map:
         styler = styler.format(format_map, na_rep="")
+    # pandas >= 2.1 Styler.applymap nebepalaikomas, todėl naudojame Styler.map.
+    # Paliekame atsarginį variantą senesnėms pandas versijoms.
     if "DPL" in display_df.columns:
-        styler = styler.applymap(_style_dpl_value, subset=["DPL"])
+        if hasattr(styler, "map"):
+            styler = styler.map(_style_dpl_value, subset=["DPL"])
+        else:
+            styler = styler.applymap(_style_dpl_value, subset=["DPL"])
     if "Vėlavo d." in display_df.columns:
-        styler = styler.applymap(_style_delay_value, subset=["Vėlavo d."])
+        if hasattr(styler, "map"):
+            styler = styler.map(_style_delay_value, subset=["Vėlavo d."])
+        else:
+            styler = styler.applymap(_style_delay_value, subset=["Vėlavo d."])
 
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
@@ -1915,9 +1923,6 @@ def show_manager_transactions_page():
                     hide_index=True,
                 )
 
-    show_dpl_dates_table(dpl_periods_df)
-    st.markdown("---")
-
     _show_summary_cards(df)
     st.markdown("---")
 
@@ -1945,6 +1950,10 @@ def show_manager_transactions_page():
             df = df[df["is_dpl_period"] == False]
 
     _show_tables(df)
+
+    st.markdown("---")
+    show_dpl_dates_table(dpl_periods_df)
+
     st.download_button(
         "⬇ Atsisiųsti CSV",
         data=df.to_csv(index=False).encode("utf-8-sig"),
