@@ -1658,16 +1658,106 @@ def _show_summary_cards(df: pd.DataFrame):
     c5.metric("Per DPL", dpl)
 
 
+def _style_dpl_value(value):
+    """Spalvina DPL stulpelį detalioje vadovų sandorių lentelėje."""
+    v = str(value or "").strip().lower()
+    if v == "taip":
+        return "background-color: #f8d7da; color: #721c24; font-weight: 700;"
+    if v == "ne":
+        return "background-color: #d4edda; color: #155724; font-weight: 700;"
+    return ""
+
+
+def _style_delay_value(value):
+    """Spalvina vėlavimo dienų stulpelį detalioje vadovų sandorių lentelėje."""
+    try:
+        if pd.isna(value):
+            return ""
+        days = float(value)
+    except Exception:
+        return ""
+
+    if days > 3:
+        return "background-color: #f8d7da; color: #721c24; font-weight: 700;"
+    return "background-color: #d4edda; color: #155724; font-weight: 700;"
+
+
 def _show_tables(df: pd.DataFrame):
     st.subheader("1. Detali vadovų sandorių lentelė")
+
     detail_cols = [
-        "DPL", "DPL paaiškinimas", "DPL tipas", "DPL pradžia", "DPL pabaiga", "Ataskaitos paskelbimo data",
-        "DPL dienų iki ataskaitos", "Susijusi ataskaita", "Ataskaitos nuoroda", "published_at", "published_date", "transaction_date_dt",
-        "days_to_publish", "is_late_notification", "issuer", "lei", "person_name", "person_role", "isin", "instrument",
-        "transaction_type", "price", "quantity", "transaction_value", "price_quantity_note", "venue", "parse_status", "pdf_name", "pdf_url", "crib_url",
+        "DPL",
+        "days_to_publish",
+        "issuer",
+        "person_name",
+        "transaction_type",
+        "price",
+        "quantity",
+        "transaction_value",
+        "instrument",
+        "transaction_date_dt",
+        "published_date",
+        "person_role",
+        "DPL tipas",
+        "Susijusi ataskaita",
+        "isin",
+        "venue",
+        "Ataskaitos paskelbimo data",
+        "DPL pradžia",
+        "DPL pabaiga",
+        "DPL dienų iki ataskaitos",
+        "Ataskaitos nuoroda",
+        "lei",
+        "pdf_name",
+        "pdf_url",
+        "crib_url",
+        "price_quantity_note",
+        "parse_status",
     ]
     detail_cols = [c for c in detail_cols if c in df.columns]
-    st.dataframe(df[detail_cols], use_container_width=True, hide_index=True)
+
+    display_df = df[detail_cols].copy()
+    display_df = display_df.rename(columns={
+        "days_to_publish": "Vėlavo d.",
+        "issuer": "Emitentas",
+        "person_name": "Asmuo",
+        "transaction_type": "Sandorio tipas",
+        "price": "Kaina",
+        "quantity": "Kiekis",
+        "transaction_value": "Vertė",
+        "instrument": "Priemonė",
+        "transaction_date_dt": "Sandorio data",
+        "published_date": "Pranešimo data",
+        "person_role": "Pareigos",
+        "isin": "ISIN",
+        "venue": "Prekybos vieta",
+        "lei": "LEI",
+        "pdf_name": "PDF pavadinimas",
+        "pdf_url": "PDF nuoroda",
+        "crib_url": "CRIB nuoroda",
+        "price_quantity_note": "Pastaba dėl kainos / kiekio",
+        "parse_status": "Apdorojimo statusas",
+    })
+
+    format_map = {}
+    if "Kaina" in display_df.columns:
+        format_map["Kaina"] = "{:.4f}"
+    if "Kiekis" in display_df.columns:
+        format_map["Kiekis"] = "{:.0f}"
+    if "Vertė" in display_df.columns:
+        format_map["Vertė"] = "{:,.2f}"
+    if "Vėlavo d." in display_df.columns:
+        format_map["Vėlavo d."] = "{:.0f}"
+
+    styler = display_df.style
+    if format_map:
+        styler = styler.format(format_map, na_rep="")
+    if "DPL" in display_df.columns:
+        styler = styler.applymap(_style_dpl_value, subset=["DPL"])
+    if "Vėlavo d." in display_df.columns:
+        styler = styler.applymap(_style_delay_value, subset=["Vėlavo d."])
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
 
     st.subheader("2. Santrauka pagal asmenį")
     person_summary = (
