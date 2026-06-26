@@ -1241,24 +1241,111 @@ def load_manager_transactions_from_db(start_date, end_date) -> pd.DataFrame:
     return _load_manager_transactions_df_fallback(start_date, end_date)
 
 
+def _infer_issuer_from_news_text(title: str = "", content: str = "") -> str:
+    """Bando nustatyti emitentą iš CRIB antraštės / turinio, jei market_news company tuščias."""
+    text = f"{title or ''} {content or ''}"
+    key_text = _issuer_norm_key(text)
+    if not key_text:
+        return ""
+
+    lookup = _load_issuer_lookup_from_market_issuers()
+    best = ""
+    best_len = 0
+    for key, canonical in lookup.items():
+        if not key or len(key) < 3:
+            continue
+        if re.search(rf"(?:^|\s){re.escape(key)}(?:\s|$)", key_text):
+            if len(key) > best_len:
+                best = canonical
+                best_len = len(key)
+    return best
+
+
 def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
     df = load_news_df("crib", start_date, end_date)
     if df is None or df.empty:
         return pd.DataFrame(columns=["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"])
     df = df.copy()
-    df["issuer"] = df.get("company", "").fillna("").astype(str).str.strip().apply(_canonical_issuer_name)
-    df["issuer_norm"] = df["issuer"].apply(_issuer_norm_key)
-    df["category"] = df.get("category", "").fillna("").astype(str).str.strip()
-    df["title"] = df.get("title", "").fillna("").astype(str).str.strip()
+
+    for col in ["company", "category", "title", "published_at", "url", "content"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["category"] = df["category"].fillna("").astype(str).str.strip()
+    df["title"] = df["title"].fillna("").astype(str).str.strip()
     df["published_at"] = df.get("published_at", None)
-    df["crib_url"] = df.get("url", "").fillna("").astype(str).str.strip()
-    df["content"] = df.get("content", "").fillna("").astype(str).str.strip()
+    df["crib_url"] = df["url"].fillna("").astype(str).str.strip()
+    df["content"] = df["content"].fillna("").astype(str).str.strip()
+
+    df["issuer"] = df["company"].fillna("").astype(str).str.strip().apply(_canonical_issuer_name)
+
+    # Jei Supabase market_news.company tuščias arba nesutampa su market_issuers,
+    # emitentą bandome ištraukti iš CRIB antraštės / turinio pagal market_issuers žodyną.
+    missing_issuer = df["issuer"].fillna("").astype(str).str.strip().eq("")
+    if missing_issuer.any():
+        df.loc[missing_issuer, "issuer"] = df.loc[missing_issuer].apply(
+            lambda r: _infer_issuer_from_news_text(r.get("title", ""), r.get("content", "")),
+            axis=1,
+        )
+
+    df["issuer"] = df["issuer"].fillna("").astype(str).str.strip().apply(_canonical_issuer_name)
+    df["issuer_norm"] = df["issuer"].apply(_issuer_norm_key)
+
     return df[["issuer", "issuer_norm", "category", "title", "published_at", "crib_url", "content"]]
 
 
-ANNUAL_PATTERNS = [r"\bmetin", r"\bannual\s+report\b", r"\baudited\b", r"\baudituot"]
-HALF_YEAR_PATTERNS = [r"\b6\s*m[ėe]n", r"\bšešių\s+m[ėe]nesių\b", r"\bpusme", r"\bhalf[- ]year\b", r"\bsemi[- ]annual\b", r"\b6\s*months\b", r"\bsix\s+months\b"]
-EXCLUDE_PATTERNS = [r"\b3\s*m[ėe]n", r"\b9\s*m[ėe]n", r"\bq1\b", r"\bq3\b", r"\bI\s+ketv", r"\bIII\s+ketv", r"\bketvir", r"\bpreliminar", r"\bprognoz", r"\bdividend"]
+ANNUAL_PATTERNS = [
+    r"\bmetin",
+    r"\bmetų\s+ataskait",
+    r"\bmetines?\s+finansin",
+    r"\baudituot",
+    r"\baudited\b",
+    r"\bannual\s+(?:information|report|financial)",
+]
+
+HALF_YEAR_PATTERNS = [
+    r"\b6\s*m[ėe]n",
+    r"\b6\s*m[ėe]nes",
+    r"\bšešių\s+m[ėe]nesių\b",
+    r"\bsesiu\s+menesiu\b",
+    r"\bpusme",
+    r"\bi\s+pusme",
+    r"\b1\s+pusme",
+    r"\bh1\b",
+    r"\bhalf[- ]year\b",
+    r"\bfirst\s+half\b",
+    r"\bsemi[- ]annual\b",
+    r"\b6\s*months\b",
+    r"\bsix[- ]month",
+    r"\bsix\s+months\b",
+]
+
+QUARTER_REPORT_PATTERNS = [
+    r"\b3\s*m[ėe]n",
+    r"\b3\s*m[ėe]nes",
+    r"\btrijų\s+m[ėe]nesių\b",
+    r"\btriju\s+menesiu\b",
+    r"\b9\s*m[ėe]n",
+    r"\b9\s*m[ėe]nes",
+    r"\bdevynių\s+m[ėe]nesių\b",
+    r"\bdevyniu\s+menesiu\b",
+    r"\bq1\b",
+    r"\bq3\b",
+    r"\bi\s+ketv",
+    r"\biii\s+ketv",
+    r"\bpirm[ao]\s+ketv",
+    r"\btre[cč]i[ao]\s+ketv",
+    r"\bthree\s+months\b",
+    r"\bnine\s+months\b",
+]
+
+NON_REPORT_PATTERNS = [
+    r"\bpreliminar",
+    r"\bprognoz",
+    r"\bdividend",
+    r"\bprezentacij",
+    r"\bpresentation\b",
+]
 
 
 def _norm_text(x) -> str:
@@ -1266,20 +1353,50 @@ def _norm_text(x) -> str:
 
 
 def _matches_any(text: str, patterns: list[str]) -> bool:
-    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
+    return any(re.search(p, text or "", flags=re.IGNORECASE) for p in patterns)
+
+
+def _is_annual_category(category: str) -> bool:
+    category = _norm_text(category)
+    return bool(re.search(r"\bmetin|\bannual\s+information", category, flags=re.I))
+
+
+def _is_interim_category(category: str) -> bool:
+    category = _norm_text(category)
+    return bool(re.search(r"\btarpin|\binterim\s+information", category, flags=re.I))
 
 
 def _classify_financial_report(row) -> str:
+    """
+    CRIB kategorija yra pagrindinis šaltinis:
+    - „Metinė informacija“ / „Annual information“ => metinė ataskaita;
+    - „Tarpinė informacija“ / „Interim information“ => gali būti 3 mėn., 6 mėn. arba 9 mėn.
+
+    DPL patikrai įtraukiame tik metines ir 6 mėn. / pusmečio ataskaitas.
+    Todėl tarpinės informacijos atveju papildomai tikriname antraštę ir turinį,
+    kad neatimtume 3 mėn. arba 9 mėn. pranešimų kaip pusmečio ataskaitų.
+    """
     category = _norm_text(row.get("category", ""))
     title = _norm_text(row.get("title", ""))
     content = _norm_text(row.get("content", ""))
-    text = f"{category} {title} {content[:1000]}"
-    if _matches_any(text, EXCLUDE_PATTERNS):
+    text = f"{category} {title} {content[:1500]}"
+
+    if _matches_any(text, NON_REPORT_PATTERNS):
         return ""
-    if "metin" in category and _matches_any(text, ANNUAL_PATTERNS):
+
+    if _is_annual_category(category) or _matches_any(text, ANNUAL_PATTERNS):
         return "Metinė"
-    if "tarpin" in category and _matches_any(text, HALF_YEAR_PATTERNS):
+
+    if _is_interim_category(category):
+        if _matches_any(text, QUARTER_REPORT_PATTERNS):
+            return ""
+        if _matches_any(text, HALF_YEAR_PATTERNS):
+            return "Pusmečio / 6 mėn."
+        return ""
+
+    if _matches_any(text, HALF_YEAR_PATTERNS):
         return "Pusmečio / 6 mėn."
+
     return ""
 
 
@@ -1545,9 +1662,9 @@ def _show_tables(df: pd.DataFrame):
     st.subheader("1. Detali vadovų sandorių lentelė")
     detail_cols = [
         "DPL", "DPL paaiškinimas", "DPL tipas", "DPL pradžia", "DPL pabaiga", "Ataskaitos paskelbimo data",
-        "DPL dienų iki ataskaitos", "Susijusi ataskaita", "Ataskaitos nuoroda", "published_date", "transaction_date_dt",
-        "days_to_publish", "is_late_notification", "issuer", "person_name", "person_role", "isin", "instrument",
-        "transaction_type", "price", "quantity", "transaction_value", "price_quantity_note", "venue", "parse_status", "pdf_url", "crib_url",
+        "DPL dienų iki ataskaitos", "Susijusi ataskaita", "Ataskaitos nuoroda", "published_at", "published_date", "transaction_date_dt",
+        "days_to_publish", "is_late_notification", "issuer", "lei", "person_name", "person_role", "isin", "instrument",
+        "transaction_type", "price", "quantity", "transaction_value", "price_quantity_note", "venue", "parse_status", "pdf_name", "pdf_url", "crib_url",
     ]
     detail_cols = [c for c in detail_cols if c in df.columns]
     st.dataframe(df[detail_cols], use_container_width=True, hide_index=True)
@@ -1690,6 +1807,23 @@ def show_manager_transactions_page():
             )
         else:
             st.dataframe(dpl_periods_df[["issuer", "dpl_report_type", "report_published_date", "dpl_start_date", "dpl_end_date", "category", "title", "crib_url"]], use_container_width=True, hide_index=True)
+
+        # Papildoma diagnostika: matome tarpinę informaciją, kuri nebuvo priskirta 6 mėn. ataskaitoms
+        # dažniausiai todėl, kad tai 3 mėn. arba 9 mėn. rezultatai.
+        if crib_news_df is not None and not crib_news_df.empty:
+            tmp_diag = crib_news_df.copy()
+            tmp_diag["report_class"] = tmp_diag.apply(_classify_financial_report, axis=1)
+            interim_unmatched = tmp_diag[
+                tmp_diag["category"].fillna("").astype(str).apply(_is_interim_category)
+                & tmp_diag["report_class"].eq("")
+            ].copy()
+            if not interim_unmatched.empty:
+                st.markdown("**Tarpinė informacija, neįtraukta į DPL kaip 6 mėn. ataskaita**")
+                st.dataframe(
+                    interim_unmatched[["issuer", "published_at", "category", "title", "crib_url"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     show_dpl_dates_table(dpl_periods_df)
     st.markdown("---")
