@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 from datetime import date
-
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -23,17 +22,18 @@ except Exception:
     show_manager_transactions_page = None
 
 try:
-    from metines import show_annual_reports_page
+    from metines import show_metines_page
 except Exception:
-    show_annual_reports_page = None
+    show_metines_page = None
 
 
 st.set_page_config(
     page_title="Rinkos pulsas",
-    page_icon="",
+    page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 
 # ============================================================
 # SESSION STATE
@@ -41,18 +41,25 @@ st.set_page_config(
 
 if "report_result" not in st.session_state:
     st.session_state.report_result = None
+
 if "report_filename" not in st.session_state:
     st.session_state.report_filename = None
+
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 1
+
 if "uploaded_file_cache" not in st.session_state:
     st.session_state.uploaded_file_cache = None
+
 if "emitentu_result" not in st.session_state:
     st.session_state.emitentu_result = None
+
 if "emitentu_dates" not in st.session_state:
     st.session_state.emitentu_dates = None
+
 if "news_update_message" not in st.session_state:
     st.session_state.news_update_message = None
+
 
 # ============================================================
 # CSS
@@ -60,62 +67,251 @@ if "news_update_message" not in st.session_state:
 
 CSS = """
 <style>
-.nav-card {
-    border: 1px solid rgba(120, 120, 120, 0.25);
-    border-radius: 14px;
-    padding: 14px 14px 10px 14px;
-    margin-bottom: 16px;
+.stApp { background: #ffffff; }
+.block-container {
+    padding-top: 1.2rem;
+    padding-left: 2rem;
+    padding-right: 2rem;
+    max-width: 100% !important;
 }
-.nav-title {
-    font-size: 0.9rem;
-    font-weight: 700;
-    margin-bottom: 10px;
-    opacity: 0.85;
+section[data-testid="stSidebar"] {
+    background: radial-gradient(circle at top left, #0c356b 0%, #061d3a 35%, #03162d 100%) !important;
+    min-width: 350px !important;
+    max-width: 350px !important;
 }
-.nav-link {
-    display: block;
-    padding: 8px 10px;
-    margin: 4px 0;
-    border-radius: 10px;
-    text-decoration: none !important;
-    color: inherit !important;
-    border: 1px solid transparent;
+
+/* Kai Streamlit soninis meniu suskleistas, nepaliekamas tuscias 350 px plotas. */
+section[data-testid="stSidebar"][aria-expanded="false"],
+section[data-testid="stSidebar"][data-expanded="false"] {
+    min-width: 0 !important;
+    max-width: 0 !important;
+    width: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
 }
-.nav-link:hover {
-    border: 1px solid rgba(120, 120, 120, 0.35);
+section[data-testid="stSidebar"][aria-expanded="false"] > div,
+section[data-testid="stSidebar"][data-expanded="false"] > div {
+    display: none !important;
 }
-.nav-link.active {
-    background: rgba(90, 140, 255, 0.14);
-    border: 1px solid rgba(90, 140, 255, 0.35);
-    font-weight: 700;
+[data-testid="stSidebarCollapsedControl"] {
+    left: 0.75rem !important;
 }
+
+section[data-testid="stSidebar"] * { color: #ffffff; }
+
+/* DateInput teksto spalva: kad vedant laikotarpi tekstas nebutu baltas */
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
+    color: #061b34 !important;
+    background: #ffffff !important;
+    caret-color: #061b34 !important;
+    -webkit-text-fill-color: #061b34 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
+    color: #6b7280 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stDateInput"] svg {
+    color: #061b34 !important;
+}
+
 .sidebar-card {
-    border: 1px solid rgba(120, 120, 120, 0.25);
-    border-radius: 14px;
-    padding: 14px;
-    margin-bottom: 16px;
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(157, 190, 230, 0.28);
+    border-radius: 17px;
+    padding: 20px 16px;
+    box-shadow: 0 18px 45px rgba(0,0,0,0.24);
+    margin-bottom: 22px;
 }
 .sidebar-card-title {
-    font-weight: 700;
-    margin-bottom: 8px;
-}
-.sidebar-card-subtitle {
-    font-size: 0.86rem;
-    opacity: 0.75;
+    font-size: 16px;
+    font-weight: 900;
     margin-bottom: 10px;
 }
-.status-muted {
-    font-size: 0.86rem;
-    opacity: 0.8;
+.sidebar-card-subtitle {
+    color: #b8c9df !important;
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+.sidebar-section-title {
+    font-size: 16px;
+    font-weight: 950;
+    margin: 16px 0 8px 0;
+}
+.sidebar-section-subtitle {
+    color: #b8c9df !important;
+    font-size: 13px;
+    line-height: 1.45;
+    margin: 0 0 12px 0;
+}
+.status-ok {
+    color: #23d996 !important;
+    font-weight: 800;
+    margin-top: 12px;
+    font-size: 13px;
+}
+.status-empty {
+    color: #c1cee0 !important;
+    font-weight: 700;
+    margin-top: 12px;
+    font-size: 13px;
+}
+.latest-news-date {
+    margin-top: 12px;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(157,190,230,0.22);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #cfe2ff !important;
+    font-size: 13px;
+    font-weight: 700;
+}
+.latest-news-date span {
+    color: #ffffff !important;
+    font-weight: 900;
+}
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] button {
+    background: linear-gradient(135deg, #1478ff, #0066ff) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 12px !important;
+    height: 48px !important;
+    font-weight: 900 !important;
+}
+.hero-card {
+    background: linear-gradient(135deg, #ffffff 0%, #f2f8ff 52%, #dcecff 100%);
+    border: 1px solid #dbe7f5;
+    border-radius: 18px;
+    padding: 28px 32px;
+    min-height: 172px;
+    box-shadow: 0 8px 28px rgba(8, 44, 84, 0.08);
+}
+.hero-inner {
+    display: flex;
+    align-items: flex-start;
+    gap: 18px;
+}
+.hero-icon {
+    width: 58px;
+    height: 58px;
+    border-radius: 14px;
+    background: #e3efff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 30px;
+}
+.hero-title {
+    font-size: 36px;
+    line-height: 1.05;
+    font-weight: 950;
+    color: #071f3d;
+    margin: 0;
+}
+.hero-text {
+    color: #34435a;
+    margin-top: 8px;
+    font-size: 15px;
+    max-width: 760px;
+}
+.hero-download button {
+    background: #061b34 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    min-height: 52px !important;
+    font-weight: 900 !important;
+}
+.info-box {
+    background: #eaf3ff;
+    color: #0b3f77;
+    border: 1px solid #c9dff8;
+    border-radius: 14px;
+    padding: 18px 20px;
+    margin-top: 24px;
+    font-weight: 700;
+}
+.report-nav-title {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 25px;
+    font-weight: 950;
+    margin: 0 0 14px 0;
+}
+.report-nav-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: rgba(255,255,255,0.16);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 21px;
+}
+.report-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 18px;
+}
+.report-nav a { text-decoration: none !important; }
+.report-nav-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 56px;
+    padding: 0 18px;
+    border-radius: 16px;
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(157,190,230,0.26);
+    color: #ffffff !important;
+    font-weight: 900;
+    font-size: 16px;
+}
+.report-nav-item.active {
+    background: rgba(20,120,255,0.14);
+    border: 3px solid #68bdff;
+}
+.report-nav-item .nav-icon {
+    font-size: 24px;
+    width: 28px;
+    text-align: center;
+}
+.report-table-wrapper {
+    background: white;
+    border: 1px solid #dbe7f5;
+    border-radius: 16px;
+    padding: 14px;
+    margin-top: 16px;
+    box-shadow: 0 10px 28px rgba(8, 44, 84, 0.08);
+    overflow-x: auto;
+}
+.report-table-wrapper table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.report-table-wrapper th {
+    background: #061b34 !important;
+    color: white !important;
+    padding: 12px 10px !important;
+    font-size: 12px !important;
+    text-align: left !important;
+}
+.report-table-wrapper td {
+    padding: 10px !important;
+    font-size: 12px !important;
+    color: #102033 !important;
+    border-bottom: 1px solid #e7eef7 !important;
 }
 </style>
 """
+
 st.markdown(CSS, unsafe_allow_html=True)
+
 
 # ============================================================
 # PAGALBINĖS FUNKCIJOS
 # ============================================================
-
 
 def format_size(size_bytes: int) -> str:
     if size_bytes is None:
@@ -129,18 +325,16 @@ def format_size(size_bytes: int) -> str:
 
 def prepare_emitentu_table_df(emit_df: pd.DataFrame) -> pd.DataFrame:
     if emit_df is None or emit_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "data",
-                "emitentas",
-                "kategorijos",
-                "tipas",
-                "antraste",
-                "santrauka",
-                "raktazodziai",
-                "nuoroda",
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "data",
+            "emitentas",
+            "kategorijos",
+            "tipas",
+            "antraste",
+            "santrauka",
+            "raktazodziai",
+            "nuoroda",
+        ])
 
     df = emit_df.copy()
 
@@ -168,24 +362,23 @@ def prepare_emitentu_table_df(emit_df: pd.DataFrame) -> pd.DataFrame:
         "matched_keywords": "raktazodziai",
         "url": "nuoroda",
     }
+
     for old, new in rename_map.items():
         if old in df.columns:
             df[new] = df[old].fillna("").astype(str)
         elif new not in df.columns:
             df[new] = ""
 
-    return df[
-        [
-            "data",
-            "emitentas",
-            "kategorijos",
-            "tipas",
-            "antraste",
-            "santrauka",
-            "raktazodziai",
-            "nuoroda",
-        ]
-    ]
+    return df[[
+        "data",
+        "emitentas",
+        "kategorijos",
+        "tipas",
+        "antraste",
+        "santrauka",
+        "raktazodziai",
+        "nuoroda",
+    ]]
 
 
 def filter_emitentu_table_df(
@@ -211,7 +404,9 @@ def filter_emitentu_table_df(
 
     if search and search.strip():
         q = search.strip().lower()
+
         mask = pd.Series(False, index=out.index)
+
         for col in [
             "data",
             "emitentas",
@@ -226,6 +421,7 @@ def filter_emitentu_table_df(
                 na=False,
                 regex=False,
             )
+
         out = out[mask]
 
     return out
@@ -233,7 +429,7 @@ def filter_emitentu_table_df(
 
 def show_styled_table(styler):
     st.markdown(
-        f'<div class="styled-table-wrap">{styler.to_html()}</div>',
+        f'<div class="report-table-wrapper">{styler.to_html()}</div>',
         unsafe_allow_html=True,
     )
 
@@ -243,6 +439,7 @@ def show_styled_table(styler):
 # ============================================================
 
 report_param = st.query_params.get("report", "rinkos")
+
 if isinstance(report_param, list):
     report_param = report_param[0] if report_param else "rinkos"
 
@@ -255,6 +452,7 @@ elif report_param == "metines":
 else:
     report_mode = "Rinkos apžvalga"
 
+
 # ============================================================
 # SIDEBAR NAVIGACIJA IR DB ATNAUJINIMAS
 # ============================================================
@@ -266,36 +464,59 @@ with st.sidebar:
     metines_active = "active" if report_mode == "Metinės ataskaitos" else ""
 
     nav_html = f"""
-    <div class="nav-card">
-        <div class="nav-title">Ataskaitos</div>
-        <a class="nav-link {rinkos_active}" href="?report=rinkos" target="_self">Rinkos apžvalga</a>
-        <a class="nav-link {emitentai_active}" href="?report=emitentai" target="_self">Emitentų atranka</a>
-        <a class="nav-link {vadovai_active}" href="?report=vadovai" target="_self">Vadovų sandoriai</a>
-        <a class="nav-link {metines_active}" href="?report=metines" target="_self">Metinės ataskaitos</a>
-    </div>
+        <div class="report-nav-title">
+            <div class="report-nav-icon">📊</div>
+            <div>Ataskaitos</div>
+        </div>
+        <div class="report-nav">
+            <a href="?report=rinkos" target="_self">
+                <div class="report-nav-item {rinkos_active}">
+                    <div class="nav-icon">📈</div>
+                    <div>Rinkos apžvalga</div>
+                </div>
+            </a>
+            <a href="?report=emitentai" target="_self">
+                <div class="report-nav-item {emitentai_active}">
+                    <div class="nav-icon">👥</div>
+                    <div>Emitentų atranka</div>
+                </div>
+            </a>
+            <a href="?report=vadovai" target="_self">
+                <div class="report-nav-item {vadovai_active}">
+                    <div class="nav-icon">👔</div>
+                    <div>Vadovų sandoriai</div>
+                </div>
+            </a>
+            <a href="?report=metines" target="_self">
+                <div class="report-nav-item {metines_active}">
+                    <div class="nav-icon">📚</div>
+                    <div>Metinės ataskaitos</div>
+                </div>
+            </a>
+        </div>
     """
     st.markdown(nav_html, unsafe_allow_html=True)
 
     st.markdown(
         """
-        <div class="sidebar-card">
-            <div class="sidebar-card-title">Naujienų bazė</div>
-            <div class="sidebar-card-subtitle">
-                Patikrina naujausius CRIB pranešimus ir atnaujina aktualius VŽ straipsnius.
-            </div>
+        <div class="sidebar-section-title">🔄 Naujienų bazė</div>
+        <div class="sidebar-section-subtitle">
+        Patikrina naujausius CRIB pranešimus ir atnaujina aktualius VŽ straipsnius.
+        </div>
         """,
         unsafe_allow_html=True,
     )
 
     latest_crib_date = get_latest_crib_news_date()
+
     if latest_crib_date is not None:
         st.markdown(
-            f'<div class="status-muted">Paskutinė DB naujiena:<br><b>{latest_crib_date.strftime("%Y-%m-%d %H:%M")}</b></div>',
+            f'<div class="latest-news-date">🕒 Paskutinė DB naujiena:<br><span>{latest_crib_date.strftime("%Y-%m-%d %H:%M")}</span></div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div class="status-muted">Paskutinė DB naujiena:<br><b>nėra duomenų</b></div>',
+            '<div class="latest-news-date">🕒 Paskutinė DB naujiena:<br><span>nėra duomenų</span></div>',
             unsafe_allow_html=True,
         )
 
@@ -304,11 +525,10 @@ with st.sidebar:
         st.session_state.news_update_message = None
 
     update_news_btn = st.button(
-        "Atnaujinti duomenis",
+        "🔄 Atnaujinti duomenis",
         use_container_width=True,
         key="update_crib_news_btn",
     )
-    st.markdown("</div>", unsafe_allow_html=True)
 
     if update_news_btn:
         try:
@@ -329,6 +549,7 @@ with st.sidebar:
                 crib_pages = int(stats.get("pages_processed", 0) or 0)
 
             manager_note = ""
+
             if update_manager_transactions_from_recent_crib is not None:
                 with st.spinner("Tikrinami vadovų sandorių CRIB pranešimai..."):
                     mgr_stats = update_manager_transactions_from_recent_crib(
@@ -337,17 +558,20 @@ with st.sidebar:
                         headless=True,
                         progress=None,
                     )
-                    manager_found = int(mgr_stats.get("manager_messages_found", 0) or 0)
-                    manager_processed = int(mgr_stats.get("manager_messages_processed", 0) or 0)
-                    manager_saved = int(mgr_stats.get("manager_transactions_saved", 0) or 0)
-                    manager_note = (
-                        f" Vadovų sandoriai: rasta CRIB pranešimų {manager_found}, "
-                        f"apdorota {manager_processed}, įrašyta {manager_saved};"
-                    )
+
+                manager_found = int(mgr_stats.get("manager_messages_found", 0) or 0)
+                manager_processed = int(mgr_stats.get("manager_messages_processed", 0) or 0)
+                manager_saved = int(mgr_stats.get("manager_transactions_saved", 0) or 0)
+
+                manager_note = (
+                    f" Vadovų sandoriai: rasta CRIB pranešimų {manager_found}, "
+                    f"apdorota {manager_processed}, įrašyta {manager_saved};"
+                )
             else:
                 manager_note = " Vadovų sandoriai neatnaujinti: modulis nerastas;"
 
             df_issuers_for_vz = None
+
             with st.spinner("Kraunamas emitentų sąrašas VŽ atrankai..."):
                 try:
                     df_issuers_for_vz = load_issuer_df()
@@ -362,19 +586,22 @@ with st.sidebar:
                         max_articles=80,
                         progress=None,
                     )
-                    vz_found = int(vz_stats.get("found", 0) or 0)
-                    vz_inserted = int(vz_stats.get("inserted", 0) or 0)
-                    vz_checked = int(vz_stats.get("checked", 0) or 0)
-                    vz_matched = int(vz_stats.get("matched", 0) or 0)
-                    vz_note += (
-                        f" VŽ patikrinta {vz_checked} straipsnių, "
-                        f"aktualių kandidatų {vz_matched}."
-                    )
+
+                vz_found = int(vz_stats.get("found", 0) or 0)
+                vz_inserted = int(vz_stats.get("inserted", 0) or 0)
+                vz_checked = int(vz_stats.get("checked", 0) or 0)
+                vz_matched = int(vz_stats.get("matched", 0) or 0)
+
+                vz_note += (
+                    f" VŽ patikrinta {vz_checked} straipsnių, "
+                    f"aktualių kandidatų {vz_matched}."
+                )
             elif not vz_note:
                 vz_note = " VŽ neatnaujinta: DB nėra emitentų sąrašo."
 
             st.session_state.report_result = None
             st.session_state.emitentu_result = None
+
             st.session_state.news_update_message = (
                 f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
                 f"(patikrinta puslapių: {crib_pages});"
@@ -382,21 +609,13 @@ with st.sidebar:
                 f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
                 f"{vz_note}"
             )
+
             st.rerun()
+
         except Exception as exc:
             st.error("Nepavyko atnaujinti naujienų bazės.")
             st.exception(exc)
 
-# ============================================================
-# METINĖS ATASKAITOS
-# ============================================================
-
-if report_mode == "Metinės ataskaitos":
-    if show_annual_reports_page is None:
-        st.error("Nepavyko užkrauti metinių ataskaitų modulio metines.py.")
-        st.stop()
-    show_annual_reports_page()
-    st.stop()
 
 # ============================================================
 # VADOVŲ SANDORIAI
@@ -406,8 +625,23 @@ if report_mode == "Vadovų sandoriai":
     if show_manager_transactions_page is None:
         st.error("Nepavyko užkrauti vadovų sandorių modulio vadovu_sandoriai.py.")
         st.stop()
+
     show_manager_transactions_page()
     st.stop()
+
+
+# ============================================================
+# METINĖS ATASKAITOS
+# ============================================================
+
+if report_mode == "Metinės ataskaitos":
+    if show_metines_page is None:
+        st.error("Nepavyko užkrauti metinių ataskaitų modulio metines.py.")
+        st.stop()
+
+    show_metines_page()
+    st.stop()
+
 
 # ============================================================
 # EMITENTŲ ATRANKA
@@ -416,34 +650,39 @@ if report_mode == "Vadovų sandoriai":
 if report_mode == "Emitentų atranka":
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-card-title">Emitentų atranka</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-card-title">🧾 Emitentų atranka</div>', unsafe_allow_html=True)
         st.markdown(
             '<div class="sidebar-card-subtitle">CRIB naujienos imamos iš Supabase DB. Pasirinkite laikotarpį.</div>',
             unsafe_allow_html=True,
         )
+
         emit_start_date = st.date_input(
             "Nuo",
             value=date.today(),
             key="emitentu_start_date",
         )
+
         emit_end_date = st.date_input(
             "Iki",
             value=date.today(),
             key="emitentu_end_date",
         )
+
         st.markdown(
-            '<div class="status-muted">Naudojama market_news lentelė, source=crib</div>',
+            '<div class="status-ok">✅ Naudojama market_news lentelė, source=crib</div>',
             unsafe_allow_html=True,
         )
+        st.markdown("</div>", unsafe_allow_html=True)
+
         emit_run_btn = st.button(
-            "Generuoti emitentų atranką",
+            "🚀 Generuoti emitentų atranką",
             type="primary",
             use_container_width=True,
             key="emitentu_run_btn",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
 
     emit_result = st.session_state.emitentu_result
+
     if emit_result is not None:
         emit_html_bytes = emit_result["html"].encode("utf-8")
         emit_out_name = (
@@ -455,62 +694,93 @@ if report_mode == "Emitentų atranka":
         emit_out_name = "emitentu_atranka.html"
 
     hero_col, download_col = st.columns([5, 1.35])
+
     with hero_col:
         st.markdown(
             """
-            # Emitentų atranka
-
-            CRIB pranešimų peržiūra su paieška, emitentų ir kategorijų filtrais.
-            Kategorijų santraukos šiame vaizde nebėra.
+            <div class="hero-card">
+                <div class="hero-inner">
+                    <div class="hero-icon">🧾</div>
+                    <div>
+                        <h1 class="hero-title">Emitentų atranka</h1>
+                        <div class="hero-text">
+                            CRIB pranešimų peržiūra su paieška, emitentų ir kategorijų filtrais.
+                            Kategorijų santraukos šiame vaizde nebėra.
+                        </div>
+                    </div>
+                </div>
+            </div>
             """,
             unsafe_allow_html=True,
         )
+
     with download_col:
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="hero-download">', unsafe_allow_html=True)
+
         if emit_html_bytes is not None:
             st.download_button(
-                label="Atsisiųsti HTML",
+                label="⬇ Atsisiųsti HTML",
                 data=emit_html_bytes,
                 file_name=emit_out_name,
                 mime="text/html",
                 use_container_width=True,
             )
         else:
-            st.button("Atsisiųsti HTML", disabled=True, use_container_width=True)
+            st.button("⬇ Atsisiųsti HTML", disabled=True, use_container_width=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
     col1, col2 = st.columns(2)
-    col1.metric("Nuo", str(emit_start_date or "-"))
-    col2.metric("Iki", str(emit_end_date or "-"))
+    col1.metric("🗓️ Nuo", str(emit_start_date or "-"))
+    col2.metric("🗓️ Iki", str(emit_end_date or "-"))
+
     st.markdown("---")
 
     if emit_run_btn:
         if emit_start_date is None or emit_end_date is None:
             st.error("Pasirinkite datas.")
             st.stop()
+
         if emit_start_date > emit_end_date:
             st.error("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
             st.stop()
+
         try:
             with st.spinner("Kraunamos CRIB naujienos iš Supabase ir generuojama emitentų atranka..."):
                 generated_emit = generate_emitentu_ataskaita(
                     start_date=emit_start_date,
                     end_date=emit_end_date,
                 )
+
             st.session_state.emitentu_result = generated_emit
             st.session_state.emitentu_dates = (emit_start_date, emit_end_date)
             st.rerun()
+
         except Exception as exc:
             st.exception(exc)
             st.stop()
 
     emit_result = st.session_state.emitentu_result
+
     if emit_result is None:
-        st.markdown("ℹ️ Pasirinkite laikotarpį ir paspauskite „Generuoti emitentų atranką“.")
+        st.markdown(
+            """
+            <div class="info-box">
+                ℹ️ Pasirinkite laikotarpį ir paspauskite „Generuoti emitentų atranką“.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.stop()
 
     st.success(f"Rasta CRIB įrašų: {len(emit_result['df'])}")
-    tab1, tab2 = st.tabs(["HTML ataskaita", "Atsisiuntimas"])
+
+    tab1, tab2 = st.tabs([
+        "🧾 HTML ataskaita",
+        "⬇️ Atsisiuntimas",
+    ])
 
     with tab1:
         components.html(
@@ -522,8 +792,9 @@ if report_mode == "Emitentų atranka":
     with tab2:
         df_export = prepare_emitentu_table_df(emit_result["df"])
         csv_data = df_export.to_csv(index=False).encode("utf-8-sig")
+
         st.download_button(
-            "Atsisiųsti lentelę CSV formatu",
+            "⬇ Atsisiųsti lentelę CSV formatu",
             data=csv_data,
             file_name=(
                 f"emitentu_atranka_{emit_result['start_date'].strftime('%Y%m%d')}_"
@@ -532,8 +803,9 @@ if report_mode == "Emitentų atranka":
             mime="text/csv",
             use_container_width=True,
         )
+
         st.download_button(
-            "Atsisiųsti HTML ataskaitą",
+            "⬇ Atsisiųsti HTML ataskaitą",
             data=emit_result["html"].encode("utf-8"),
             file_name=(
                 f"emitentu_atranka_{emit_result['start_date'].strftime('%Y%m%d')}_"
@@ -542,35 +814,43 @@ if report_mode == "Emitentų atranka":
             mime="text/html",
             use_container_width=True,
         )
+
     st.stop()
+
 
 # ============================================================
 # RINKOS APŽVALGA
 # ============================================================
 
 with st.sidebar:
-    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-card-title">Laikotarpis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-title">🗓️ Laikotarpis</div>', unsafe_allow_html=True)
+
     start_date = st.date_input(
         "Nuo",
         value=date.today(),
         key="rinkos_start_date",
     )
+
     end_date = st.date_input(
         "Iki",
         value=date.today(),
         key="rinkos_end_date",
     )
+
     run_btn = st.button(
-        "Generuoti ataskaitą",
+        "🚀 Generuoti ataskaitą",
         type="primary",
         use_container_width=True,
         key="rinkos_run_btn",
     )
-    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-card-title">Duomenų šaltinis</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="sidebar-section-title">📌 Duomenų šaltinis</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     duomenu_saltinis = st.radio(
         "Pasirinkite duomenų gavimo būdą",
         ["Atsisiųsti iš Nasdaq Baltic", "Įkelti Excel rankiniu būdu"],
@@ -583,14 +863,16 @@ with st.sidebar:
 
     if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
         st.markdown(
-            '<div class="status-muted">Automatinis atsisiuntimas įjungtas</div>',
+            '<div class="status-ok">✅ Automatinis atsisiuntimas įjungtas</div>',
             unsafe_allow_html=True,
         )
+
     else:
         st.markdown(
-            '<div class="sidebar-card-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx).</div>',
+            '<div class="sidebar-section-subtitle">Įkelkite Nasdaq statistikos Excel failą (.xlsx).</div>',
             unsafe_allow_html=True,
         )
+
         if st.session_state.uploaded_file_cache is None:
             uploaded_file_temp = st.file_uploader(
                 "Statistikos Excel failas",
@@ -598,17 +880,20 @@ with st.sidebar:
                 label_visibility="collapsed",
                 key=f"statistics_uploader_{st.session_state.uploader_key}",
             )
+
             if uploaded_file_temp is not None:
                 st.session_state.uploaded_file_cache = uploaded_file_temp
                 st.rerun()
+
         else:
             uploaded_file = st.session_state.uploaded_file_cache
             st.markdown(
-                f'<div class="status-muted">Failas įkeltas: <b>{uploaded_file.name}</b></div>',
+                f'<div class="status-ok">✅ Failas įkeltas: {uploaded_file.name}</div>',
                 unsafe_allow_html=True,
             )
+
             if st.button(
-                "Pakeisti failą",
+                "🔄 Pakeisti failą",
                 use_container_width=True,
                 key="change_statistics_file_btn",
             ):
@@ -620,12 +905,13 @@ with st.sidebar:
 
         if uploaded_file is None:
             st.markdown(
-                '<div class="status-muted">Failas neįkeltas</div>',
+                '<div class="status-empty">🛡️ Failas neįkeltas</div>',
                 unsafe_allow_html=True,
             )
-    st.markdown("</div>", unsafe_allow_html=True)
+
 
 result = st.session_state.report_result
+
 if result is not None:
     html_bytes = result["html"].encode("utf-8")
     out_name = f"rinkos_ataskaita_{date.today().isoformat()}.html"
@@ -633,22 +919,34 @@ else:
     html_bytes = None
     out_name = "rinkos_ataskaita.html"
 
+
 hero_col, download_col = st.columns([5, 1.35])
+
 with hero_col:
     st.markdown(
         """
-        # Rinkos pulsas
-
-        Įkelkite Nasdaq statistikos Excel failą arba leiskite programai jį atsisiųsti automatiškai.
-        Aplikacija surinks CRIB, VŽ ir Nasdaq naujienas, suformuos lenteles ir HTML ataskaitą.
+        <div class="hero-card">
+            <div class="hero-inner">
+                <div class="hero-icon">📈</div>
+                <div>
+                    <h1 class="hero-title">Rinkos pulsas</h1>
+                    <div class="hero-text">
+                        Įkelkite Nasdaq statistikos Excel failą arba leiskite programai jį atsisiųsti automatiškai.
+                        Aplikacija surinks CRIB, VŽ ir Nasdaq naujienas, suformuos lenteles ir HTML ataskaitą.
+                    </div>
+                </div>
+            </div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
+
 with download_col:
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="hero-download">', unsafe_allow_html=True)
+
     if html_bytes is not None:
         st.download_button(
-            label="Atsisiųsti HTML",
+            label="⬇ Atsisiųsti HTML",
             data=html_bytes,
             file_name=out_name,
             mime="text/html",
@@ -656,21 +954,28 @@ with download_col:
         )
     else:
         st.button(
-            "Atsisiųsti HTML",
+            "⬇ Atsisiųsti HTML",
             disabled=True,
             use_container_width=True,
         )
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 st.markdown("<br>", unsafe_allow_html=True)
+
 col1, col2 = st.columns(2)
-col1.metric("Nuo", str(start_date or "-"))
-col2.metric("Iki", str(end_date or "-"))
+col1.metric("🗓️ Nuo", str(start_date or "-"))
+col2.metric("🗓️ Iki", str(end_date or "-"))
+
 st.markdown("---")
+
 
 if run_btn:
     if start_date is None or end_date is None:
         st.error("Nepavyko nustatyti datų. Pasirinkite laikotarpį rankiniu būdu.")
         st.stop()
+
     if start_date > end_date:
         st.error("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
         st.stop()
@@ -683,18 +988,22 @@ if run_btn:
     try:
         with st.spinner("Generuojama ataskaita..."):
             if duomenu_saltinis == "Atsisiųsti iš Nasdaq Baltic":
-                progress("Atsisiunčiamas Nasdaq Baltic statistikos Excel failas...")
+                progress("📥 Atsisiunčiamas Nasdaq Baltic statistikos Excel failas...")
+
                 uploaded_file, filename = download_nasdaq_statistics_excel(
                     start_date=start_date,
                     end_date=end_date,
                     download_dir="downloads",
                     progress=progress,
                 )
-                progress(f"Failas atsisiųstas: {filename}")
+
+                progress(f"✅ Failas atsisiųstas: {filename}")
+
             else:
                 if uploaded_file is None:
                     st.error("Įkelkite Excel failą arba pasirinkite automatinį atsisiuntimą iš Nasdaq Baltic.")
                     st.stop()
+
                 filename = uploaded_file.name
 
             generated = generate_report(
@@ -704,50 +1013,65 @@ if run_btn:
                 end_date=end_date,
                 progress=progress,
             )
-            st.session_state.report_result = generated
-            st.session_state.report_filename = filename
 
-            try:
-                issuer_count = save_issuer_list_from_stat_df(generated.get("df_raw"))
-                progress_box.success(
-                    f"Ataskaita sugeneruota. Emitentų sąrašas DB atnaujintas: {issuer_count} įrašų."
-                )
-            except Exception as issuer_exc:
-                progress_box.warning(
-                    f"Ataskaita sugeneruota, bet emitentų sąrašo nepavyko išsaugoti DB: {issuer_exc}"
-                )
-            st.rerun()
+        st.session_state.report_result = generated
+        st.session_state.report_filename = filename
+
+        try:
+            issuer_count = save_issuer_list_from_stat_df(generated.get("df_raw"))
+            progress_box.success(
+                f"Ataskaita sugeneruota. Emitentų sąrašas DB atnaujintas: {issuer_count} įrašų."
+            )
+        except Exception as issuer_exc:
+            progress_box.warning(
+                f"Ataskaita sugeneruota, bet emitentų sąrašo nepavyko išsaugoti DB: {issuer_exc}"
+            )
+
+        st.rerun()
+
     except Exception as exc:
         st.exception(exc)
         st.stop()
 
+
 result = st.session_state.report_result
+
 if result is None:
-    st.markdown("ℹ️ Pasirinkite duomenų šaltinį ir paspauskite „Generuoti ataskaitą“.")
+    st.markdown(
+        """
+        <div class="info-box">
+            ℹ️ Pasirinkite duomenų šaltinį ir paspauskite „Generuoti ataskaitą“.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.stop()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    [
-        "Akcijos",
-        "Obligacijos",
-        "First North",
-        "Visos naujienos",
-        "Pilna HTML peržiūra",
-    ]
-)
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📈 Akcijos",
+    "🏦 Obligacijos",
+    "🌱 First North",
+    "📰 Visos naujienos",
+    "🧾 Pilna HTML peržiūra",
+])
+
 
 with tab1:
     show_styled_table(result["styled_akcijos"])
+
 with tab2:
     show_styled_table(result["styled_obligacijos"])
+
 with tab3:
     show_styled_table(result["styled_first_north"])
+
 with tab4:
     show_styled_table(result["styled_visos"])
+
 with tab5:
     components.html(
         result["html"],
         height=900,
         scrolling=True,
     )
-
