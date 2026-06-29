@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 Metiniu ataskaitu modulis Rinkos pulsui.
@@ -592,7 +591,30 @@ def save_annual_metric_row(row: dict) -> bool:
             return True
         if resp.status_code == 409:
             return False
+        if _is_missing_table_response(resp):
+            raise RuntimeError(
+                "Supabase lentelė annual_report_metrics dar nesukurta arba nematoma REST API schema cache. "
+                "Paleisk annual_report_metrics_schema.sql Supabase SQL Editor lange ir perkrauk aplikaciją."
+            )
         raise RuntimeError(f"Supabase {METRICS_TABLE} įrašymo klaida: {resp.status_code} - {resp.text}")
+
+
+def _is_missing_table_response(resp) -> bool:
+    """Ar Supabase REST atsakymas rodo, kad lentelė dar nesukurta / nematoma schema cache."""
+    try:
+        if int(getattr(resp, "status_code", 0) or 0) == 404:
+            return True
+        txt = str(getattr(resp, "text", "") or "").lower()
+        return "could not find the table" in txt or "schema cache" in txt or "404 not found" in txt
+    except Exception:
+        return False
+
+
+def _show_missing_metrics_table_warning():
+    st.warning(
+        "Supabase lentelė `annual_report_metrics` dar nesukurta arba nematoma REST API schema cache. "
+        "Paleisk `annual_report_metrics_schema.sql` Supabase SQL Editor lange, tada perkrauk aplikaciją."
+    )
 
 
 def load_annual_metrics_from_db(start_date, end_date) -> pd.DataFrame:
@@ -608,6 +630,9 @@ def load_annual_metrics_from_db(start_date, end_date) -> pd.DataFrame:
         }
         with http_client() as client:
             resp = client.get(url, headers=headers(), params=params)
+            if _is_missing_table_response(resp):
+                _show_missing_metrics_table_warning()
+                return pd.DataFrame()
             resp.raise_for_status()
             data = resp.json() or []
         return pd.DataFrame(data)
