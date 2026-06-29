@@ -23,8 +23,22 @@ except Exception:
 
 try:
     from metines import show_metines_page
-except Exception:
+except Exception as exc:
     show_metines_page = None
+    show_metines_page_import_error = exc
+else:
+    show_metines_page_import_error = None
+
+try:
+    from metines import show_annual_reports_page
+except Exception:
+    show_annual_reports_page = None
+
+# Suderinamumas: jei metines.py turi senesnį funkcijos pavadinimą,
+# aplikacija vis tiek užkraus puslapį.
+if show_metines_page is None and show_annual_reports_page is not None:
+    show_metines_page = show_annual_reports_page
+    show_metines_page_import_error = None
 
 
 st.set_page_config(
@@ -637,6 +651,10 @@ if report_mode == "Vadovų sandoriai":
 if report_mode == "Metinės ataskaitos":
     if show_metines_page is None:
         st.error("Nepavyko užkrauti metinių ataskaitų modulio metines.py.")
+        if show_metines_page_import_error is not None:
+            import traceback
+            st.warning("Žemiau rodoma tikroji importavimo klaida. Ji padės sutvarkyti metines.py.")
+            st.code("".join(traceback.format_exception(type(show_metines_page_import_error), show_metines_page_import_error, show_metines_page_import_error.__traceback__)))
         st.stop()
 
     show_metines_page()
