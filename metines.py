@@ -2,121 +2,99 @@
 """
 Metiniu ataskaitu modulis Rinkos pulsui.
 
-Tikslas:
-- is Supabase market_news lenteles paimti CRIB kategorijos "Metine informacija" pranesimus;
-- atrinkti tik Supabase market_issuers sarase saugomus VLN emitentus;
-- is CRIB priedu atsisiusti PDF arba XBRL metines ataskaitas;
-- istraukti pagrindinius finansinius rodiklius:
-    * Balansinis turtas, tukst. EUR: grupes ir bendroves;
-    * Pajamos, tukst. EUR: grupes ir bendroves;
-- rezultatus issaugoti Supabase lenteleje annual_report_metrics;
-- parodyti atskira Streamlit ataskaitos puslapi.
-
-Pastaba: PDF lenteliu struktura tarp emitentu skiriasi, todel parseris yra atsargus.
-Jeigu rodiklio nepavyksta patikimai nustatyti, laukas paliekamas tuscias, o parse_status
-ir parse_note parodo priezasti.
+Funkcionalumas:
+- rodo laikotarpio pasirinkima Streamlit puslapyje;
+- is market_news paima CRIB kategorijos "Metine informacija" / "Annual information" irasus;
+- filtruoja tik market_issuers lenteles VLN emitentus;
+- suranda PDF / XBRL / XML / XHTML priedus CRIB puslapyje;
+- issaugo annual_reports ir annual_report_files lentelese;
+- ikelia pacius failus i Supabase Storage bucket annual-reports;
+- PDF tekstui bando issaugoti raw_text ateities analizei;
+- klaidu nebeslepia: puslapyje parodo, kodel konkretus irasas nebuvo issaugotas.
 """
 
 import os
 import re
-import hashlib
-import warnings
+import mimetypes
+import traceback
 from datetime import date, timedelta
 from io import BytesIO
-from urllib.parse import urljoin
-from xml.etree import ElementTree as ET
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
-import pdfplumber
-import urllib3
 from bs4 import BeautifulSoup
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+from supabase_cache import load_news_df
 
 try:
-    from supabase_cache import load_news_df
+    from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
 except Exception:
-    load_news_df = None
+    _supabase_headers = None
+    _supabase_rest_url = None
+    _http_client = None
 
 
-ANNUAL_CATEGORY_TOKENS = (
+ANNUAL_CATEGORY_PATTERNS = (
     "metinė informacija",
     "metine informacija",
     "annual information",
 )
 
-OFFICIAL_OR_SECONDARY_TOKENS = (
-    "oficial", "official", "main list", "baltic main", "papild", "secondary", "additional",
-)
-
-EXCLUDED_LIST_TOKENS = (
-    "first north", "bond", "oblig", "fund", "etf", "vyriausyb", "government",
-)
-
-METRICS_TABLE = "annual_report_metrics"
+REPORT_FILE_EXTENSIONS = (".pdf", ".xml", ".xbrl", ".xhtml", ".html", ".zip")
+REPORT_BUCKET = "annual-reports"
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Bendros pagalbines funkcijos
-# ------------------------------------------------------------
+# ============================================================
+
 
 def _collapse_ws(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def _norm(value: str) -> str:
+def _lt_norm(value) -> str:
     s = str(value or "").lower().strip()
-    repl = str.maketrans({"ą": "a", "č": "c", "ę": "e", "ė": "e", "į": "i", "š": "s", "ų": "u", "ū": "u", "ž": "z"})
+    repl = str.maketrans({
+        "ą": "a", "č": "c", "ę": "e", "ė": "e", "į": "i",
+        "š": "s", "ų": "u", "ū": "u", "ž": "z",
+    })
     s = s.translate(repl)
+    s = re.sub(r"\b(ab|uab|as|asa|akcine bendrove|uzdaroji akcine bendrove)\b", " ", s)
+    s = s.replace(" group", " ").replace(" grupe", " ")
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _issuer_key(value: str) -> str:
-    s = _norm(value)
-    s = re.sub(r"\b(ab|uab|as|asa|akcine bendrove|uzdaroji akcine bendrove)\b", " ", s)
-    s = s.replace(" group", " ").replace(" grupe", " ")
-    return re.sub(r"\s+", " ", s).strip()
+def _is_annual_category(category: str) -> bool:
+    c = str(category or "").lower()
+    c_norm = _lt_norm(c)
+    return any(_lt_norm(p) in c_norm for p in ANNUAL_CATEGORY_PATTERNS)
 
 
-def _parse_number(value):
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s or s.lower() in {"nan", "none", "null", "-", "–"}:
-        return None
-    neg = False
-    if re.search(r"\(.*\)", s):
-        neg = True
-    s = s.replace("\u00a0", " ")
-    m = re.search(r"[-+]?\d[\d\s.,]*", s)
-    if not m:
-        return None
-    num = m.group(0).replace(" ", "")
-    if "," in num and "." in num:
-        if num.rfind(",") > num.rfind("."):
-            num = num.replace(".", "").replace(",", ".")
-        else:
-            num = num.replace(",", "")
-    else:
-        num = num.replace(",", ".")
-    try:
-        out = float(num)
-        if neg and out > 0:
-            out = -out
-        return out
-    except Exception:
-        return None
+def _is_annual_report_title(title: str, category: str = "") -> bool:
+    txt = _lt_norm(f"{category} {title}")
+    if any(x in txt for x in ["preliminar", "dividend", "prognoz", "presentation", "prezentacij"]):
+        return False
+    return (
+        _is_annual_category(category)
+        or "metin" in txt
+        or "annual report" in txt
+        or "annual information" in txt
+        or "audituot" in txt
+        or "audited" in txt
+    )
 
 
-def _sha256_bytes(content: bytes) -> str:
-    return hashlib.sha256(content or b"").hexdigest()
-
-
-def _to_iso(value):
+def _safe_iso_ts(value):
     try:
         if value is not None and not pd.isna(value):
             return pd.to_datetime(value).isoformat()
@@ -125,134 +103,184 @@ def _to_iso(value):
     return None
 
 
-def _supabase_client_parts():
-    from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
-    return _supabase_headers, _supabase_rest_url, _http_client
-
-
-# ------------------------------------------------------------
-# Emitentai: tik Vilniaus oficialusis ir papildomasis sarasas
-# ------------------------------------------------------------
-
-def load_vln_official_secondary_issuers() -> pd.DataFrame:
-    """Uzkrauna leidziamu emitentu sarasa is Supabase market_issuers.
-
-    Svarbu: emitentu sarasas jau yra pildomas duomenu bazeje, todel cia
-    nebespeliiojame pagal CRIB ir papildomai nesurenkame emitentu is isores.
-    Imami tik market_issuers irasai su market='VLN'.
-
-    Jeigu market_issuers lenteleje jau laikomi tik Vilniaus oficialiojo ir
-    papildomojo saraso emitentai, sis filtras bus tiksliai toks, kokio reikia.
-    Jeigu lenteleje yra ir First North / obligaciju / fondu irasu, jie bus
-    atmesti tik pagal aiskiai matomus segmento / tipo pozymius DB laukuose.
-    """
+def _safe_date(value):
     try:
-        headers, rest_url, http_client = _supabase_client_parts()
-        url = rest_url("market_issuers")
-        params = {"select": "*", "market": "eq.VLN", "order": "issuer.asc"}
-        with http_client() as client:
-            resp = client.get(url, headers=headers(), params=params)
-            resp.raise_for_status()
-            rows = resp.json() or []
-    except Exception as exc:
-        st.warning(f"Nepavyko uzkrauti market_issuers lenteles: {exc}")
-        return pd.DataFrame()
+        if value is not None and not pd.isna(value):
+            return pd.to_datetime(value).date()
+    except Exception:
+        pass
+    return None
 
+
+def _detect_report_year(title: str, published_at=None) -> Optional[int]:
+    title = str(title or "")
+    years = [int(y) for y in re.findall(r"\b(20\d{2})\b", title)]
+    if years:
+        return max(years)
+    d = _safe_date(published_at)
+    if d:
+        # Metines ataskaitos dazniausiai skelbiamos kitais metais uz praeitus finansinius metus.
+        return d.year - 1
+    return None
+
+
+def _guess_file_type(url: str, content_type: str = "", name: str = "") -> str:
+    u = f"{url or ''} {name or ''} {content_type or ''}".lower()
+    if ".pdf" in u or "application/pdf" in u:
+        return "pdf"
+    if ".xbrl" in u or "xbrl" in u:
+        return "xbrl"
+    if ".xhtml" in u:
+        return "xhtml"
+    if ".xml" in u:
+        return "xml"
+    if ".zip" in u:
+        return "zip"
+    if ".html" in u or "text/html" in u:
+        return "html"
+    return "file"
+
+
+def _filename_from_url(url: str, fallback: str = "report") -> str:
+    try:
+        parsed = urlparse(url)
+        name = os.path.basename(parsed.path)
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
+        return name or fallback
+    except Exception:
+        return fallback
+
+
+# ============================================================
+# Supabase pagalbininkai
+# ============================================================
+
+
+def _require_supabase_helpers():
+    if _supabase_headers is None or _supabase_rest_url is None or _http_client is None:
+        raise RuntimeError("Nepavyko importuoti Supabase pagalbiniu funkciju is supabase_cache.py")
+
+
+def _headers_json(prefer: Optional[str] = None) -> Dict[str, str]:
+    _require_supabase_helpers()
+    h = dict(_supabase_headers())
+    h["Content-Type"] = "application/json"
+    if prefer:
+        h["Prefer"] = prefer
+    return h
+
+
+def _supabase_base_url() -> str:
+    env_url = os.getenv("SUPABASE_URL") or os.getenv("supabase_url")
+    if env_url:
+        return env_url.rstrip("/")
+    # Is REST URL: https://xxx.supabase.co/rest/v1/table -> https://xxx.supabase.co
+    test_url = _supabase_rest_url("__dummy__")
+    return test_url.split("/rest/v1/")[0].rstrip("/")
+
+
+def _get_table_rows(table: str, params: Dict) -> List[dict]:
+    _require_supabase_helpers()
+    url = _supabase_rest_url(table)
+    with _http_client() as client:
+        resp = client.get(url, headers=_supabase_headers(), params=params)
+        resp.raise_for_status()
+        return resp.json() or []
+
+
+def _post_table_row(table: str, row: dict, on_conflict: Optional[str] = None) -> dict:
+    _require_supabase_helpers()
+    url = _supabase_rest_url(table)
+    params = {}
+    if on_conflict:
+        params["on_conflict"] = on_conflict
+    headers = _headers_json("resolution=merge-duplicates,return=representation")
+    with _http_client() as client:
+        resp = client.post(url, headers=headers, params=params, json=row)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Supabase INSERT/UPSERT klaida {table}: {resp.status_code} - {resp.text}")
+        data = resp.json() or []
+        return data[0] if isinstance(data, list) and data else {}
+
+
+def _patch_table_rows(table: str, filters: Dict[str, str], row: dict) -> bool:
+    _require_supabase_helpers()
+    url = _supabase_rest_url(table)
+    with _http_client() as client:
+        resp = client.patch(url, headers=_headers_json("return=minimal"), params=filters, json=row)
+        if resp.status_code not in (200, 204):
+            raise RuntimeError(f"Supabase UPDATE klaida {table}: {resp.status_code} - {resp.text}")
+        return True
+
+
+def _upload_to_storage(bucket: str, storage_path: str, content: bytes, content_type: str) -> bool:
+    base = _supabase_base_url()
+    storage_path = storage_path.lstrip("/")
+    url = f"{base}/storage/v1/object/{bucket}/{storage_path}"
+    headers = dict(_supabase_headers())
+    headers["Content-Type"] = content_type or "application/octet-stream"
+    headers["x-upsert"] = "true"
+    resp = requests.post(url, headers=headers, data=content, timeout=90)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Supabase Storage upload klaida: {resp.status_code} - {resp.text[:500]}")
+    return True
+
+
+def load_vln_issuers() -> pd.DataFrame:
+    rows = _get_table_rows(
+        "market_issuers",
+        {
+            "select": "issuer,company,issuer_norm,company_norm,ticker,market",
+            "market": "eq.VLN",
+            "order": "issuer.asc",
+        },
+    )
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
-
-    if "issuer" not in df.columns:
-        if "company" in df.columns:
-            df["issuer"] = df["company"]
-        else:
-            df["issuer"] = ""
-
-    # Jei DB turi aktyvumo pozymi, paliekame tik aktyvius irasus.
-    for active_col in ["is_active", "active", "listed"]:
-        if active_col in df.columns:
-            mask = df[active_col].fillna(True).astype(str).str.lower().isin(["true", "1", "yes", "taip"])
-            if mask.any():
-                df = df[mask].copy()
-            break
-
-    # Neatmetame emitentu pagal pavadinimo interpretacijas, bet jei tame paciame
-    # Supabase sarase yra obligaciju / fondu / First North instrumentu, juos
-    # isfiltruojame pagal aiskiai DB saugomus segmentu ar tipo laukus.
-    searchable_cols = [c for c in df.columns if c.lower() in {
-        "list", "listing", "segment", "market_segment", "market_list", "trading_list",
-        "board", "instrument_group", "security_type", "asset_class", "category", "group", "type",
-    }]
-    if searchable_cols:
-        text = df[searchable_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
-        excluded = text.apply(lambda x: any(t in x for t in EXCLUDED_LIST_TOKENS))
-        df = df[~excluded].copy()
-
-    df["issuer"] = df["issuer"].fillna("").astype(str).str.strip()
-    df = df[df["issuer"] != ""].copy()
-
-    # Naudojame DB normalizuotus laukus, jei jie yra, o jei ne - pasidarome lokaliai.
-    if "issuer_norm" in df.columns:
-        norm_from_db = df["issuer_norm"].fillna("").astype(str).str.strip()
-    else:
-        norm_from_db = pd.Series([""] * len(df), index=df.index)
-    df["issuer_key"] = norm_from_db.where(norm_from_db.ne(""), df["issuer"].apply(_issuer_key))
-    df["issuer_key"] = df["issuer_key"].apply(_issuer_key)
-
-    keep_cols = [c for c in ["issuer", "company", "ticker", "isin", "issuer_norm", "company_norm", "issuer_key"] if c in df.columns]
-    return df[keep_cols].drop_duplicates(subset=["issuer_key"]).reset_index(drop=True)
-
-def _canonical_issuer_from_allowed(value: str, allowed_issuers: pd.DataFrame) -> str:
-    if allowed_issuers is None or allowed_issuers.empty:
-        return str(value or "").strip()
-    key = _issuer_key(value)
-    if not key:
-        return ""
-    lookup = dict(zip(allowed_issuers["issuer_key"], allowed_issuers["issuer"]))
-    if key in lookup:
-        return lookup[key]
-    for k, issuer in lookup.items():
-        if key and k and (key in k or k in key):
-            return issuer
-    return ""
+        return pd.DataFrame(columns=["issuer", "issuer_norm", "company", "ticker", "market"])
+    for col in ["issuer", "company", "issuer_norm", "company_norm", "ticker", "market"]:
+        if col not in df.columns:
+            df[col] = ""
+    df["issuer"] = df["issuer"].fillna(df["company"]).fillna("").astype(str).str.strip()
+    df["issuer_norm_calc"] = df["issuer"].apply(_lt_norm)
+    return df
 
 
-def _infer_issuer_from_text(title: str, content: str, allowed_issuers: pd.DataFrame) -> str:
-    if allowed_issuers is None or allowed_issuers.empty:
-        return ""
-    text_key = _issuer_key(f"{title or ''} {content or ''}")
+def _build_issuer_lookup(issuers_df: pd.DataFrame) -> Dict[str, str]:
+    lookup = {}
+    if issuers_df is None or issuers_df.empty:
+        return lookup
+    for _, r in issuers_df.iterrows():
+        canonical = str(r.get("issuer") or r.get("company") or "").strip()
+        if not canonical:
+            continue
+        for c in [canonical, r.get("company"), r.get("issuer_norm"), r.get("company_norm"), r.get("ticker")]:
+            key = _lt_norm(c)
+            if key:
+                lookup[key] = canonical
+    return lookup
+
+
+def _infer_issuer_from_text(text: str, lookup: Dict[str, str]) -> str:
+    txt = _lt_norm(text)
     best = ""
     best_len = 0
-    for _, row in allowed_issuers.iterrows():
-        key = str(row.get("issuer_key") or "")
-        issuer = str(row.get("issuer") or "")
-        if len(key) < 3:
+    for key, issuer in lookup.items():
+        if not key or len(key) < 3:
             continue
-        if re.search(rf"(?:^|\s){re.escape(key)}(?:\s|$)", text_key):
+        if re.search(rf"(?:^|\s){re.escape(key)}(?:\s|$)", txt):
             if len(key) > best_len:
                 best = issuer
                 best_len = len(key)
     return best
 
 
-# ------------------------------------------------------------
-# CRIB metiniu pranesimu ir priedu nuskaitymas
-# ------------------------------------------------------------
-
-def _is_annual_information_row(row) -> bool:
-    text = " ".join([
-        str(row.get("category", "") or ""),
-        str(row.get("title", "") or ""),
-        str(row.get("content", "") or "")[:500],
-    ]).lower()
-    return any(token in text for token in ANNUAL_CATEGORY_TOKENS)
+# ============================================================
+# CRIB / failu nuskaitymas
+# ============================================================
 
 
-def load_annual_crib_news(start_date, end_date, allowed_issuers: pd.DataFrame) -> pd.DataFrame:
-    if load_news_df is None:
-        st.error("Nerasta supabase_cache.load_news_df funkcijos.")
-        return pd.DataFrame()
-
+def load_annual_crib_news(start_date, end_date, issuers_df: pd.DataFrame) -> pd.DataFrame:
     df = load_news_df("crib", start_date, end_date)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -262,118 +290,99 @@ def load_annual_crib_news(start_date, end_date, allowed_issuers: pd.DataFrame) -
         if col not in df.columns:
             df[col] = ""
 
-    df = df[df.apply(_is_annual_information_row, axis=1)].copy()
+    df["category"] = df["category"].fillna("").astype(str).str.strip()
+    df["title"] = df["title"].fillna("").astype(str).str.strip()
+    df["content"] = df["content"].fillna("").astype(str).str.strip()
+    df["crib_url"] = df["url"].fillna("").astype(str).str.strip()
+    df["published_at_dt"] = pd.to_datetime(df["published_at"], errors="coerce", utc=False)
+
+    df = df[df.apply(lambda r: _is_annual_report_title(r.get("title", ""), r.get("category", "")), axis=1)].copy()
     if df.empty:
         return df
 
-    df["issuer"] = df["company"].fillna("").astype(str).str.strip().apply(
-        lambda x: _canonical_issuer_from_allowed(x, allowed_issuers)
-    )
-    missing = df["issuer"].fillna("").astype(str).str.strip().eq("")
+    lookup = _build_issuer_lookup(issuers_df)
+    allowed = set(issuers_df["issuer"].dropna().astype(str).str.strip()) if issuers_df is not None and not issuers_df.empty else set()
+
+    df["issuer"] = df["company"].fillna("").astype(str).str.strip()
+    missing = df["issuer"].eq("") | (~df["issuer"].isin(allowed))
     if missing.any():
         df.loc[missing, "issuer"] = df.loc[missing].apply(
-            lambda r: _infer_issuer_from_text(r.get("title", ""), r.get("content", ""), allowed_issuers),
+            lambda r: _infer_issuer_from_text(f"{r.get('title','')} {r.get('content','')}", lookup),
             axis=1,
         )
 
-    df = df[df["issuer"].fillna("").astype(str).str.strip().ne("")].copy()
-    df["issuer_key"] = df["issuer"].apply(_issuer_key)
-    df["crib_url"] = df["url"].fillna("").astype(str).str.strip()
-    df["published_at_dt"] = pd.to_datetime(df["published_at"], errors="coerce")
-    df = df.sort_values("published_at_dt", ascending=False)
+    df = df[df["issuer"].isin(allowed)].copy()
+    if df.empty:
+        return df
+
+    df["issuer_norm"] = df["issuer"].apply(_lt_norm)
+    df["report_year"] = df.apply(lambda r: _detect_report_year(r.get("title", ""), r.get("published_at")), axis=1)
+    df = df[df["crib_url"].ne("")].copy()
     df = df.drop_duplicates(subset=["crib_url"], keep="first")
     return df.reset_index(drop=True)
 
 
-def _extract_attachment_links_from_html(html: str, base_url: str) -> list[str]:
+def _extract_file_links_from_html(html: str, base_url: str) -> List[str]:
     soup = BeautifulSoup(html or "", "html.parser")
-    out = []
+    links = []
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         text = (a.get_text(" ", strip=True) or "").lower()
         href_l = href.lower()
-        if (
-            ".pdf" in href_l or ".xhtml" in href_l or ".html" in href_l or ".xml" in href_l or ".zip" in href_l
-            or "viewattachment.action" in href_l or "download" in href_l or "attachment" in href_l
-            or "pdf" in text or "xbrl" in text or "xhtml" in text
-        ):
+        is_file = any(ext in href_l for ext in REPORT_FILE_EXTENSIONS)
+        is_attachment = "viewattachment.action" in href_l or "attachment" in href_l or "download" in href_l
+        text_hint = any(x in text for x in ["pdf", "xbrl", "xml", "metin", "annual", "ataskait"])
+        if is_file or is_attachment or text_hint:
             full = urljoin(base_url, href)
-            if full not in out:
-                out.append(full)
-    return _rank_attachment_links(out)
+            if full not in links:
+                links.append(full)
 
-
-def _rank_attachment_links(links: list[str]) -> list[str]:
     def score(u: str) -> int:
-        u_l = u.lower()
-        if "viewattachment" in u_l and (".xhtml" in u_l or ".xml" in u_l or "xbrl" in u_l):
+        ul = u.lower()
+        if "crib.lt/cns-web/oam/viewattachment" in ul:
             return 0
-        if "viewattachment" in u_l and ".pdf" in u_l:
+        if "viewattachment.action" in ul:
             return 1
-        if "viewattachment" in u_l:
+        if any(ext in ul for ext in [".xbrl", ".xml", ".xhtml"]):
             return 2
-        if ".xhtml" in u_l or ".xml" in u_l or "xbrl" in u_l:
+        if ".pdf" in ul:
             return 3
-        if ".pdf" in u_l:
-            return 4
-        if "globenewswire" in u_l:
+        if "globenewswire.com/resource/download" in ul:
             return 9
         return 5
-    return sorted(list(dict.fromkeys(links or [])), key=score)
+
+    return sorted(links, key=score)
 
 
-def get_crib_attachment_links(crib_url: str) -> list[str]:
-    if not crib_url:
-        return []
+def extract_report_file_links(crib_url: str) -> List[str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
         "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    try:
-        resp = requests.get(crib_url, headers=headers, verify=False, timeout=30)
-        resp.raise_for_status()
-        return _extract_attachment_links_from_html(resp.text, crib_url)
-    except Exception:
-        return []
+    resp = requests.get(crib_url, headers=headers, verify=False, timeout=45)
+    resp.raise_for_status()
+    return _extract_file_links_from_html(resp.text, crib_url)
 
 
-def download_attachment(url: str) -> tuple[bytes, str]:
+def download_file(file_url: str) -> Tuple[bytes, str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept": "application/pdf,application/xhtml+xml,application/xml,text/html,application/zip,*/*",
+        "Accept": "application/pdf,application/xml,text/xml,application/xhtml+xml,text/html,application/zip,application/octet-stream,*/*",
         "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    resp = requests.get(url, headers=headers, verify=False, timeout=60, allow_redirects=True)
+    resp = requests.get(file_url, headers=headers, verify=False, timeout=90, allow_redirects=True)
     resp.raise_for_status()
     content = resp.content or b""
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    if content[:20].lstrip().startswith(b"%PDF"):
-        return content, "pdf"
-    sample = content[:500].lower()
-    if b"xbrl" in sample or b"<html" in sample or b"<xhtml" in sample or b"<?xml" in sample:
-        return content, "xbrl"
-    if "pdf" in ctype:
-        return content, "pdf"
-    if "xml" in ctype or "html" in ctype or "xbrl" in ctype:
-        return content, "xbrl"
-    return content, "unknown"
+    content_type = resp.headers.get("Content-Type", "") or mimetypes.guess_type(file_url)[0] or "application/octet-stream"
+    return content, content_type
 
 
-# ------------------------------------------------------------
-# PDF parseris
-# ------------------------------------------------------------
-
-ASSETS_LABELS = (
-    "balansinis turtas", "turtas is viso", "turtas iš viso", "total assets", "assets total",
-)
-REVENUE_LABELS = (
-    "pajamos", "pardavimo pajamos", "revenue", "sales revenue", "sales",
-)
-
-
-def _extract_pdf_text_and_tables(content: bytes):
-    text_parts = []
-    tables = []
+def extract_pdf_text(content: bytes) -> str:
+    if not content or not content[:20].lstrip().startswith(b"%PDF"):
+        return ""
+    if pdfplumber is None:
+        return ""
+    texts = []
     with pdfplumber.open(BytesIO(content)) as pdf:
         for page in pdf.pages:
             try:
@@ -381,464 +390,290 @@ def _extract_pdf_text_and_tables(content: bytes):
             except Exception:
                 txt = page.extract_text() or ""
             if txt:
-                text_parts.append(txt)
-            try:
-                for tbl in page.extract_tables() or []:
-                    if tbl:
-                        tables.append(tbl)
-            except Exception:
-                pass
-    return "\n".join(text_parts), tables
+                texts.append(txt)
+    return "\n".join(texts).strip()
 
 
-def _row_text(row) -> str:
-    return _norm(" ".join(str(c or "") for c in row))
+# ============================================================
+# Saugojimo logika
+# ============================================================
 
 
-def _numbers_from_row(row) -> list[float]:
-    vals = []
-    for cell in row:
-        v = _parse_number(cell)
-        if v is not None:
-            vals.append(v)
-    return vals
-
-
-def _find_metric_in_tables(tables, label_tokens) -> tuple[float | None, float | None, str]:
-    """Grazina (grupe, bendrove, note).
-
-    Strategija:
-    - ieskome eilutes, kurioje yra norimas rodiklis;
-    - jei eiluteje yra bent 2 skaiciai, laikome, kad pirmi du yra "Grupes" ir "Bendroves";
-    - jeigu yra 4 skaiciai, daznai tai einamieji ir palyginamieji metai; imame pirmus du.
-    """
-    for table in tables or []:
-        for row in table or []:
-            if not row:
-                continue
-            rt = _row_text(row)
-            if any(_norm(label) in rt for label in label_tokens):
-                nums = _numbers_from_row(row)
-                if len(nums) >= 2:
-                    return nums[0], nums[1], "reikšmės paimtos iš PDF lentelės eilutės"
-                if len(nums) == 1:
-                    return nums[0], None, "rasta tik viena reikšmė PDF lentelėje"
-    return None, None, "rodiklio eilutė PDF lentelėse nerasta"
-
-
-def _find_metric_in_text(text: str, label_tokens) -> tuple[float | None, float | None, str]:
-    norm_text = _norm(text)
-    original_lines = [line for line in (text or "").splitlines() if line.strip()]
-    for line in original_lines:
-        ln = _norm(line)
-        if any(_norm(label) in ln for label in label_tokens):
-            nums = [_parse_number(x) for x in re.findall(r"(?:\(?[-+]?\d[\d\s.,]*\)?)", line)]
-            nums = [x for x in nums if x is not None]
-            if len(nums) >= 2:
-                return nums[0], nums[1], "reikšmės paimtos iš PDF teksto eilutės"
-            if len(nums) == 1:
-                return nums[0], None, "rasta tik viena reikšmė PDF tekste"
-    if not norm_text:
-        return None, None, "PDF tekstas tuščias"
-    return None, None, "rodiklio eilutė PDF tekste nerasta"
-
-
-def parse_pdf_annual_report(content: bytes) -> dict:
-    text, tables = _extract_pdf_text_and_tables(content)
-    assets_g, assets_c, assets_note = _find_metric_in_tables(tables, ASSETS_LABELS)
-    revenue_g, revenue_c, revenue_note = _find_metric_in_tables(tables, REVENUE_LABELS)
-
-    if assets_g is None and assets_c is None:
-        assets_g, assets_c, assets_note = _find_metric_in_text(text, ASSETS_LABELS)
-    if revenue_g is None and revenue_c is None:
-        revenue_g, revenue_c, revenue_note = _find_metric_in_text(text, REVENUE_LABELS)
-
-    year = None
-    m = re.search(r"\b(20\d{2})\b", text or "")
-    if m:
-        year = int(m.group(1))
-
-    found = sum(v is not None for v in [assets_g, assets_c, revenue_g, revenue_c])
-    status = "parsed_pdf" if found else "parsed_pdf_no_metrics"
-    return {
-        "report_year": year,
-        "assets_group_teu": assets_g,
-        "assets_company_teu": assets_c,
-        "revenue_group_teu": revenue_g,
-        "revenue_company_teu": revenue_c,
-        "parse_status": status,
-        "parse_note": f"Turtas: {assets_note}; Pajamos: {revenue_note}",
-        "raw_text": text[:12000] if text else "",
+def save_annual_report_notice(row: dict) -> dict:
+    report_row = {
+        "issuer": str(row.get("issuer") or "").strip(),
+        "issuer_norm": _lt_norm(row.get("issuer") or ""),
+        "company": str(row.get("company") or row.get("issuer") or "").strip(),
+        "market": "VLN",
+        "report_year": int(row.get("report_year")) if pd.notna(row.get("report_year")) else None,
+        "report_type": "Metinė",
+        "crib_url": str(row.get("crib_url") or "").strip(),
+        "crib_title": str(row.get("title") or "").strip(),
+        "crib_category": str(row.get("category") or "").strip(),
+        "published_at": _safe_iso_ts(row.get("published_at")),
+        "parse_status": "notice_saved",
     }
+    return _post_table_row("annual_reports", report_row, on_conflict="crib_url")
 
 
-# ------------------------------------------------------------
-# XBRL parseris
-# ------------------------------------------------------------
+def save_annual_report_file(report_id: int, notice_row: dict, file_url: str, content: bytes, content_type: str) -> dict:
+    issuer = str(notice_row.get("issuer") or "").strip()
+    report_year = int(notice_row.get("report_year")) if pd.notna(notice_row.get("report_year")) else None
+    safe_issuer = _lt_norm(issuer).replace(" ", "_") or "issuer"
+    file_name = _filename_from_url(file_url, fallback=f"annual_report_{report_id}")
+    file_type = _guess_file_type(file_url, content_type, file_name)
+    storage_path = f"{report_year or 'unknown'}/{safe_issuer}/{report_id}_{file_name}"
 
-ASSETS_CONCEPTS = {
-    "assets", "totalassets", "ifrsfullassets", "ifrs-fullassets",
-}
-REVENUE_CONCEPTS = {
-    "revenue", "salesrevenue", "ifrsfullrevenue", "ifrs-fullrevenue",
-    "revenuefromcontractswithcustomers", "revenuefromcontractswithcustomersexcludingassessedtax",
-}
-
-
-def _local_name(tag: str) -> str:
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-    return tag.split(":")[-1]
-
-
-def _concept_key(tag: str) -> str:
-    return _norm(_local_name(tag)).replace(" ", "")
-
-
-def parse_xbrl_annual_report(content: bytes) -> dict:
+    storage_status = "not_uploaded"
     try:
-        root = ET.fromstring(content)
-    except Exception:
-        # Kai kurie inline XBRL failai buna XHTML su neidealiu XML. Bandom minimaliai isvalyti.
-        text = content.decode("utf-8", errors="ignore")
-        text = re.sub(r"&nbsp;", " ", text)
-        try:
-            root = ET.fromstring(text.encode("utf-8"))
-        except Exception as exc:
-            return {
-                "report_year": None,
-                "assets_group_teu": None,
-                "assets_company_teu": None,
-                "revenue_group_teu": None,
-                "revenue_company_teu": None,
-                "parse_status": "xbrl_parse_error",
-                "parse_note": str(exc)[:500],
-                "raw_text": "",
-            }
-
-    facts = []
-    for elem in root.iter():
-        key = _concept_key(elem.tag)
-        if key not in ASSETS_CONCEPTS and key not in REVENUE_CONCEPTS:
-            continue
-        val = _parse_number(elem.text)
-        if val is None:
-            continue
-        ctx = elem.attrib.get("contextRef") or elem.attrib.get("contextref") or ""
-        unit = elem.attrib.get("unitRef") or elem.attrib.get("unitref") or ""
-        decimals = elem.attrib.get("decimals", "")
-        facts.append({"key": key, "value": val, "context": ctx, "unit": unit, "decimals": decimals})
-
-    def pick(concepts):
-        candidates = [f for f in facts if f["key"] in concepts]
-        if not candidates:
-            return None, None
-        # Grupes ir bendroves atskyrimas XBRL yra emitentu-specifinis. Jei kontekstas turi
-        # consolidated/group pozymi, ji laikome grupe. Jei separate/company pozymi - bendrove.
-        group = [f for f in candidates if re.search(r"consolid|group|grupe|konsolid", f["context"], re.I)]
-        company = [f for f in candidates if re.search(r"separate|company|bendrov|parent|individual", f["context"], re.I)]
-        if group or company:
-            g = group[0]["value"] if group else candidates[0]["value"]
-            c = company[0]["value"] if company else None
-            return g, c
-        # Atsarginiu atveju pirmoji reiksme paliekama kaip grupes reiksme.
-        return candidates[0]["value"], None
-
-    assets_g, assets_c = pick(ASSETS_CONCEPTS)
-    revenue_g, revenue_c = pick(REVENUE_CONCEPTS)
-
-    found = sum(v is not None for v in [assets_g, assets_c, revenue_g, revenue_c])
-    return {
-        "report_year": None,
-        "assets_group_teu": assets_g,
-        "assets_company_teu": assets_c,
-        "revenue_group_teu": revenue_g,
-        "revenue_company_teu": revenue_c,
-        "parse_status": "parsed_xbrl" if found else "parsed_xbrl_no_metrics",
-        "parse_note": "XBRL/iXBRL faktai nuskaityti pagal IFRS taksonomijos pavadinimus; grupes/bendroves atskyrimas priklauso nuo contextRef.",
-        "raw_text": "",
-    }
-
-
-# ------------------------------------------------------------
-# Supabase issaugojimas
-# ------------------------------------------------------------
-
-def _metric_already_saved(crib_url: str, attachment_url: str) -> bool:
-    try:
-        headers, rest_url, http_client = _supabase_client_parts()
-        url = rest_url(METRICS_TABLE)
-        params = {"select": "id", "crib_url": f"eq.{crib_url}", "attachment_url": f"eq.{attachment_url}", "limit": "1"}
-        with http_client() as client:
-            resp = client.get(url, headers=headers(), params=params)
-            resp.raise_for_status()
-            return bool(resp.json() or [])
-    except Exception:
-        return False
-
-
-def save_annual_metric_row(row: dict) -> bool:
-    headers, rest_url, http_client = _supabase_client_parts()
-    url = rest_url(METRICS_TABLE)
-    clean = {k: v for k, v in row.items() if v is not pd.NA}
-    with http_client() as client:
-        resp = client.post(
-            url,
-            headers={**headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
-            json=clean,
-        )
-        if resp.status_code in (200, 201, 204):
-            return True
-        if resp.status_code == 409:
-            return False
-        if _is_missing_table_response(resp):
-            raise RuntimeError(
-                "Supabase lentelė annual_report_metrics dar nesukurta arba nematoma REST API schema cache. "
-                "Paleisk annual_report_metrics_schema.sql Supabase SQL Editor lange ir perkrauk aplikaciją."
-            )
-        raise RuntimeError(f"Supabase {METRICS_TABLE} įrašymo klaida: {resp.status_code} - {resp.text}")
-
-
-def _is_missing_table_response(resp) -> bool:
-    """Ar Supabase REST atsakymas rodo, kad lentelė dar nesukurta / nematoma schema cache."""
-    try:
-        if int(getattr(resp, "status_code", 0) or 0) == 404:
-            return True
-        txt = str(getattr(resp, "text", "") or "").lower()
-        return "could not find the table" in txt or "schema cache" in txt or "404 not found" in txt
-    except Exception:
-        return False
-
-
-def _show_missing_metrics_table_warning():
-    st.warning(
-        "Supabase lentelė `annual_report_metrics` dar nesukurta arba nematoma REST API schema cache. "
-        "Paleisk `annual_report_metrics_schema.sql` Supabase SQL Editor lange, tada perkrauk aplikaciją."
-    )
-
-
-def load_annual_metrics_from_db(start_date, end_date) -> pd.DataFrame:
-    try:
-        headers, rest_url, http_client = _supabase_client_parts()
-        url = rest_url(METRICS_TABLE)
-        start_iso = f"{start_date}T00:00:00"
-        end_iso = f"{end_date}T23:59:59"
-        params = {
-            "select": "*",
-            "published_at": [f"gte.{start_iso}", f"lte.{end_iso}"],
-            "order": "published_at.desc",
-        }
-        with http_client() as client:
-            resp = client.get(url, headers=headers(), params=params)
-            if _is_missing_table_response(resp):
-                _show_missing_metrics_table_warning()
-                return pd.DataFrame()
-            resp.raise_for_status()
-            data = resp.json() or []
-        return pd.DataFrame(data)
+        if content:
+            _upload_to_storage(REPORT_BUCKET, storage_path, content, content_type)
+            storage_status = "uploaded"
     except Exception as exc:
-        st.error(f"Nepavyko nuskaityti {METRICS_TABLE}: {exc}")
-        return pd.DataFrame()
+        storage_status = f"storage_error: {str(exc)[:300]}"
+
+    raw_text = ""
+    if file_type == "pdf" and content:
+        try:
+            raw_text = extract_pdf_text(content)[:200000]
+        except Exception as exc:
+            raw_text = ""
+            if storage_status == "uploaded":
+                storage_status = f"uploaded_pdf_text_error: {str(exc)[:200]}"
+
+    file_row = {
+        "annual_report_id": report_id,
+        "issuer": issuer,
+        "report_year": report_year,
+        "file_url": file_url,
+        "file_name": file_name,
+        "file_type": file_type,
+        "storage_bucket": REPORT_BUCKET,
+        "storage_path": storage_path if storage_status.startswith("uploaded") else "",
+        "content_type": content_type,
+        "file_size": len(content or b""),
+        "raw_text": raw_text,
+        "parse_status": storage_status,
+    }
+    return _post_table_row("annual_report_files", file_row, on_conflict="file_url")
 
 
-# ------------------------------------------------------------
-# Atnaujinimas
-# ------------------------------------------------------------
-
-def update_annual_reports_metrics(start_date, end_date, max_reports: int = 80, progress=None) -> dict:
+def update_annual_reports_for_period(start_date, end_date, progress=None) -> dict:
     stats = {
-        "annual_news_found": 0,
-        "annual_news_processed": 0,
-        "attachments_checked": 0,
-        "rows_saved": 0,
-        "skipped_existing": 0,
+        "issuers_loaded": 0,
+        "annual_notices_found": 0,
+        "reports_saved": 0,
+        "files_found": 0,
+        "files_saved": 0,
         "errors": 0,
+        "error_rows": [],
     }
 
-    allowed = load_vln_official_secondary_issuers()
-    news_df = load_annual_crib_news(start_date, end_date, allowed)
-    if news_df is None or news_df.empty:
+    issuers_df = load_vln_issuers()
+    stats["issuers_loaded"] = len(issuers_df)
+    if issuers_df.empty:
+        raise RuntimeError("market_issuers lenteleje nerasta VLN emitentu.")
+
+    notices = load_annual_crib_news(start_date, end_date, issuers_df)
+    stats["annual_notices_found"] = len(notices)
+    if notices.empty:
         return stats
 
-    news_df = news_df.head(max_reports).copy()
-    stats["annual_news_found"] = len(news_df)
-
-    for _, news in news_df.iterrows():
-        crib_url = str(news.get("crib_url") or "").strip()
-        if not crib_url:
-            continue
-        stats["annual_news_processed"] += 1
+    for _, r in notices.iterrows():
+        title = str(r.get("title") or "")
+        crib_url = str(r.get("crib_url") or "")
+        issuer = str(r.get("issuer") or "")
         if progress:
-            progress(f"Tikrinama metinė ataskaita: {news.get('issuer', '')} - {news.get('title', '')}")
+            progress(f"Tikrinama: {issuer} | {title[:100]}")
 
         try:
-            links = get_crib_attachment_links(crib_url)
+            report = save_annual_report_notice(r.to_dict())
+            report_id = report.get("id")
+            if not report_id:
+                # Jei REST negrąžino id del konflikto, pasiimame pagal crib_url.
+                found = _get_table_rows("annual_reports", {"select": "id", "crib_url": f"eq.{crib_url}", "limit": "1"})
+                report_id = found[0].get("id") if found else None
+            if not report_id:
+                raise RuntimeError("annual_reports irasas issaugotas be id arba nepavyko jo rasti pagal crib_url.")
+
+            stats["reports_saved"] += 1
+
+            links = extract_report_file_links(crib_url)
+            stats["files_found"] += len(links)
             if not links:
+                _patch_table_rows("annual_reports", {"id": f"eq.{report_id}"}, {"parse_status": "notice_saved_no_files_found"})
                 continue
-            for attachment_url in links[:5]:
-                if _metric_already_saved(crib_url, attachment_url):
-                    stats["skipped_existing"] += 1
-                    continue
-                stats["attachments_checked"] += 1
-                content, file_type = download_attachment(attachment_url)
-                if not content or len(content) < 100:
-                    continue
 
-                if file_type == "pdf":
-                    parsed = parse_pdf_annual_report(content)
-                elif file_type == "xbrl":
-                    parsed = parse_xbrl_annual_report(content)
-                else:
-                    parsed = {
-                        "report_year": None,
-                        "assets_group_teu": None,
-                        "assets_company_teu": None,
-                        "revenue_group_teu": None,
-                        "revenue_company_teu": None,
-                        "parse_status": "unsupported_attachment_type",
-                        "parse_note": "Priedas neatpažintas kaip PDF arba XBRL/iXBRL.",
-                        "raw_text": "",
-                    }
+            saved_for_report = 0
+            for file_url in links:
+                try:
+                    content, content_type = download_file(file_url)
+                    if not content or len(content) < 50:
+                        raise RuntimeError("Atsisiustas failas tuscias arba per mazas.")
+                    save_annual_report_file(report_id, r.to_dict(), file_url, content, content_type)
+                    saved_for_report += 1
+                    stats["files_saved"] += 1
+                except Exception as file_exc:
+                    stats["errors"] += 1
+                    stats["error_rows"].append({
+                        "issuer": issuer,
+                        "title": title,
+                        "url": crib_url,
+                        "file_url": file_url,
+                        "error": str(file_exc),
+                    })
 
-                row = {
-                    "issuer": str(news.get("issuer") or ""),
-                    "issuer_key": str(news.get("issuer_key") or ""),
-                    "report_year": parsed.get("report_year"),
-                    "published_at": _to_iso(news.get("published_at")),
-                    "crib_url": crib_url,
-                    "crib_title": str(news.get("title") or ""),
-                    "crib_category": str(news.get("category") or ""),
-                    "attachment_url": attachment_url,
-                    "attachment_type": file_type,
-                    "attachment_sha256": _sha256_bytes(content),
-                    "assets_group_teu": parsed.get("assets_group_teu"),
-                    "assets_company_teu": parsed.get("assets_company_teu"),
-                    "revenue_group_teu": parsed.get("revenue_group_teu"),
-                    "revenue_company_teu": parsed.get("revenue_company_teu"),
-                    "parse_status": parsed.get("parse_status"),
-                    "parse_note": parsed.get("parse_note"),
-                    "raw_text": parsed.get("raw_text"),
-                }
-                if save_annual_metric_row(row):
-                    stats["rows_saved"] += 1
+            _patch_table_rows(
+                "annual_reports",
+                {"id": f"eq.{report_id}"},
+                {"parse_status": "files_saved" if saved_for_report else "notice_saved_files_failed"},
+            )
+
         except Exception as exc:
             stats["errors"] += 1
-            if progress:
-                progress(f"Klaida: {exc}")
-            continue
+            stats["error_rows"].append({
+                "issuer": issuer,
+                "title": title,
+                "url": crib_url,
+                "file_url": "",
+                "error": str(exc),
+            })
 
     return stats
 
 
-# ------------------------------------------------------------
-# Streamlit ataskaita
-# ------------------------------------------------------------
-
-def _prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+def load_saved_annual_reports(start_date, end_date) -> pd.DataFrame:
+    try:
+        start_iso = f"{start_date}T00:00:00"
+        end_iso = f"{end_date}T23:59:59"
+        rows = _get_table_rows(
+            "annual_reports",
+            {
+                "select": "id,issuer,report_year,report_type,crib_title,crib_category,published_at,parse_status,crib_url",
+                "published_at": [f"gte.{start_iso}", f"lte.{end_iso}"],
+                "order": "published_at.desc",
+            },
+        )
+        return pd.DataFrame(rows)
+    except Exception as exc:
+        st.warning(f"Nepavyko nuskaityti annual_reports: {exc}")
         return pd.DataFrame()
-    out = df.copy()
-    for col in [
-        "issuer", "report_year", "published_at", "assets_group_teu", "assets_company_teu",
-        "revenue_group_teu", "revenue_company_teu", "parse_status", "parse_note", "crib_title",
-        "attachment_type", "crib_url", "attachment_url",
-    ]:
-        if col not in out.columns:
-            out[col] = ""
-    out["published_date"] = pd.to_datetime(out["published_at"], errors="coerce").dt.date
-    rename = {
-        "issuer": "Emitentas",
-        "report_year": "Metai",
-        "published_date": "Paskelbimo data",
-        "assets_group_teu": "Balansinis turtas, tūkst. EUR - Grupės",
-        "assets_company_teu": "Balansinis turtas, tūkst. EUR - Bendrovės",
-        "revenue_group_teu": "Pajamos, tūkst. EUR - Grupės",
-        "revenue_company_teu": "Pajamos, tūkst. EUR - Bendrovės",
-        "parse_status": "Nuskaitymo statusas",
-        "parse_note": "Pastaba",
-        "crib_title": "CRIB pranešimas",
-        "attachment_type": "Formatas",
-        "crib_url": "CRIB nuoroda",
-        "attachment_url": "Ataskaitos failas",
-    }
-    cols = list(rename.keys())
-    cols = [c for c in cols if c in out.columns]
-    out = out[cols].rename(columns=rename)
-    return out
 
 
-def show_annual_reports_page():
-    st.markdown("# Metinių ataskaitų rodikliai")
+def load_saved_annual_files() -> pd.DataFrame:
+    try:
+        rows = _get_table_rows(
+            "annual_report_files",
+            {
+                "select": "id,annual_report_id,issuer,report_year,file_name,file_type,file_size,storage_path,parse_status,file_url",
+                "order": "created_at.desc",
+                "limit": "1000",
+            },
+        )
+        return pd.DataFrame(rows)
+    except Exception as exc:
+        st.warning(f"Nepavyko nuskaityti annual_report_files: {exc}")
+        return pd.DataFrame()
+
+
+# ============================================================
+# Streamlit puslapis
+# ============================================================
+
+
+def show_metines_page():
     st.markdown(
-        "CRIB kategorijos **Metinė informacija** PDF / XBRL ataskaitos. "
-        "Rodoma tik tų emitentų informacija, kurie yra Supabase `market_issuers` sąraše su `market=VLN`."
+        """
+        <div class="hero-card">
+            <div class="hero-inner">
+                <div class="hero-icon">📚</div>
+                <div>
+                    <h1 class="hero-title">Metinės ataskaitos</h1>
+                    <div class="hero-text">
+                        CRIB kategorijos „Metinė informacija“ ataskaitų atsisiuntimas ir saugojimas Supabase.
+                        Failai saugomi annual_reports / annual_report_files lentelėse ir Supabase Storage bucket annual-reports.
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+    st.markdown("<br>", unsafe_allow_html=True)
 
     with st.sidebar:
-        st.markdown("### Metinės ataskaitos")
-        start_date = st.date_input("Metinės informacijos data nuo", value=date.today() - timedelta(days=730), key="annual_reports_start_date")
-        end_date = st.date_input("Metinės informacijos data iki", value=date.today(), key="annual_reports_end_date")
-        max_reports = st.number_input("Maks. CRIB pranešimų", min_value=10, max_value=300, value=80, step=10, key="annual_reports_max_reports")
-        update_btn = st.button("Atnaujinti metinių ataskaitų rodiklius", use_container_width=True, key="annual_reports_update_btn")
+        st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-card-title">📚 Metinės ataskaitos</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-card-subtitle">Pasirink laikotarpį pagal CRIB paskelbimo datą ir atsisiųsk metines ataskaitas.</div>',
+            unsafe_allow_html=True,
+        )
+        start_date = st.date_input("Nuo", value=date(date.today().year - 2, 1, 1), key="metines_start_date")
+        end_date = st.date_input("Iki", value=date.today(), key="metines_end_date")
+        run_btn = st.button("Atsisiųsti metines ataskaitas", type="primary", use_container_width=True, key="metines_download_btn")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    if start_date > end_date:
-        st.error("Data „nuo“ negali būti vėlesnė už datą „iki“.")
-        st.stop()
-
-    if update_btn:
-        progress_box = st.empty()
-        def progress(msg: str):
-            progress_box.info(msg)
-        try:
-            with st.spinner("Nuskaitomos CRIB metinės ataskaitos ir pildoma duomenų bazė..."):
-                stats = update_annual_reports_metrics(start_date, end_date, max_reports=int(max_reports), progress=progress)
-            progress_box.success(
-                "Atnaujinta: "
-                f"rasta metinių pranešimų {stats.get('annual_news_found', 0)}, "
-                f"apdorota {stats.get('annual_news_processed', 0)}, "
-                f"patikrinta priedų {stats.get('attachments_checked', 0)}, "
-                f"įrašyta {stats.get('rows_saved', 0)}, "
-                f"praleista esamų {stats.get('skipped_existing', 0)}, "
-                f"klaidų {stats.get('errors', 0)}."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error("Nepavyko atnaujinti metinių ataskaitų rodiklių.")
-            st.exception(exc)
-            st.stop()
-
-    raw_df = load_annual_metrics_from_db(start_date, end_date)
-    display_df = _prepare_display_df(raw_df)
-
-    if display_df.empty:
-        st.info("Pasirinktu laikotarpiu metinių ataskaitų rodiklių duomenų bazėje nėra.")
-        st.stop()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Įrašų", len(display_df))
-    c2.metric("Emitentų", display_df["Emitentas"].replace("", pd.NA).dropna().nunique())
-    c3.metric("PDF", int((display_df["Formatas"] == "pdf").sum()))
-    c4.metric("XBRL", int((display_df["Formatas"] == "xbrl").sum()))
-
+    c1, c2 = st.columns(2)
+    c1.metric("Nuo", str(start_date or "-"))
+    c2.metric("Iki", str(end_date or "-"))
     st.markdown("---")
 
-    with st.expander("Filtrai", expanded=True):
-        issuers = sorted(display_df["Emitentas"].dropna().astype(str).unique())
-        selected = st.multiselect("Emitentas", issuers, key="annual_reports_filter_issuer")
-        status_values = sorted(display_df["Nuskaitymo statusas"].dropna().astype(str).unique())
-        statuses = st.multiselect("Nuskaitymo statusas", status_values, key="annual_reports_filter_status")
-        if selected:
-            display_df = display_df[display_df["Emitentas"].isin(selected)]
-        if statuses:
-            display_df = display_df[display_df["Nuskaitymo statusas"].isin(statuses)]
+    if start_date > end_date:
+        st.error("Data „Nuo“ negali būti vėlesnė už datą „Iki“.")
+        st.stop()
 
-    st.subheader("Metinių ataskaitų rodiklių lentelė")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    if run_btn:
+        progress_box = st.empty()
 
-    st.download_button(
-        "Atsisiųsti CSV",
-        data=display_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="metiniu_ataskaitu_rodikliai.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+        def progress(msg: str):
+            progress_box.info(msg)
+
+        try:
+            with st.spinner("Ieškomos ir saugomos metinės ataskaitos..."):
+                stats = update_annual_reports_for_period(start_date, end_date, progress=progress)
+
+            st.success(
+                "Metinių ataskaitų atsisiuntimas baigtas: "
+                f"VLN emitentų {stats.get('issuers_loaded', 0)}, "
+                f"rasta CRIB metinių pranešimų {stats.get('annual_notices_found', 0)}, "
+                f"išsaugota annual_reports {stats.get('reports_saved', 0)}, "
+                f"rasta failų {stats.get('files_found', 0)}, "
+                f"išsaugota failų {stats.get('files_saved', 0)}, "
+                f"klaidų {stats.get('errors', 0)}."
+            )
+
+            if stats.get("error_rows"):
+                st.warning("Dalis įrašų neišsisaugojo. Žemiau pateikiamos klaidos.")
+                st.dataframe(pd.DataFrame(stats["error_rows"]), use_container_width=True, hide_index=True)
+
+            progress_box.empty()
+        except Exception as exc:
+            st.error("Nepavyko atsisiųsti / išsaugoti metinių ataskaitų.")
+            st.exception(exc)
+            st.code(traceback.format_exc())
+            st.stop()
+
+    reports_df = load_saved_annual_reports(start_date, end_date)
+    files_df = load_saved_annual_files()
+
+    st.subheader("Išsaugotos metinės ataskaitos")
+    if reports_df.empty:
+        st.info("Pasirinktu laikotarpiu annual_reports lentelėje įrašų nėra.")
+    else:
+        show_cols = [c for c in ["issuer", "report_year", "published_at", "parse_status", "crib_title", "crib_url"] if c in reports_df.columns]
+        st.dataframe(reports_df[show_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("Išsaugoti metinių ataskaitų failai")
+    if files_df.empty:
+        st.info("annual_report_files lentelėje failų nėra.")
+    else:
+        show_cols = [c for c in ["issuer", "report_year", "file_type", "file_size", "parse_status", "file_name", "storage_path", "file_url"] if c in files_df.columns]
+        st.dataframe(files_df[show_cols], use_container_width=True, hide_index=True)
+
+
+# Suderinamumo aliasas, jei app.py importuotų kitu pavadinimu.
+show_annual_reports_page = show_metines_page
+
+
+if __name__ == "__main__":
+    show_metines_page()
