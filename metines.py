@@ -842,4 +842,3 @@ def show_annual_reports_page():
         mime="text/csv",
         use_container_width=True,
     )
-
