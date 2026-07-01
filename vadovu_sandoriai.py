@@ -1789,12 +1789,18 @@ def _style_delay_value(value):
     return "background-color: #d4edda; color: #155724; font-weight: 700;"
 
 
-def _show_tables(df: pd.DataFrame):
-    st.subheader("1. Detali vadovų sandorių lentelė")
+def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Paruošia detalios vadovų sandorių lentelės rodymo / eksporto DataFrame.
 
-    # Pagrindiniai priežiūrai reikalingi laukai rodomi lentelės pradžioje.
-    # Visi kiti naudingi / techniniai parametrai paliekami lentelės gale.
-    primary_cols = [
+    Pageidaujama pradžios tvarka:
+    Įmonės pavadinimas, Asmuo, Pranešimo data, Sandorio data,
+    Pranešta per d., Pavadinimas, Pusė, Kiekis, Kaina, Vertė, Vieta, DPL.
+    Visi kiti turimi parametrai paliekami lentelės gale.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    first_cols = [
         "issuer",
         "person_name",
         "published_date",
@@ -1809,7 +1815,9 @@ def _show_tables(df: pd.DataFrame):
         "DPL",
     ]
 
-    remaining_cols = [
+    # Šie stulpeliai rodomi po pagrindinių. Jei ateityje atsiras naujų DB laukų,
+    # jie automatiškai bus pridėti dar toliau per extra_cols.
+    preferred_tail_cols = [
         "person_role",
         "DPL tipas",
         "Susijusi ataskaita",
@@ -1827,10 +1835,35 @@ def _show_tables(df: pd.DataFrame):
         "parse_status",
     ]
 
-    detail_cols = []
-    for col in primary_cols + remaining_cols:
-        if col in df.columns and col not in detail_cols:
-            detail_cols.append(col)
+    # Techninius / tarpinius stulpelius, kurie neturi būti rodomi lentelės gale, paslepiame.
+    hidden_cols = {
+        "raw_text",
+        "published_at",
+        "transaction_date",
+        "published_at_dt",
+        "transaction_date_dt_raw",
+        "is_late_notification",
+        "is_dpl_period",
+        "dpl_report_type",
+        "dpl_report_date",
+        "dpl_start_date",
+        "dpl_end_date",
+        "dpl_days_to_report",
+        "dpl_report_title",
+        "dpl_report_url",
+        "DPL paaiškinimas",
+    }
+
+    ordered_cols = []
+    for col in first_cols + preferred_tail_cols:
+        if col in df.columns and col not in ordered_cols and col not in hidden_cols:
+            ordered_cols.append(col)
+
+    extra_cols = [
+        col for col in df.columns
+        if col not in ordered_cols and col not in hidden_cols
+    ]
+    detail_cols = ordered_cols + extra_cols
 
     display_df = df[detail_cols].copy()
     display_df = display_df.rename(columns={
@@ -1855,6 +1888,14 @@ def _show_tables(df: pd.DataFrame):
         "parse_status": "Apdorojimo statusas",
     })
 
+    return display_df
+
+
+def _show_tables(df: pd.DataFrame):
+    st.subheader("1. Detali vadovų sandorių lentelė")
+
+    display_df = _prepare_manager_transactions_display_df(df)
+
     format_map = {}
     if "Kaina" in display_df.columns:
         format_map["Kaina"] = "{:.4f}"
@@ -1864,6 +1905,10 @@ def _show_tables(df: pd.DataFrame):
         format_map["Vertė"] = "{:,.2f}"
     if "Pranešta per d." in display_df.columns:
         format_map["Pranešta per d."] = "{:.0f}"
+
+    # Tą patį DataFrame išsaugome CSV atsisiuntimui, kad eksportas turėtų
+    # tokią pačią stulpelių tvarką kaip matoma lentelė.
+    st.session_state["manager_transactions_display_df"] = display_df.copy()
 
     styler = display_df.style
     if format_map:
@@ -1898,6 +1943,7 @@ def _show_tables(df: pd.DataFrame):
         .sort_values(["dpl_sandoriu_sk", "pranesimu_sk", "sandorio_bendra_verte"], ascending=[False, False, False])
     )
     st.dataframe(person_summary, use_container_width=True, hide_index=True)
+
 
 # ------------------------------------------------------------
 # Streamlit puslapis
@@ -2091,9 +2137,13 @@ def show_manager_transactions_page():
     st.markdown("---")
     show_dpl_dates_table(dpl_periods_df)
 
+    export_df = st.session_state.get("manager_transactions_display_df")
+    if export_df is None or export_df.empty:
+        export_df = _prepare_manager_transactions_display_df(df)
+
     st.download_button(
         "⬇ Atsisiųsti CSV",
-        data=df.to_csv(index=False).encode("utf-8-sig"),
+        data=export_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="vadovu_sandoriai_su_dpl.csv",
         mime="text/csv",
         use_container_width=True,
