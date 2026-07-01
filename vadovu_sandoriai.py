@@ -45,6 +45,22 @@ MANAGER_TRANSACTION_COLUMNS = {
     "parse_status", "price_quantity_note",
 }
 
+# Įrašai su šiais statusais / pastabomis yra techniniai nesėkmingo PDF
+# nuskaitymo rezultatai. Juos laikome ne ataskaitos duomenimis, todėl
+# Streamlit lentelėje jų nerodome ir į santraukas neįtraukiame.
+HIDDEN_MANAGER_PARSE_STATUSES = {
+    "pdf_parse_empty_after_retry",
+    "pdf_text_empty",
+    "pdf_parse_error",
+    "pdf_repair_error",
+}
+
+HIDDEN_MANAGER_NOTE_TOKENS = (
+    "pakartotinai nepavyko nuskaityti pdf teksto",
+    "db raw_text buvo tuščias",
+    "db raw_text buvo tuscias",
+)
+
 
 # ------------------------------------------------------------
 # Bendros pagalbinės funkcijos
@@ -102,6 +118,52 @@ def _is_good_parsed_row(row: dict) -> bool:
         and str(row.get("transaction_date") or "").strip()
         and str(row.get("isin") or "").strip()
     )
+
+
+def _is_hidden_manager_report_row(row: dict) -> bool:
+    """Ar eilutė yra techninis nepavykusio PDF nuskaitymo įrašas, kurio ataskaitoje nerodome."""
+    status = str((row or {}).get("parse_status") or "").strip().lower()
+    note = str((row or {}).get("price_quantity_note") or "").strip().lower()
+    issuer = str((row or {}).get("issuer") or "").strip()
+    raw_text = str((row or {}).get("raw_text") or "").strip()
+
+    if status in HIDDEN_MANAGER_PARSE_STATUSES:
+        return True
+    if any(token in note for token in HIDDEN_MANAGER_NOTE_TOKENS):
+        return True
+    # Tuščias emitentas beveik visada reiškia, kad PDF nebuvo sėkmingai išparsintas.
+    # Tokios eilutės gadina santraukas ir atrodo kaip pasikartojimai.
+    if not issuer and (not raw_text or status in {"parsed_incomplete", "repaired_partial_fields", ""}):
+        return True
+    return False
+
+
+def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Pašalina techninius / tuščius PDF įrašus prieš rodant Streamlit ataskaitoje."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    for col in ["issuer", "parse_status", "price_quantity_note", "raw_text"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    mask_hidden = df.apply(lambda r: _is_hidden_manager_report_row(r.to_dict()), axis=1)
+    df = df[~mask_hidden].copy()
+
+    # Papildoma apsauga nuo to paties sandorio dubliavimo, jei jis į DB pateko keliais keliais.
+    dedup_cols = [
+        "pdf_url", "crib_url", "issuer", "person_name", "transaction_date",
+        "isin", "transaction_type", "price", "quantity",
+    ]
+    existing = [c for c in dedup_cols if c in df.columns]
+    if existing:
+        sort_cols = [c for c in ["created_at", "id"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=True)
+        df = df.drop_duplicates(subset=existing, keep="last")
+
+    return df.reset_index(drop=True)
 
 
 # ------------------------------------------------------------
@@ -390,6 +452,43 @@ def _delete_manager_transactions_for_crib_url(crib_url: str) -> int:
             return len(resp.json() or [])
         except Exception:
             return 0
+
+
+def delete_hidden_manager_report_rows(limit: int = 1000) -> dict:
+    """Iš DB pašalina techninius nepavykusio PDF nuskaitymo įrašus.
+
+    Naudoti nebūtina, nes ataskaita juos jau filtruoja, bet mygtukas praverčia
+    norint susitvarkyti senus įrašus, kuriuose yra pastaba
+    „Pakartotinai nepavyko nuskaityti PDF teksto...“.
+    """
+    stats = {"found": 0, "deleted": 0, "errors": 0}
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {
+            "select": "id,issuer,raw_text,parse_status,price_quantity_note",
+            "order": "id.desc",
+            "limit": str(limit),
+        }
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            rows = resp.json() or []
+
+        hidden_ids = [int(r["id"]) for r in rows if r.get("id") and _is_hidden_manager_report_row(r)]
+        stats["found"] = len(hidden_ids)
+
+        for row_id in hidden_ids:
+            try:
+                if _delete_manager_transaction_by_id(row_id):
+                    stats["deleted"] += 1
+            except Exception:
+                stats["errors"] += 1
+
+    except Exception:
+        stats["errors"] += 1
+
+    return stats
 
 
 def _has_good_transaction_for_crib_url(crib_url: str) -> bool:
@@ -1071,6 +1170,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
         "partial": 0,
         "unchanged": 0,
         "failed": 0,
+        "deleted_duplicates": 0,
     }
 
     bad_df = _load_bad_manager_transactions(limit=limit)
@@ -1531,6 +1631,13 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
 def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+
+    # Čia atliekamas pagrindinis pataisymas: techniniai nepavykusio PDF
+    # nuskaitymo įrašai nerodomi ataskaitoje ir nepatenka į santraukas.
+    df = _filter_hidden_manager_report_rows(df)
+    if df.empty:
+        return pd.DataFrame()
+
     df = df.copy()
     for col in ["published_at", "transaction_date"]:
         if col not in df.columns:
@@ -1822,6 +1929,7 @@ def show_manager_transactions_page():
         manager_update_btn = st.button("🔄 Atnaujinti vadovų sandorius", use_container_width=True, key="manager_transactions_update_btn")
         latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
         repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
+        cleanup_hidden_btn = st.button("🧹 Ištrinti techninius tuščius įrašus", use_container_width=True, key="manager_cleanup_hidden_btn")
         repair_limit = st.number_input("Blogų PDF taisymo limitas", min_value=10, max_value=1000, value=200, step=10, key="manager_repair_limit")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1876,12 +1984,32 @@ def show_manager_transactions_page():
             st.exception(exc)
             st.stop()
 
+    if cleanup_hidden_btn:
+        try:
+            with st.spinner("Trinami techniniai tušti vadovų sandorių įrašai..."):
+                stats = delete_hidden_manager_report_rows(limit=int(repair_limit))
+            st.success(
+                "Techniniai tušti įrašai sutvarkyti: "
+                f"rasta {stats.get('found', 0)}, "
+                f"ištrinta {stats.get('deleted', 0)}, "
+                f"klaidų {stats.get('errors', 0)}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error("Nepavyko ištrinti techninių tuščių įrašų.")
+            st.exception(exc)
+            st.stop()
+
     if manager_start_date > manager_end_date:
         st.error("Data „nuo“ negali būti vėlesnė už datą „iki“.")
         st.stop()
 
     raw_df = load_manager_transactions_from_db(manager_start_date, manager_end_date)
+    raw_count = len(raw_df) if raw_df is not None else 0
     df = prepare_manager_transactions_df(raw_df)
+    hidden_count = max(raw_count - len(df), 0)
+    if hidden_count:
+        st.caption(f"Ataskaitoje paslėpta techninių / tuščių PDF nuskaitymo įrašų: {hidden_count}.")
     if df.empty:
         st.info("Pasirinktu laikotarpiu vadovų sandorių duomenų nėra.")
         st.stop()
