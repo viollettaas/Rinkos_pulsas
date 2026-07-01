@@ -1792,23 +1792,28 @@ def _style_delay_value(value):
 def _show_tables(df: pd.DataFrame):
     st.subheader("1. Detali vadovų sandorių lentelė")
 
-    detail_cols = [
-        "DPL",
-        "days_to_publish",
+    # Pagrindiniai priežiūrai reikalingi laukai rodomi lentelės pradžioje.
+    # Visi kiti naudingi / techniniai parametrai paliekami lentelės gale.
+    primary_cols = [
         "issuer",
         "person_name",
-        "transaction_type",
-        "price",
-        "quantity",
-        "transaction_value",
-        "instrument",
-        "transaction_date_dt",
         "published_date",
+        "transaction_date_dt",
+        "days_to_publish",
+        "instrument",
+        "transaction_type",
+        "quantity",
+        "price",
+        "transaction_value",
+        "venue",
+        "DPL",
+    ]
+
+    remaining_cols = [
         "person_role",
         "DPL tipas",
         "Susijusi ataskaita",
         "isin",
-        "venue",
         "Ataskaitos paskelbimo data",
         "DPL pradžia",
         "DPL pabaiga",
@@ -1821,23 +1826,27 @@ def _show_tables(df: pd.DataFrame):
         "price_quantity_note",
         "parse_status",
     ]
-    detail_cols = [c for c in detail_cols if c in df.columns]
+
+    detail_cols = []
+    for col in primary_cols + remaining_cols:
+        if col in df.columns and col not in detail_cols:
+            detail_cols.append(col)
 
     display_df = df[detail_cols].copy()
     display_df = display_df.rename(columns={
-        "days_to_publish": "Vėlavo d.",
-        "issuer": "Emitentas",
+        "issuer": "Įmonės pavadinimas",
         "person_name": "Asmuo",
-        "transaction_type": "Sandorio tipas",
-        "price": "Kaina",
-        "quantity": "Kiekis",
-        "transaction_value": "Vertė",
-        "instrument": "Priemonė",
-        "transaction_date_dt": "Sandorio data",
         "published_date": "Pranešimo data",
+        "transaction_date_dt": "Sandorio data",
+        "days_to_publish": "Pranešta per d.",
+        "instrument": "Pavadinimas",
+        "transaction_type": "Pusė",
+        "quantity": "Kiekis",
+        "price": "Kaina",
+        "transaction_value": "Vertė",
+        "venue": "Vieta",
         "person_role": "Pareigos",
         "isin": "ISIN",
-        "venue": "Prekybos vieta",
         "lei": "LEI",
         "pdf_name": "PDF pavadinimas",
         "pdf_url": "PDF nuoroda",
@@ -1853,12 +1862,13 @@ def _show_tables(df: pd.DataFrame):
         format_map["Kiekis"] = "{:.0f}"
     if "Vertė" in display_df.columns:
         format_map["Vertė"] = "{:,.2f}"
-    if "Vėlavo d." in display_df.columns:
-        format_map["Vėlavo d."] = "{:.0f}"
+    if "Pranešta per d." in display_df.columns:
+        format_map["Pranešta per d."] = "{:.0f}"
 
     styler = display_df.style
     if format_map:
         styler = styler.format(format_map, na_rep="")
+
     # pandas >= 2.1 Styler.applymap nebepalaikomas, todėl naudojame Styler.map.
     # Paliekame atsarginį variantą senesnėms pandas versijoms.
     if "DPL" in display_df.columns:
@@ -1866,11 +1876,11 @@ def _show_tables(df: pd.DataFrame):
             styler = styler.map(_style_dpl_value, subset=["DPL"])
         else:
             styler = styler.applymap(_style_dpl_value, subset=["DPL"])
-    if "Vėlavo d." in display_df.columns:
+    if "Pranešta per d." in display_df.columns:
         if hasattr(styler, "map"):
-            styler = styler.map(_style_delay_value, subset=["Vėlavo d."])
+            styler = styler.map(_style_delay_value, subset=["Pranešta per d."])
         else:
-            styler = styler.applymap(_style_delay_value, subset=["Vėlavo d."])
+            styler = styler.applymap(_style_delay_value, subset=["Pranešta per d."])
 
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
@@ -1888,7 +1898,6 @@ def _show_tables(df: pd.DataFrame):
         .sort_values(["dpl_sandoriu_sk", "pranesimu_sk", "sandorio_bendra_verte"], ascending=[False, False, False])
     )
     st.dataframe(person_summary, use_container_width=True, hide_index=True)
-
 
 # ------------------------------------------------------------
 # Streamlit puslapis
