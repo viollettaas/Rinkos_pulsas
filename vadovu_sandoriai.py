@@ -1658,6 +1658,7 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["transaction_value"] = df["price"] * df["quantity"]
+    df = _remove_manager_duplicates_for_display(df)
     return df
 
 
@@ -1750,6 +1751,245 @@ def show_dpl_dates_table(dpl_periods_df: pd.DataFrame):
         st.info("DPL laikotarpių nerasta pagal pasirinktą vadovų sandorių laikotarpį.")
     else:
         st.dataframe(dpl_dates_df, use_container_width=True, hide_index=True)
+
+
+
+# ------------------------------------------------------------
+# Vadovų sandorių dublikatų valymas
+# ------------------------------------------------------------
+
+def _dup_norm_text(value) -> str:
+    """Normalizuoja tekstą dublikatų palyginimui."""
+    s = str(value or "").strip().lower()
+    repl = str.maketrans({"ą":"a","č":"c","ę":"e","ė":"e","į":"i","š":"s","ų":"u","ū":"u","ž":"z"})
+    s = s.translate(repl)
+    s = re.sub(r"\b(ab|uab|as|akcine bendrove|uzdaroji akcine bendrove)\b", " ", s)
+    s = s.replace("paprastoji vardine akcija", "akcija")
+    s = s.replace("paprastosios vardines akcijos", "akcija")
+    s = s.replace("ordinary registered shares", "akcija")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _dup_date(value) -> str:
+    try:
+        dt = pd.to_datetime(value, errors="coerce")
+        if pd.notna(dt):
+            return dt.date().isoformat()
+    except Exception:
+        pass
+    return str(value or "").strip()[:10]
+
+
+def _dup_number(value, decimals: int = 6) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return ""
+        val = float(value)
+        if abs(val) < 1e-12:
+            # Nulis vadovų sandoriuose dažnai reiškia opcioną / paveldėjimą;
+            # paliekame kaip tikrą reikšmę, o ne kaip tuščią.
+            return "0"
+        return f"{val:.{decimals}f}".rstrip("0").rstrip(".")
+    except Exception:
+        s = str(value or "").replace(" ", "").replace(",", ".").strip()
+        return s
+
+
+def _row_has_price_quantity(row) -> bool:
+    try:
+        price_ok = row.get("price") is not None and not pd.isna(row.get("price"))
+    except Exception:
+        price_ok = bool(str(row.get("price") or "").strip())
+    try:
+        quantity_ok = row.get("quantity") is not None and not pd.isna(row.get("quantity"))
+    except Exception:
+        quantity_ok = bool(str(row.get("quantity") or "").strip())
+    return bool(price_ok and quantity_ok)
+
+
+def _manager_duplicate_score(row) -> float:
+    """Kuo didesnis balas, tuo įrašas laikomas geresniu dublikato variante."""
+    score = 0.0
+    important_cols = [
+        "issuer", "person_name", "person_role", "transaction_date", "transaction_date_dt",
+        "isin", "instrument", "transaction_type", "price", "quantity", "venue",
+        "published_at", "published_date", "crib_url", "pdf_url", "raw_text",
+    ]
+    for col in important_cols:
+        val = row.get(col)
+        try:
+            empty = val is None or pd.isna(val) or str(val).strip() == ""
+        except Exception:
+            empty = str(val or "").strip() == ""
+        if not empty:
+            score += 1
+
+    if _row_has_price_quantity(row):
+        score += 40
+    if _looks_like_valid_isin(row.get("isin")):
+        score += 10
+
+    pdf_url = str(row.get("pdf_url") or "").lower()
+    if "crib.lt" in pdf_url and "viewattachment" in pdf_url:
+        score += 12
+    if "globenewswire.com" in pdf_url:
+        score -= 8
+
+    status = str(row.get("parse_status") or "").lower()
+    if status in {"parsed_mar_form", "repaired_empty_fields"}:
+        score += 8
+    elif status in {"parsed_incomplete", "repaired_partial_fields"}:
+        score += 2
+    elif "error" in status or "empty" in status:
+        score -= 10
+
+    raw_len = len(str(row.get("raw_text") or ""))
+    score += min(raw_len / 1000.0, 6.0)
+
+    try:
+        if row.get("id") is not None and not pd.isna(row.get("id")):
+            # Jei viskas vienoda, paliekame naujesnį / vėlesnį įrašą.
+            score += min(float(row.get("id")) / 1000000.0, 1.0)
+    except Exception:
+        pass
+    return score
+
+
+def _manager_duplicate_key_strict(row) -> tuple:
+    return (
+        _dup_norm_text(_canonical_issuer_name(row.get("issuer"))),
+        _dup_norm_text(row.get("person_name")),
+        _dup_date(row.get("transaction_date_dt") or row.get("transaction_date")),
+        str(row.get("isin") or "").strip().upper(),
+        _dup_norm_text(row.get("transaction_type")),
+        _dup_norm_text(row.get("instrument")),
+        _dup_number(row.get("quantity"), decimals=0),
+        _dup_number(row.get("price"), decimals=6),
+        _dup_norm_text(row.get("venue")),
+    )
+
+
+def _manager_duplicate_key_loose(row) -> tuple:
+    """Platesnis raktas silpniems dublikatams, pvz. Globenewswire be kainos/kiekio."""
+    crib = str(row.get("crib_url") or "").strip().lower()
+    return (
+        crib,
+        _dup_norm_text(_canonical_issuer_name(row.get("issuer"))),
+        _dup_norm_text(row.get("person_name")),
+        _dup_date(row.get("transaction_date_dt") or row.get("transaction_date")),
+        str(row.get("isin") or "").strip().upper(),
+        _dup_norm_text(row.get("transaction_type")),
+        _dup_norm_text(row.get("venue")),
+    )
+
+
+def _duplicate_ids_from_rows(rows: list[dict]) -> list[int]:
+    """Grąžina ID, kuriuos galima saugiai trinti kaip dublikatus."""
+    if not rows:
+        return []
+
+    # Pirmas etapas: visiškai tas pats sandoris pagal faktinius laukus.
+    by_strict = {}
+    for r in rows:
+        key = _manager_duplicate_key_strict(r)
+        if not any(key):
+            continue
+        by_strict.setdefault(key, []).append(r)
+
+    delete_ids = set()
+    for group in by_strict.values():
+        if len(group) <= 1:
+            continue
+        ranked = sorted(group, key=_manager_duplicate_score, reverse=True)
+        for r in ranked[1:]:
+            if r.get("id") is not None:
+                try:
+                    delete_ids.add(int(r.get("id")))
+                except Exception:
+                    pass
+
+    # Antras etapas: tas pats CRIB pranešimas ir sandorio tapatybė, bet viena eilutė nepilna.
+    remaining = [r for r in rows if r.get("id") is not None and pd.notna(r.get("id")) and int(r.get("id")) not in delete_ids]
+    by_loose = {}
+    for r in remaining:
+        key = _manager_duplicate_key_loose(r)
+        # Be crib_url tokio plataus palyginimo netaikome, kad nesutrintume realių atskirų sandorių.
+        if not key[0] or not key[1] or not key[2] or not key[3]:
+            continue
+        by_loose.setdefault(key, []).append(r)
+
+    for group in by_loose.values():
+        if len(group) <= 1:
+            continue
+        complete = [r for r in group if _row_has_price_quantity(r)]
+        incomplete = [r for r in group if not _row_has_price_quantity(r)]
+        if complete and incomplete:
+            # Paliekame pilnus įrašus. Triname tik nepilnus veidrodinius įrašus.
+            for r in incomplete:
+                try:
+                    delete_ids.add(int(r.get("id")))
+                except Exception:
+                    pass
+        else:
+            # Jei visi vienodai pilni arba visi nepilni, paliekame geriausią.
+            ranked = sorted(group, key=_manager_duplicate_score, reverse=True)
+            for r in ranked[1:]:
+                try:
+                    delete_ids.add(int(r.get("id")))
+                except Exception:
+                    pass
+
+    return sorted(delete_ids)
+
+
+def _remove_manager_duplicates_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Paslepia dublikatus ataskaitoje, net jei jie dar fiziškai yra DB."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "id" not in df.columns:
+        return df
+
+    rows = df.to_dict("records")
+    delete_ids = set(_duplicate_ids_from_rows(rows))
+    if not delete_ids:
+        return df
+    return df[~df["id"].apply(lambda x: int(x) in delete_ids if pd.notna(x) else False)].copy().reset_index(drop=True)
+
+
+def delete_duplicate_manager_transactions(limit: int = 3000) -> dict:
+    """Fiziškai ištrina dublikatus iš Supabase manager_transactions lentelės."""
+    stats = {"checked": 0, "duplicates_found": 0, "deleted": 0, "errors": 0, "error_messages": []}
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {
+            "select": "id,published_at,pdf_url,pdf_name,crib_url,crib_title,issuer,person_name,person_role,isin,instrument,transaction_type,price,quantity,transaction_date,venue,raw_text,parse_status,price_quantity_note",
+            "order": "id.desc",
+            "limit": str(limit),
+        }
+        with _client() as client:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            rows = resp.json() or []
+
+        stats["checked"] = len(rows)
+        duplicate_ids = _duplicate_ids_from_rows(rows)
+        stats["duplicates_found"] = len(duplicate_ids)
+
+        for row_id in duplicate_ids:
+            try:
+                if _delete_manager_transaction_by_id(int(row_id)):
+                    stats["deleted"] += 1
+            except Exception as exc:
+                stats["errors"] += 1
+                if len(stats["error_messages"]) < 10:
+                    stats["error_messages"].append(f"id={row_id}: {exc}")
+    except Exception as exc:
+        stats["errors"] += 1
+        stats["error_messages"].append(str(exc))
+    return stats
+
 
 def _show_summary_cards(df: pd.DataFrame):
     total = len(df)
@@ -1969,6 +2209,7 @@ def show_manager_transactions_page():
         unsafe_allow_html=True,
     )
     st.markdown("<br>", unsafe_allow_html=True)
+    st.caption("Vadovų sandorių modulis: dublikatų valymo versija 2026-07-03")
 
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -1983,9 +2224,10 @@ def show_manager_transactions_page():
         manager_update_days = st.number_input("Tikrinti paskutines dienas", min_value=7, max_value=180, value=45, step=1, key="manager_update_days")
         manager_update_btn = st.button("🔄 Atnaujinti vadovų sandorius", use_container_width=True, key="manager_transactions_update_btn")
         latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
+        duplicate_cleanup_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_btn")
         repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
         cleanup_hidden_btn = st.button("🧹 Ištrinti techninius tuščius įrašus", use_container_width=True, key="manager_cleanup_hidden_btn")
-        repair_limit = st.number_input("Blogų PDF taisymo limitas", min_value=10, max_value=1000, value=200, step=10, key="manager_repair_limit")
+        repair_limit = st.number_input("Blogų PDF / dublikatų limitas", min_value=10, max_value=5000, value=1000, step=10, key="manager_repair_limit")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if manager_update_btn:
@@ -2019,6 +2261,33 @@ def show_manager_transactions_page():
             st.rerun()
         except Exception as exc:
             st.error("Nepavyko perskaičiuoti paskutinio pranešimo.")
+            st.exception(exc)
+            st.stop()
+
+    if duplicate_cleanup_btn:
+        try:
+            with st.spinner("Ieškomi ir trinami vadovų sandorių dublikatai DB..."):
+                stats = delete_duplicate_manager_transactions(limit=int(repair_limit))
+            if stats.get("errors", 0):
+                st.warning(
+                    "Dublikatų valymas baigtas su klaidomis: "
+                    f"patikrinta {stats.get('checked', 0)}, "
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}, "
+                    f"klaidų {stats.get('errors', 0)}."
+                )
+                if stats.get("error_messages"):
+                    st.code("\n".join(stats.get("error_messages", [])[:10]))
+            else:
+                st.success(
+                    "Dublikatų valymas baigtas: "
+                    f"patikrinta {stats.get('checked', 0)}, "
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}."
+                )
+            st.rerun()
+        except Exception as exc:
+            st.error("Nepavyko ištrinti dublikatų.")
             st.exception(exc)
             st.stop()
 
@@ -2058,6 +2327,40 @@ def show_manager_transactions_page():
     if manager_start_date > manager_end_date:
         st.error("Data „nuo“ negali būti vėlesnė už datą „iki“.")
         st.stop()
+
+    st.markdown("### DB tvarkymas")
+    c_db1, c_db2 = st.columns([1, 3])
+    with c_db1:
+        duplicate_cleanup_main_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_main_btn")
+    with c_db2:
+        st.caption("Mygtukas patikrina naujausius manager_transactions įrašus ir ištrina dubliuotus techninius / veidrodinius įrašus. Ataskaitoje dublikatai paslepiami ir be trynimo.")
+
+    if duplicate_cleanup_main_btn:
+        try:
+            with st.spinner("Ieškomi ir trinami vadovų sandorių dublikatai DB..."):
+                stats = delete_duplicate_manager_transactions(limit=int(repair_limit))
+            if stats.get("errors", 0):
+                st.warning(
+                    "Dublikatų valymas baigtas su klaidomis: "
+                    f"patikrinta {stats.get('checked', 0)}, "
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}, "
+                    f"klaidų {stats.get('errors', 0)}."
+                )
+                if stats.get("error_messages"):
+                    st.code("\n".join(stats.get("error_messages", [])[:10]))
+            else:
+                st.success(
+                    "Dublikatų valymas baigtas: "
+                    f"patikrinta {stats.get('checked', 0)}, "
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}."
+                )
+            st.rerun()
+        except Exception as exc:
+            st.error("Nepavyko ištrinti dublikatų.")
+            st.exception(exc)
+            st.stop()
 
     raw_df = load_manager_transactions_from_db(manager_start_date, manager_end_date)
     raw_count = len(raw_df) if raw_df is not None else 0
