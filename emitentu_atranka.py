@@ -24,6 +24,9 @@ import pandas as pd
 from supabase_cache import load_news_df
 
 
+EMITENTU_ATRANKA_VERSION = "emitentu_suvienodinimas_2026-07-15c"
+
+
 # ============================================================
 # KATEGORIJŲ / RAKTAŽODŽIŲ KONFIGŪRACIJA
 # ============================================================
@@ -122,6 +125,139 @@ def _norm_for_dedup(value) -> str:
     s = norm_text(value).lower()
     s = re.sub(r"\s+", " ", s)
     return s.strip()
+
+
+_LT_TRANSLATION = str.maketrans({
+    "ą": "a", "č": "c", "ę": "e", "ė": "e", "į": "i",
+    "š": "s", "ų": "u", "ū": "u", "ž": "z",
+    "Ą": "a", "Č": "c", "Ę": "e", "Ė": "e", "Į": "i",
+    "Š": "s", "Ų": "u", "Ū": "u", "Ž": "z",
+})
+
+_LEGAL_FORM_PATTERNS = [
+    r"uzdaroji\s+akcine\s+bendrove",
+    r"uždaroji\s+akcinė\s+bendrovė",
+    r"akcine\s+bendrove",
+    r"akcinė\s+bendrovė",
+    r"\buab\b",
+    r"\bab\b",
+    r"\bas\b",
+    r"\basa\b",
+    r"\boy\b",
+    r"\bsia\b",
+]
+
+_LEGAL_SUFFIX_RE = re.compile(
+    # Teisine forma turi buti atskiras zodis gale.
+    # Svarbu: neturi sutapti su zodziais kaip "bankas", kurie baigiasi "as".
+    r"(?:\s*,\s*|\s+)(UAB|AB|AS|ASA|OY|SIA)\s*$",
+    flags=re.I | re.U,
+)
+
+_LEGAL_PREFIX_RE = re.compile(
+    # Teisine forma turi buti atskiras zodis pradzioje.
+    r"^\s*(UAB|AB|AS|ASA|OY|SIA)\s+",
+    flags=re.I | re.U,
+)
+
+
+def _issuer_base_key(value) -> str:
+    """Sukuria emitento grupavimo raktą.
+
+    Pvz. "AKROPOLIS GROUP UAB" ir "AKROPOLIS GROUP, UAB" abu tampa
+    "akropolis group". Taip ataskaitoje neatsiranda dviejų blokų dėl
+    kablelio, teisinės formos ar raidžių registro skirtumų.
+    """
+    s = norm_text(value)
+    if not s:
+        return ""
+
+    s = s.translate(_LT_TRANSLATION).lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[„“\"'`´]", "", s)
+    s = re.sub(r"[\.,;:()\[\]{}]+", " ", s)
+
+    for pattern in _LEGAL_FORM_PATTERNS:
+        s = re.sub(pattern, " ", s, flags=re.I | re.U)
+
+    s = re.sub(r"\bgroup\s+group\b", "group", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _clean_issuer_display(value) -> str:
+    """Sutvarko pavadinimą rodymui, bet nepakeičia jo esmės."""
+    s = norm_text(value)
+    if not s or s.lower() == "unknown":
+        return "Unknown"
+
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r",\s*", ", ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _issuer_display_score(value) -> int:
+    """Parenka gražiausią pavadinimo variantą iš kelių to paties emitento formų."""
+    s = _clean_issuer_display(value)
+    if not s or s == "Unknown":
+        return -10000
+
+    score = 0
+    if re.search(r",\s*(UAB|AB|AS|ASA|OY|SIA)\s*$", s, flags=re.I):
+        score += 100
+    if re.search(r"^(AB|UAB|AS|ASA|OY|SIA)\s+", s, flags=re.I):
+        score += 60
+    if s.isupper():
+        score -= 5
+    score += min(len(s), 80)
+    return score
+
+
+def _canonical_issuer_from_values(values) -> str:
+    clean = [_clean_issuer_display(v) for v in values if _clean_issuer_display(v) != "Unknown"]
+    if not clean:
+        return "Unknown"
+
+    best = sorted(clean, key=lambda x: (_issuer_display_score(x), x), reverse=True)[0]
+
+    # Jei pavadinimas baigiasi teisine forma be kablelio, rodome su kableliu:
+    # "AKROPOLIS GROUP UAB" -> "AKROPOLIS GROUP, UAB".
+    m = _LEGAL_SUFFIX_RE.search(best)
+    if m:
+        suffix = m.group(1).upper()
+        base = _LEGAL_SUFFIX_RE.sub("", best).strip(" ,")
+        if base:
+            return f"{base}, {suffix}"
+
+    # Jei teisinė forma yra priekyje, paliekame įprastą AB ... formą.
+    m = _LEGAL_PREFIX_RE.search(best)
+    if m:
+        prefix = m.group(1).upper()
+        rest = _LEGAL_PREFIX_RE.sub("", best).strip()
+        if rest:
+            return f"{prefix} {rest}"
+
+    return best
+
+
+def _canonicalize_issuers(data: pd.DataFrame) -> pd.DataFrame:
+    """Suvienodina emitentų pavadinimus prieš grupavimą ir dublikatų šalinimą."""
+    if data is None or data.empty or "issuer" not in data.columns:
+        return data
+
+    out = data.copy()
+    out["issuer"] = out["issuer"].fillna("Unknown").astype(str).map(_clean_issuer_display)
+    out["issuer_key"] = out["issuer"].map(_issuer_base_key)
+    out.loc[out["issuer_key"].eq(""), "issuer_key"] = out.loc[out["issuer_key"].eq(""), "issuer"].map(_norm_for_dedup)
+
+    canonical_by_key = {}
+    for key, group in out.groupby("issuer_key", dropna=False):
+        canonical_by_key[key] = _canonical_issuer_from_values(group["issuer"].tolist())
+
+    out["issuer"] = out["issuer_key"].map(canonical_by_key).fillna(out["issuer"])
+    return out.drop(columns=["issuer_key"], errors="ignore")
 
 
 def _make_news_key(row: pd.Series) -> str:
@@ -308,6 +444,7 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
         data[col] = data[col].fillna("").astype(str).map(norm_text)
 
     data["issuer"] = data["issuer"].replace("", "Unknown")
+    data = _canonicalize_issuers(data)
 
     if "date_parsed" not in data.columns:
         data["date_parsed"] = parse_dates_safe(data["date"])
@@ -401,7 +538,7 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
         </html>
         """
 
-    report_df = df.copy()
+    report_df = _canonicalize_issuers(df.copy())
     report_df["date_parsed"] = pd.to_datetime(report_df.get("date_parsed"), errors="coerce")
     report_df = report_df.sort_values(["issuer", "date_parsed", "orig_order"], ascending=[True, True, True])
 
@@ -763,6 +900,7 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
         "<div><strong>Santrauka</strong></div>"
         f"<div>Visų įrašų skaičius: <strong>{len(report_df)}</strong></div>"
         f"<div>Emitentų skaičius: <strong>{report_df['issuer'].nunique()}</strong></div>"
+        f"<div>Versija: <strong>{EMITENTU_ATRANKA_VERSION}</strong></div>"
         f"<div>Temų pasiskirstymas pagal aptikimus: {cat_summary_str}</div>"
         "<div class='small' style='margin-top:8px'>"
         "Pastaba: kiekvienas pranešimas prie emitento rodomas tik vieną kartą. "
@@ -907,7 +1045,8 @@ def render_emitentu_atranka_page(default_days: int = 30):
     st.subheader("🧾 Emitentų atranka pagal CRIB naujienas")
     st.caption(
         "Duomenys imami iš Supabase market_news lentelės, source='crib'. "
-        "Ataskaita generuojama pagal emitentus, be kategorijų blokų, su aptiktomis temomis ir raktažodžiais."
+        "Ataskaita generuojama pagal emitentus, be kategorijų blokų, su aptiktomis temomis ir raktažodžiais. "
+        "Versija: emitentu_suvienodinimas_2026-07-15c."
     )
 
     today = date.today()
