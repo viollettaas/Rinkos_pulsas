@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Emitentų atranka pagal CRIB naujienas.
 
