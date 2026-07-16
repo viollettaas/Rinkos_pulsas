@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Metiniu ataskaitu modulis Rinkos pulsui.
 
