@@ -1,3 +1,13 @@
+AKTYVUS NAUJAS METINES MODULIS: metines_pipeline_visible_buttons_2026-07-16h. Failas: /mount/src/rinkos_pulsas/metines.py
+
+
+DIAGNOSTIKA: jeigu matai šį bloką, užkrautas NAUJAS metines.py. Veiksmų mygtukai specialiai perkelti į pagrindinį puslapį, kad jų neuždengtų senas sidebar kodas.
+
+Metinių ataskaitų veiksmai
+Metinės informacijos data nuo
+
+2026/01/01
+Metinės informacijos data iki
 """
 Metinių ataskaitų modulis Rinkos pulsui.
 
@@ -63,7 +73,7 @@ except Exception:
 # KONFIGŪRACIJA
 # ============================================================
 
-MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16h"
+MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16i"
 
 TABLE_REPORTS = "annual_reports"
 TABLE_FILES = "annual_report_files"
@@ -2660,32 +2670,40 @@ def show_metines_page():
             help="Įjunk, jei DB raw_text buvo sukurtas senu parseriu arba matai akivaizdžiai neteisingus rodiklius. Tai lėčiau, bet patikimiau.",
         )
 
-        b1, b2 = st.columns(2)
-        with b1:
-            fetch_btn = st.button(
-                "1️⃣ Rasti CRIB pranešimus ir atsisiųsti trūkstamus failus",
-                use_container_width=True,
-                type="primary",
-                key="metines_main_fetch_btn",
-            )
-            full_btn = st.button(
-                "🔁 Pilnas atnaujinimas: atsisiųsti + perparsinti",
-                use_container_width=True,
-                key="metines_main_full_btn",
-            )
-        with b2:
-            reparse_btn = st.button(
-                "2️⃣ Ištraukti rodiklius iš jau išsaugotų failų",
-                use_container_width=True,
-                key="metines_main_reparse_btn",
-            )
-            clear_btn = st.button(
-                "🧹 Išvalyti šio periodo rodiklius",
-                use_container_width=True,
-                key="metines_main_clear_metrics_btn",
-            )
+        st.markdown("### 1 etapas. Duomenų surinkimas")
+        st.caption("Naudok, kai annual_reports / annual_report_files yra 0 arba kai atsirado naujų CRIB metinių pranešimų.")
+        fetch_btn = st.button(
+            "1 etapas: rasti CRIB pranešimus ir atsisiųsti failus",
+            use_container_width=True,
+            type="primary",
+            key="metines_main_fetch_btn_v2",
+        )
 
-        st.caption("2 žingsnis neieško CRIB iš naujo — jis perparsina jau Supabase išsaugotus annual_report_files/raw_text.")
+        st.markdown("### 2 etapas. Rodiklių ištraukimas")
+        st.caption("Naudok, kai failai jau yra DB. Šis veiksmas neieško CRIB iš naujo, tik perparsina annual_report_files/raw_text.")
+        reparse_btn = st.button(
+            "2 etapas: ištraukti rodiklius iš jau išsaugotų failų",
+            use_container_width=True,
+            type="primary",
+            key="metines_main_reparse_btn_v2",
+        )
+
+        st.markdown("### Papildomi veiksmai")
+        full_btn = st.button(
+            "Pilnas atnaujinimas: 1 etapas + 2 etapas",
+            use_container_width=True,
+            key="metines_main_full_btn_v2",
+        )
+        clear_btn = st.button(
+            "Išvalyti tik šio periodo rodiklius annual_report_metrics",
+            use_container_width=True,
+            key="metines_main_clear_metrics_btn_v2",
+        )
+
+        st.warning(
+            "Jeigu diagnostikoje annual_reports = 0 ir annual_report_files = 0, pirmiausia spausk 1 etapą arba pilną atnaujinimą. "
+            "2 etapas tokiu atveju neturės ką perparsinti."
+        )
 
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -2851,3 +2869,62 @@ show_annual_reports_metrics_page = show_metines_page
 if __name__ == "__main__":
     # Minimalus lokalaus importo testas.
     print(MODULE_VERSION)
+2026/07/16
+Maks. CRIB pranešimų vienu paleidimu
+
+1000
+
+
+
+2 žingsnyje peratsisiųsti originalius failus iš file_url
+
+
+
+
+
+
+2 žingsnis neieško CRIB iš naujo — jis perparsina jau Supabase išsaugotus annual_report_files/raw_text.
+
+Diagnostika
+
+Diagnostika
+annual_reports
+
+0
+
+annual_report_files
+
+0
+
+annual_report_metrics
+
+0
+
+Failų su raw_text
+
+0
+
+Paskutinio paleidimo rezultatas šioje naršyklės sesijoje
+
+{
+"module_version":"metines_pipeline_visible_buttons_2026-07-16h"
+"mode":"reparse_saved_files"
+"reports_in_period":0
+"reports_processed":0
+"files_seen":0
+"files_with_raw_text":0
+"files_redownloaded":0
+"metrics_found":0
+"metrics_saved":0
+"reports_without_metrics":0
+"errors":0
+"error_examples":[]
+"last_messages":[]
+}
+Kodėl ne visos įmonės matosi?
+
+Rodiklių suvestinė dabar įtraukia visas pasirinkto periodo annual_reports eilutes. Jeigu įmonė turi metinį CRIB pranešimą, bet nėra ištrauktų rodiklių, ji bus rodoma su tuščiais rodiklių laukais.
+
+Yra VLN emitentų sąraše, bet pasirinktu periodu annual_reports nerasta:
+
+AUGA group, Akola group, Amber Grid, Apranga, Artea bankas, Grigeo Group, INVL Baltic Farmland, INVL Baltic Real Estate, INVL Technology, Ignitis grupė, Invalda INVL, KN Energies, Kauno energija, LITGRID, Novaturas, Pieno žvaigždės, Rokiškio sūris, Telia Lietuva, Utenos trikotažas, Vilkyškių pieninė, Vilniaus baldai, Žemaitijos pienas
