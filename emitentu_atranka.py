@@ -23,8 +23,12 @@ import pandas as pd
 
 from supabase_cache import load_news_df
 
-
-EMITENTU_ATRANKA_VERSION = "emitentu_suvienodinimas_2026-07-15c"
+try:
+    from supabase_cache import _http_client, _supabase_headers, _supabase_rest_url
+except Exception:
+    _http_client = None
+    _supabase_headers = None
+    _supabase_rest_url = None
 
 
 # ============================================================
@@ -125,139 +129,6 @@ def _norm_for_dedup(value) -> str:
     s = norm_text(value).lower()
     s = re.sub(r"\s+", " ", s)
     return s.strip()
-
-
-_LT_TRANSLATION = str.maketrans({
-    "ą": "a", "č": "c", "ę": "e", "ė": "e", "į": "i",
-    "š": "s", "ų": "u", "ū": "u", "ž": "z",
-    "Ą": "a", "Č": "c", "Ę": "e", "Ė": "e", "Į": "i",
-    "Š": "s", "Ų": "u", "Ū": "u", "Ž": "z",
-})
-
-_LEGAL_FORM_PATTERNS = [
-    r"uzdaroji\s+akcine\s+bendrove",
-    r"uždaroji\s+akcinė\s+bendrovė",
-    r"akcine\s+bendrove",
-    r"akcinė\s+bendrovė",
-    r"\buab\b",
-    r"\bab\b",
-    r"\bas\b",
-    r"\basa\b",
-    r"\boy\b",
-    r"\bsia\b",
-]
-
-_LEGAL_SUFFIX_RE = re.compile(
-    # Teisine forma turi buti atskiras zodis gale.
-    # Svarbu: neturi sutapti su zodziais kaip "bankas", kurie baigiasi "as".
-    r"(?:\s*,\s*|\s+)(UAB|AB|AS|ASA|OY|SIA)\s*$",
-    flags=re.I | re.U,
-)
-
-_LEGAL_PREFIX_RE = re.compile(
-    # Teisine forma turi buti atskiras zodis pradzioje.
-    r"^\s*(UAB|AB|AS|ASA|OY|SIA)\s+",
-    flags=re.I | re.U,
-)
-
-
-def _issuer_base_key(value) -> str:
-    """Sukuria emitento grupavimo raktą.
-
-    Pvz. "AKROPOLIS GROUP UAB" ir "AKROPOLIS GROUP, UAB" abu tampa
-    "akropolis group". Taip ataskaitoje neatsiranda dviejų blokų dėl
-    kablelio, teisinės formos ar raidžių registro skirtumų.
-    """
-    s = norm_text(value)
-    if not s:
-        return ""
-
-    s = s.translate(_LT_TRANSLATION).lower()
-    s = s.replace("&", " and ")
-    s = re.sub(r"[„“\"'`´]", "", s)
-    s = re.sub(r"[\.,;:()\[\]{}]+", " ", s)
-
-    for pattern in _LEGAL_FORM_PATTERNS:
-        s = re.sub(pattern, " ", s, flags=re.I | re.U)
-
-    s = re.sub(r"\bgroup\s+group\b", "group", s)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _clean_issuer_display(value) -> str:
-    """Sutvarko pavadinimą rodymui, bet nepakeičia jo esmės."""
-    s = norm_text(value)
-    if not s or s.lower() == "unknown":
-        return "Unknown"
-
-    s = re.sub(r"\s+,", ",", s)
-    s = re.sub(r",\s*", ", ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _issuer_display_score(value) -> int:
-    """Parenka gražiausią pavadinimo variantą iš kelių to paties emitento formų."""
-    s = _clean_issuer_display(value)
-    if not s or s == "Unknown":
-        return -10000
-
-    score = 0
-    if re.search(r",\s*(UAB|AB|AS|ASA|OY|SIA)\s*$", s, flags=re.I):
-        score += 100
-    if re.search(r"^(AB|UAB|AS|ASA|OY|SIA)\s+", s, flags=re.I):
-        score += 60
-    if s.isupper():
-        score -= 5
-    score += min(len(s), 80)
-    return score
-
-
-def _canonical_issuer_from_values(values) -> str:
-    clean = [_clean_issuer_display(v) for v in values if _clean_issuer_display(v) != "Unknown"]
-    if not clean:
-        return "Unknown"
-
-    best = sorted(clean, key=lambda x: (_issuer_display_score(x), x), reverse=True)[0]
-
-    # Jei pavadinimas baigiasi teisine forma be kablelio, rodome su kableliu:
-    # "AKROPOLIS GROUP UAB" -> "AKROPOLIS GROUP, UAB".
-    m = _LEGAL_SUFFIX_RE.search(best)
-    if m:
-        suffix = m.group(1).upper()
-        base = _LEGAL_SUFFIX_RE.sub("", best).strip(" ,")
-        if base:
-            return f"{base}, {suffix}"
-
-    # Jei teisinė forma yra priekyje, paliekame įprastą AB ... formą.
-    m = _LEGAL_PREFIX_RE.search(best)
-    if m:
-        prefix = m.group(1).upper()
-        rest = _LEGAL_PREFIX_RE.sub("", best).strip()
-        if rest:
-            return f"{prefix} {rest}"
-
-    return best
-
-
-def _canonicalize_issuers(data: pd.DataFrame) -> pd.DataFrame:
-    """Suvienodina emitentų pavadinimus prieš grupavimą ir dublikatų šalinimą."""
-    if data is None or data.empty or "issuer" not in data.columns:
-        return data
-
-    out = data.copy()
-    out["issuer"] = out["issuer"].fillna("Unknown").astype(str).map(_clean_issuer_display)
-    out["issuer_key"] = out["issuer"].map(_issuer_base_key)
-    out.loc[out["issuer_key"].eq(""), "issuer_key"] = out.loc[out["issuer_key"].eq(""), "issuer"].map(_norm_for_dedup)
-
-    canonical_by_key = {}
-    for key, group in out.groupby("issuer_key", dropna=False):
-        canonical_by_key[key] = _canonical_issuer_from_values(group["issuer"].tolist())
-
-    out["issuer"] = out["issuer_key"].map(canonical_by_key).fillna(out["issuer"])
-    return out.drop(columns=["issuer_key"], errors="ignore")
 
 
 def _make_news_key(row: pd.Series) -> str:
@@ -379,19 +250,162 @@ def safe_write_text(path: Path, content: str, encoding: str = "utf-8") -> Path:
         return alt
 
 
+
+# ============================================================
+# EMITENTU PAVADINIMU SUVEDIMAS I VIENA FORMA
+# ============================================================
+
+LEGAL_FORM_TOKENS = {
+    "ab", "uab", "mb", "vsi", "vsi", "as", "asa", "oy", "oyj", "sIA".lower(),
+    "akcine", "bendrove", "akcine bendrove", "uzdaroji", "uzdaroji akcine bendrove",
+    "public", "limited", "company", "group", "grupe"
+}
+
+# Zodziai, kuriu nenorime nukirpti kaip teisiniu formu, nors jie baigiasi panasiomis raidemis.
+PROTECTED_WORDS = {"bankas", "bank", "energija", "energies", "grid", "group", "grupe"}
+
+
+def _remove_lithuanian_accents(s: str) -> str:
+    repl = str.maketrans({
+        "ą": "a", "č": "c", "ę": "e", "ė": "e", "į": "i", "š": "s", "ų": "u", "ū": "u", "ž": "z",
+        "Ą": "A", "Č": "C", "Ę": "E", "Ė": "E", "Į": "I", "Š": "S", "Ų": "U", "Ū": "U", "Ž": "Z",
+    })
+    return s.translate(repl)
+
+
+def _issuer_base_key(value) -> str:
+    """Grupavimo raktas: AKROPOLIS GROUP UAB ir AKROPOLIS GROUP, UAB -> akropolis."""
+    s = norm_text(value).lower()
+    s = _remove_lithuanian_accents(s)
+    s = s.replace("&quot;", " ").replace("&amp;", " and ")
+    s = re.sub(r"[„“”\"'`´,.;:()\[\]{}]", " ", s)
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return "unknown"
+
+    tokens = []
+    for tok in s.split():
+        t = tok.strip("- ")
+        if not t:
+            continue
+        # Teisine forma salinama tik kaip atskiras zodis, ne zodzio dalis.
+        if t in PROTECTED_WORDS:
+            tokens.append(t)
+            continue
+        if t in LEGAL_FORM_TOKENS:
+            continue
+        tokens.append(t)
+
+    key = " ".join(tokens).strip()
+    key = re.sub(r"\s+", " ", key)
+    return key or s or "unknown"
+
+
+def _choose_canonical_issuer(values: Iterable[str]) -> str:
+    cleaned = [norm_text(v) for v in values if norm_text(v)]
+    if not cleaned:
+        return "Unknown"
+    # Pirmenybe: ilgesnis pavadinimas su lietuviskomis kabutemis/kableliu, bet ne per daug triuksmo.
+    def score(v: str):
+        has_comma = 1 if "," in v else 0
+        has_quotes = 1 if any(ch in v for ch in ['"', '„', '“']) else 0
+        upper_penalty = 1 if v.isupper() else 0
+        return (has_comma + has_quotes, -upper_penalty, len(v))
+    return sorted(cleaned, key=score, reverse=True)[0]
+
+
+def _canonicalize_issuers(data: pd.DataFrame) -> pd.DataFrame:
+    if data is None or data.empty or "issuer" not in data.columns:
+        return data
+    out = data.copy()
+    out["issuer_original"] = out["issuer"].fillna("").astype(str).map(norm_text)
+    out["issuer_key"] = out["issuer_original"].map(_issuer_base_key)
+    mapping = {}
+    for key, grp in out.groupby("issuer_key", dropna=False):
+        mapping[key] = _choose_canonical_issuer(grp["issuer_original"].tolist())
+    out["issuer"] = out["issuer_key"].map(mapping).fillna(out["issuer_original"])
+    out["issuer"] = out["issuer"].replace("", "Unknown")
+    return out
+
+
+# ============================================================
+# SUPABASE PAGINATION - KAD NEBUTU 1000 IRASU RIBOS
+# ============================================================
+
+REPORT_VERSION = "emitentu_suvienodinimas_ir_puslapiavimas_2026-07-15d"
+PAGE_SIZE = 1000
+
+
+def _date_start_iso(d: date) -> str:
+    return f"{d.isoformat()} 00:00:00"
+
+
+def _date_end_iso(d: date) -> str:
+    return f"{d.isoformat()} 23:59:59"
+
+
+def _load_crib_news_df_paginated(start_date: date, end_date: date, page_size: int = PAGE_SIZE) -> pd.DataFrame:
+    """
+    Nuskaito visus CRIB irasus is Supabase market_news per kelis puslapius.
+    Naudojama, nes standartinis Supabase/PostgREST atsakymas daznai grazina tik 1000 eiluciu.
+    """
+    if _http_client is None or _supabase_headers is None or _supabase_rest_url is None:
+        raise RuntimeError("supabase_cache neturi _http_client / _supabase_headers / _supabase_rest_url helperiu")
+
+    url = _supabase_rest_url("market_news")
+    all_rows = []
+    offset = 0
+
+    select_cols = "published_at,company,category,title,url,content,source"
+
+    with _http_client() as client:
+        while True:
+            params = [
+                ("select", select_cols),
+                ("source", "eq.crib"),
+                ("published_at", f"gte.{_date_start_iso(start_date)}"),
+                ("published_at", f"lte.{_date_end_iso(end_date)}"),
+                ("order", "published_at.asc"),
+                ("limit", str(page_size)),
+                ("offset", str(offset)),
+            ]
+            headers = dict(_supabase_headers())
+            headers["Range"] = f"{offset}-{offset + page_size - 1}"
+            headers["Prefer"] = "count=exact"
+            resp = client.get(url, headers=headers, params=params)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Supabase market_news nuskaitymo klaida {resp.status_code}: {resp.text[:800]}")
+            rows = resp.json() or []
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+    return pd.DataFrame(all_rows)
+
 # ============================================================
 # SUPABASE -> ATASKAITOS DATAFRAME
 # ============================================================
 
 
 def load_crib_news_for_report(start_date: date, end_date: date) -> pd.DataFrame:
-    """Ima CRIB naujienas iš Supabase ir suvienodina laukus ataskaitai."""
-    raw = load_news_df("crib", start_date, end_date)
-
+    """Ima VISAS CRIB naujienas is Supabase ir suvienodina laukus ataskaitai."""
     columns = [
         "date", "issuer", "type", "category_src", "title", "url", "summary",
         "content", "orig_order", "date_parsed",
     ]
+
+    # Pirmiausia bandome tiesiogini puslapiuota nuskaityma is market_news.
+    # Jei aplinkoje nera Supabase REST helperiu, krentame i sena load_news_df varianta.
+    pagination_error = None
+    try:
+        raw = _load_crib_news_df_paginated(start_date, end_date, page_size=PAGE_SIZE)
+    except Exception as exc:
+        pagination_error = str(exc)
+        raw = load_news_df("crib", start_date, end_date)
 
     if raw is None or raw.empty:
         return pd.DataFrame(columns=columns)
@@ -418,9 +432,13 @@ def load_crib_news_for_report(start_date: date, end_date: date) -> pd.DataFrame:
         out[c] = out[c].fillna("").astype(str).map(norm_text)
 
     out["issuer"] = out["issuer"].replace("", "Unknown")
+    out = _canonicalize_issuers(out)
     out["date_parsed"] = parse_dates_safe(out["date"])
     out = out.sort_values("date_parsed", ascending=True, na_position="last").reset_index(drop=True)
     out["orig_order"] = out.index
+
+    if pagination_error:
+        out["_pagination_warning"] = pagination_error
 
     return out[columns]
 
@@ -859,7 +877,7 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
     parts.append("<header>")
     parts.append("<div style='display:flex;flex-direction:column'>")
     parts.append(f"<h1>{html_lib.escape(title)}</h1>")
-    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>")
+    parts.append(f"<div class='meta'>Generuota: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Versija: {REPORT_VERSION}</div>")
     parts.append("</div>")
     parts.append("<div class='controls'>")
     parts.append("<button id='global_toggle' class='btn' onclick='toggleAll()'>Rodyti visus</button>")
@@ -900,7 +918,6 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
         "<div><strong>Santrauka</strong></div>"
         f"<div>Visų įrašų skaičius: <strong>{len(report_df)}</strong></div>"
         f"<div>Emitentų skaičius: <strong>{report_df['issuer'].nunique()}</strong></div>"
-        f"<div>Versija: <strong>{EMITENTU_ATRANKA_VERSION}</strong></div>"
         f"<div>Temų pasiskirstymas pagal aptikimus: {cat_summary_str}</div>"
         "<div class='small' style='margin-top:8px'>"
         "Pastaba: kiekvienas pranešimas prie emitento rodomas tik vieną kartą. "
@@ -1045,8 +1062,8 @@ def render_emitentu_atranka_page(default_days: int = 30):
     st.subheader("🧾 Emitentų atranka pagal CRIB naujienas")
     st.caption(
         "Duomenys imami iš Supabase market_news lentelės, source='crib'. "
-        "Ataskaita generuojama pagal emitentus, be kategorijų blokų, su aptiktomis temomis ir raktažodžiais. "
-        "Versija: emitentu_suvienodinimas_2026-07-15c."
+        "Nauja versija nuskaito visus įrašus per puslapius, todėl nebeturi 1000 eilučių ribos. "
+        f"Versija: {REPORT_VERSION}."
     )
 
     today = date.today()
@@ -1069,7 +1086,8 @@ def render_emitentu_atranka_page(default_days: int = 30):
     with st.spinner("Kraunamos CRIB naujienos iš duomenų bazės ir generuojama HTML ataskaita..."):
         result = generate_emitentu_ataskaita(start, end)
 
-    st.success(f"Rasta įrašų: {len(result['df'])}")
+    st.success(f"Rasta įrašų po dublikatų ir emitentų suvienodinimo: {len(result['df'])}")
+    st.caption("Jeigu laikotarpyje yra daugiau nei 1000 CRIB įrašų, ši versija juos nuskaito per kelis Supabase puslapius.")
 
     if not result["summary"].empty:
         st.markdown("**Temų aptikimo santrauka**")
