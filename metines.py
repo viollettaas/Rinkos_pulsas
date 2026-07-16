@@ -9,9 +9,10 @@ Metinių ataskaitų modulis Rinkos pulsui.
 - iš PDF / ZIP / XHTML / XML / XBRL ištraukti tekstą ir pagrindinius finansinius rodiklius;
 - įrašyti dokumentų informaciją į annual_reports ir annual_report_files;
 - įrašyti rodiklius į normalizuotą annual_report_metrics lentelę:
-      metric_name  = Turtas / Nuosavas kapitalas / Grynasis pelnas / Pajamos
+      metric_name  = Turtas / Nuosavas kapitalas / Grynasis pelnas / Pajamos / Darbuotojų skaičius
       metric_group = Grupė / Bendrovė / Neatskirta
-      metric_value = skaitinė reikšmė, tūkst. EUR
+      metric_value = skaitinė reikšmė
+      metric_unit  = tūkst. EUR arba vnt.
 - parodyti rezultatų lentelę Streamlit puslapyje.
 
 Svarbu: Storage nebūtinas. CRIB priedai yra vieši, todėl DB saugomas file_url,
@@ -51,7 +52,7 @@ except Exception:
 # KONFIGŪRACIJA
 # ============================================================
 
-MODULE_VERSION = "metines_zip_esef_units_2026-07-16b"
+MODULE_VERSION = "metines_zip_pdf_html_units_employees_2026-07-16c"
 
 TABLE_REPORTS = "annual_reports"
 TABLE_FILES = "annual_report_files"
@@ -63,6 +64,14 @@ ANNUAL_CATEGORY_TOKENS = (
     "metinė informacija",
     "metine informacija",
     "annual information",
+    "annual financial report",
+    "metinė finansinė ataskaita",
+    "metine finansine ataskaita",
+    "metinių finansinių ataskaitų",
+    "metiniu finansiniu ataskaitu",
+    "financial statements",
+    "audituota metinė",
+    "audituota metine",
 )
 
 # Tikros metinės ataskaitos. Filtras tyčia nėra per siauras, nes dalis emitentų
@@ -104,8 +113,18 @@ ALLOWED_ATTACHMENT_EXTENSIONS = (
     ".pdf", ".zip", ".xhtml", ".html", ".htm", ".xml", ".xbrl",
 )
 
-METRIC_ORDER = ["Turtas", "Nuosavas kapitalas", "Grynasis pelnas", "Pajamos"]
+METRIC_ORDER = ["Turtas", "Nuosavas kapitalas", "Grynasis pelnas", "Pajamos", "Darbuotojų skaičius"]
 GROUP_ORDER = ["Grupė", "Bendrovė", "Neatskirta"]
+
+METRIC_UNITS = {
+    "Turtas": "tūkst. EUR",
+    "Nuosavas kapitalas": "tūkst. EUR",
+    "Grynasis pelnas": "tūkst. EUR",
+    "Pajamos": "tūkst. EUR",
+    "Darbuotojų skaičius": "vnt.",
+}
+
+FINANCIAL_METRICS = {"Turtas", "Nuosavas kapitalas", "Grynasis pelnas", "Pajamos"}
 
 
 # ============================================================
@@ -471,8 +490,10 @@ def _load_crib_news_df(start_date: date, end_date: date) -> pd.DataFrame:
 def _is_annual_information_row(row: pd.Series) -> bool:
     text = " ".join([
         str(row.get("category", "") or ""),
+        str(row.get("category_src", "") or ""),
+        str(row.get("type", "") or ""),
         str(row.get("title", "") or ""),
-        str(row.get("content", "") or "")[:1000],
+        str(row.get("content", "") or "")[:2000],
     ]).lower()
     return any(t in text for t in ANNUAL_CATEGORY_TOKENS)
 
@@ -513,10 +534,13 @@ def load_annual_crib_news(start_date: date, end_date: date, allowed: pd.DataFram
         return pd.DataFrame()
 
     df = raw.copy()
-    for col in ["company", "category", "title", "published_at", "url", "content"]:
+    for col in ["company", "category", "category_src", "type", "title", "published_at", "url", "content"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).map(_collapse_ws)
+
+    df["category"] = df["category"].where(df["category"].ne(""), df["category_src"])
+    df["category"] = df["category"].where(df["category"].ne(""), df["type"])
 
     df = df[df.apply(_is_annual_information_row, axis=1)].copy()
     if df.empty:
@@ -587,33 +611,55 @@ def _extract_attachment_items_from_html(html: str, base_url: str) -> List[Dict[s
     soup = BeautifulSoup(html or "", "html.parser")
     items: List[Dict[str, str]] = []
 
-    for a in soup.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
-        text = _collapse_ws(a.get_text(" ", strip=True))
-        href_l = href.lower()
-        text_l = text.lower()
+    def add(raw_url: str, name: str = ""):
+        if not raw_url:
+            return
+        u = str(raw_url).strip().replace("\\/", "/").replace("&amp;", "&")
+        if not u or u.startswith("javascript:") or u.startswith("mailto:"):
+            return
+        u_l = u.lower()
+        text_l = str(name or "").lower()
         if (
-            any(ext in href_l for ext in ALLOWED_ATTACHMENT_EXTENSIONS)
-            or "viewattachment.action" in href_l
-            or "download" in href_l
-            or "attachment" in href_l
+            any(ext in u_l for ext in ALLOWED_ATTACHMENT_EXTENSIONS)
+            or "viewattachment.action" in u_l
+            or "messageattachmentid" in u_l
+            or "download" in u_l
+            or "attachment" in u_l
             or any(ext.replace(".", "") in text_l for ext in ALLOWED_ATTACHMENT_EXTENSIONS)
             or "xbrl" in text_l
             or "esef" in text_l
+            or "ataskait" in text_l
+            or "financial" in text_l
         ):
-            items.append({"url": urljoin(base_url, href), "name": text or _file_name_from_url(href)})
+            items.append({"url": urljoin(base_url, u), "name": _collapse_ws(name) or _file_name_from_url(u)})
 
-    # Kartais market_news content turi plain text tipo „Priedai: file.pdf /cns-web/oam/viewAttachment...“.
-    # Ištraukiame tokius linkus iš teksto.
-    text = BeautifulSoup(html or "", "html.parser").get_text(" ", strip=True)
-    for m in re.finditer(r"((?:/cns-web/oam/viewAttachment\.action\?messageAttachmentId=\d+)|(?:https?://[^\s'\"]+))", text):
-        raw = m.group(1)
-        if "viewAttachment" in raw or any(ext in raw.lower() for ext in ALLOWED_ATTACHMENT_EXTENSIONS):
-            items.append({"url": urljoin(base_url, raw), "name": _file_name_from_url(raw)})
+    # Visi <a href> ir papildomi data-* atributai.
+    for a in soup.find_all(True):
+        visible = _collapse_ws(a.get_text(" ", strip=True))
+        for attr, val in list(a.attrs.items()):
+            if isinstance(val, list):
+                val = " ".join(str(x) for x in val)
+            if not isinstance(val, str):
+                continue
+            if any(token in attr.lower() for token in ["href", "url", "download", "file", "attachment", "data"]):
+                # iš atributo ištraukiame ir visą reikšmę, ir URL fragmentus jos viduje
+                add(val, visible)
+                for m in re.finditer(r"((?:/cns-web/oam/viewAttachment\.action\?[^\s'\"<>]+)|(?:https?://[^\s'\"<>]+))", val):
+                    add(m.group(1), visible)
+
+    # Kartais market_news content turi plain text / JSON tipo nuorodas.
+    full_text = str(html or "")
+    full_text = full_text.replace("\\/", "/").replace("&amp;", "&")
+    patterns = [
+        r"((?:/cns-web/oam/viewAttachment\.action\?[^\s'\"<>]+))",
+        r"((?:https?://[^\s'\"<>]+(?:\.pdf|\.zip|\.xhtml|\.html|\.htm|\.xml|\.xbrl)[^\s'\"<>]*))",
+        r"((?:https?://[^\s'\"<>]*(?:viewAttachment|download|attachment)[^\s'\"<>]*))",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, full_text, flags=re.I):
+            add(m.group(1), _file_name_from_url(m.group(1)))
 
     return _rank_attachment_items(items)
-
-
 def get_crib_attachment_items(crib_url: str, content_hint: str = "") -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     headers = {
@@ -679,12 +725,13 @@ def download_attachment(url: str, name: str = "") -> Tuple[bytes, str, str]:
 
 METRIC_LABELS = {
     "Turtas": [
-        "turtas iš viso", "turtas is viso", "viso turto", "visas turtas", "iš viso turto", "is viso turto", "total assets", "assets total",
+        "turtas iš viso", "turtas is viso", "viso turto", "visas turtas", "iš viso turto", "is viso turto",
+        "total assets", "assets total", "assets, total",
     ],
     "Nuosavas kapitalas": [
         "nuosavas kapitalas iš viso", "nuosavas kapitalas is viso", "iš viso nuosavo kapitalo", "viso nuosavo kapitalo",
-        "nuosavas kapitalas", "equity", "total equity",
-        "equity total", "total shareholders equity", "shareholders equity", "equity attributable",
+        "nuosavas kapitalas", "equity", "total equity", "equity total", "total shareholders equity",
+        "shareholders equity", "equity attributable",
     ],
     "Grynasis pelnas": [
         "grynasis pelnas", "grynasis nuostolis", "grynasis pelnas (nuostoliai)", "grynasis pelnas nuostoliai",
@@ -692,15 +739,21 @@ METRIC_LABELS = {
         "profit loss", "profit (loss)", "net profit", "net loss", "profit for the year", "loss for the year",
     ],
     "Pajamos": [
-        "pardavimo pajamos", "pagrindinės veiklos pajamos", "pagrindines veiklos pajamos", "pajamos",
-        "revenue", "sales revenue", "net sales", "sales",
+        "pardavimo pajamos", "pagrindinės veiklos pajamos", "pagrindines veiklos pajamos", "pajamos iš sutarčių", "pajamos is sutarciu",
+        "pajamos", "revenue", "sales revenue", "net sales", "sales",
+    ],
+    "Darbuotojų skaičius": [
+        "vidutinis darbuotojų skaičius", "vidutinis darbuotoju skaicius", "darbuotojų skaičius", "darbuotoju skaicius",
+        "vidutinis sąrašinis darbuotojų skaičius", "vidutinis sarasinis darbuotoju skaicius",
+        "average number of employees", "number of employees", "employees average", "employees",
     ],
 }
 
 NEGATIVE_LABEL_GUARDS = {
     "Pajamos": ["finansinės pajamos", "finansines pajamos", "kitos pajamos", "palūkanų pajamos", "palukanu pajamos", "other income", "finance income"],
     "Turtas": ["ilgalaikis turtas", "trumpalaikis turtas", "finansinis turtas", "investicinis turtas", "non current assets", "current assets"],
-    "Nuosavas kapitalas": ["nuosavas kapitalas ir įsipareigojimai", "nuosavas kapitalas ir isipareigojimai", "equity and liabilities", "total equity and liabilities"],
+    "Nuosavas kapitalas": ["nuosavas kapitalas ir įsipareigojimai", "nuosavas kapitalas ir isipareigojimai", "nuosavo kapitalo ir įsipareigojimų", "nuosavo kapitalo ir isipareigojimu", "equity and liabilities", "total equity and liabilities"],
+    "Darbuotojų skaičius": ["akcijų", "akciju", "shares", "shareholders", "balsų", "balsu"],
 }
 
 CONCEPTS = {
@@ -720,7 +773,18 @@ CONCEPTS = {
         "revenuefromcontractswithcustomers", "revenuefromcontractswithcustomersexcludingassessedtax",
         "ifrsfullrevenuefromcontractswithcustomers", "ifrsfullrevenuefromcontractswithcustomersexcludingassessedtax",
     },
+    "Darbuotojų skaičius": {
+        "averagenumberofemployeesduringtheperiod", "averagenumberofemployees", "numberofemployees",
+        "employees", "employee", "fulltimeequivalentemployees", "fteemployees",
+    },
 }
+
+FINANCIAL_TABLE_HINTS = [
+    "finansinės būklės ataskaita", "finansines bukles ataskaita", "balansas", "statement of financial position",
+    "pelno nuostolių ataskaita", "pelno nuostoliu ataskaita", "bendrųjų pajamų ataskaita", "bendruju pajamu ataskaita",
+    "statement of profit or loss", "income statement", "comprehensive income",
+    "finansinių ataskaitų", "finansiniu ataskaitu", "financial statements", "pagrindiniai finansiniai rodikliai",
+]
 
 
 def _label_matches(metric_name: str, row_norm: str) -> bool:
@@ -766,27 +830,87 @@ def _extract_pdf_text_and_tables(content: bytes) -> Tuple[str, List[List[List[An
     return "\n".join(text_parts).strip(), tables
 
 
-def _numbers_from_cells(cells: Iterable[Any]) -> List[float]:
+def _cell_is_year_or_date(text: str) -> bool:
+    t = _collapse_ws(text)
+    n = _norm(t)
+    if re.fullmatch(r"20\d{2}", n):
+        return True
+    if re.search(r"\b20\d{2}\b", n) and any(x in n for x in ["gruodzio", "december", "sausio", "january", "m", "date"]):
+        return True
+    return False
+
+
+def _cell_has_letters(text: str) -> bool:
+    return bool(re.search(r"[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž]", str(text or "")))
+
+
+def _row_label_text(row: Iterable[Any]) -> str:
+    """Imame tik pirmus tekstinius langelius iki finansinių skaičių.
+
+    Tai apsaugo nuo klaidingų atvejų, kai metrika randama antraštėje ar pastaboje,
+    o eilutės gale esantys skaičiai iš tikro yra datos, procentai ar balsavimo punktai.
+    """
+    labels: List[str] = []
+    for cell in row or []:
+        txt = _collapse_ws(cell)
+        if not txt:
+            continue
+        has_letters = _cell_has_letters(txt)
+        num = _parse_number(txt)
+        # Kai jau prasideda gryni skaitiniai stulpeliai, label baigėsi.
+        if num is not None and not has_letters:
+            break
+        labels.append(txt)
+        if len(labels) >= 3:
+            break
+    return _collapse_ws(" ".join(labels))
+
+
+def _numbers_from_cells(cells: Iterable[Any], metric_name: Optional[str] = None) -> List[float]:
     nums: List[float] = []
     for cell in cells:
         s = _collapse_ws(cell)
         if not s:
             continue
-        # Dažnas note stulpelis: vienaženklis / dviženklis pastabos numeris.
-        # Jo neišmetame čia, o pašaliname vėliau pagal poziciją.
+        if _cell_is_year_or_date(s):
+            continue
+        if metric_name in FINANCIAL_METRICS and "%" in s:
+            continue
         parts = re.findall(r"\(?[-+]?\d[\d\s.,]*\)?", s)
         if not parts:
             continue
-        # Jei langelyje yra ilgas tekstas su daug skaičių, dažnai tai ne finansinė reikšmė.
-        # Lentelių eilutėse paprastai vienas langelis = viena reikšmė.
+        # Jei ilgame tekstiniame langelyje daug skaičių, tai dažniausiai ne finansinė reikšmė.
         if len(parts) > 2 and len(s) > 40:
             continue
         for p in parts[:2]:
             v = _parse_number(p)
-            if v is not None:
-                nums.append(v)
+            if v is None:
+                continue
+            # Metus / datų likučius atmetame.
+            if metric_name in FINANCIAL_METRICS and 1900 <= abs(v) <= 2035 and len(parts) == 1:
+                continue
+            nums.append(v)
     return nums
 
+
+def _numbers_after_label(row: Iterable[Any], metric_name: str) -> List[float]:
+    cells = list(row or [])
+    started_numeric = False
+    numeric_cells: List[Any] = []
+    for cell in cells:
+        txt = _collapse_ws(cell)
+        if not txt:
+            continue
+        has_letters = _cell_has_letters(txt)
+        num = _parse_number(txt)
+        if not started_numeric:
+            # praleidžiame label/pastabų tekstą; note numerį paliekame, nes _clean_statement_numbers jį pašalins.
+            if num is not None and not has_letters:
+                started_numeric = True
+                numeric_cells.append(txt)
+            continue
+        numeric_cells.append(txt)
+    return _numbers_from_cells(numeric_cells, metric_name=metric_name)
 
 def _clean_statement_numbers(nums: List[float]) -> List[float]:
     if not nums:
@@ -802,34 +926,42 @@ def _clean_statement_numbers(nums: List[float]) -> List[float]:
 
 
 def _infer_unit_kind(text: str) -> Tuple[str, str]:
-    """Nustato, kokiais vienetais pateikiami skaičiai.
+    """Nustato originalų skaičių vienetą.
 
-    Grąžina (unit_kind, note):
-    - thousands_eur: reikšmės jau yra tūkst. EUR;
-    - eur: reikšmės yra EUR ir jas reikia dalinti iš 1000;
-    - unknown: sprendžiama pagal reikšmės dydį.
+    Grąžina:
+    - millions_eur: skaičiai pateikti mln. EUR, į DB dauginame iš 1000;
+    - thousands_eur: skaičiai jau pateikti tūkst. EUR;
+    - eur: skaičiai pateikti EUR, į DB daliname iš 1000;
+    - unknown: vienetas nerastas, taikoma dydžio taisyklė.
     """
     n = _norm(text)
+    raw = str(text or "").lower()
     if not n:
         return "unknown", "vienetai nenustatyti"
 
-    thousand_patterns = [
-        r"tukst\s*eur", r"tukstanciais\s*eur", r"tukstanciu\s*eur",
-        r"thousand\s*eur", r"eur\s*000", r"000\s*eur", r"thousands\s*of\s*eur",
-        r"keur", r"k\s*eur",
+    million_patterns = [
+        r"mln\s*eur", r"mln\.\s*eur", r"milijonais\s*eur", r"milijonų\s*eur", r"milijonu\s*eur",
+        r"million\s*eur", r"millions\s*of\s*eur", r"eur\s*million", r"eur\s*millions",
+        r"eur\s*mln", r"m\s*eur\b", r"\beur\s*m\b",
     ]
-    if any(re.search(p, n) for p in thousand_patterns):
+    if any(re.search(p, raw) or re.search(p, n) for p in million_patterns):
+        return "millions_eur", "originalūs skaičiai pateikti mln. EUR; DB saugoma tūkst. EUR"
+
+    thousand_patterns = [
+        r"tūkst\s*eur", r"tukst\s*eur", r"tūkstančiais\s*eur", r"tukstanciais\s*eur", r"tūkstančių\s*eur", r"tukstanciu\s*eur",
+        r"thousand\s*eur", r"thousands\s*eur", r"thousands\s*of\s*eur", r"eur\s*000", r"000\s*eur", r"keur", r"k\s*eur",
+    ]
+    if any(re.search(p, raw) or re.search(p, n) for p in thousand_patterns):
         return "thousands_eur", "originalūs skaičiai pateikti tūkst. EUR"
 
     eur_patterns = [
-        r"eurais", r"euru", r"eur ", r" euro", r" euros", r"currency eur", r"unit eur",
-        r"expressed in euros", r"presented in euros",
+        r"eurais", r"euru", r"\beur\b", r"\beuro\b", r"\beuros\b", r"currency\s*eur",
+        r"expressed\s*in\s*euros", r"presented\s*in\s*euros", r"amounts\s*are\s*in\s*eur",
     ]
-    if any(re.search(p, n + " ") for p in eur_patterns):
+    if any(re.search(p, raw) or re.search(p, n) for p in eur_patterns):
         return "eur", "originalūs skaičiai pateikti EUR; DB saugoma tūkst. EUR"
 
     return "unknown", "vienetai nenustatyti; taikoma reikšmės dydžio taisyklė"
-
 
 def _value_to_teu(value: Optional[float], unit_kind: str = "unknown") -> Optional[float]:
     if value is None:
@@ -838,16 +970,16 @@ def _value_to_teu(value: Optional[float], unit_kind: str = "unknown") -> Optiona
         v = float(value)
     except Exception:
         return None
+    if unit_kind == "millions_eur":
+        return v * 1000.0
     if unit_kind == "eur":
         return v / 1000.0
     if unit_kind == "thousands_eur":
         return v
-    # Kai vienetas neaiškus, Lietuvos listinguotų bendrovių metinių ataskaitų
-    # EUR reikšmės dažnai yra milijoninės. Tokias konvertuojame į tūkst. EUR.
+    # Nežinant vieneto: jeigu suma akivaizdžiai EUR, konvertuojame į tūkst. EUR.
     if abs(v) >= 1_000_000:
         return v / 1000.0
     return v
-
 
 def _scope_from_text(text: str) -> str:
     n = _norm(text)
@@ -868,12 +1000,20 @@ def _table_scope(table: List[List[Any]], row_idx: int) -> str:
     return _scope_from_text(header_text)
 
 
-def _assign_group_company(nums: List[float], scope: str = "unknown", unit_kind: str = "unknown") -> Dict[str, Optional[float]]:
+def _assign_group_company(nums: List[float], scope: str = "unknown", unit_kind: str = "unknown", metric_name: str = "") -> Dict[str, Optional[float]]:
     nums = _clean_statement_numbers(nums)
     if not nums:
         return {"Grupė": None, "Bendrovė": None, "Neatskirta": None}
 
     def conv(x):
+        if metric_name == "Darbuotojų skaičius":
+            try:
+                v = float(x)
+            except Exception:
+                return None
+            if abs(v) > 1_000_000:
+                return None
+            return round(v, 0)
         return _value_to_teu(x, unit_kind)
 
     if scope == "group_company":
@@ -889,23 +1029,60 @@ def _assign_group_company(nums: List[float], scope: str = "unknown", unit_kind: 
     if scope == "company_only":
         return {"Grupė": None, "Bendrovė": conv(nums[0]), "Neatskirta": None}
 
-    # Jeigu scope nežinomas, nesupainiojame ankstesnių metų su bendrovės reikšme.
-    # 4 reikšmės dažnai vis tiek reiškia Grupė/Bendrovė per 2 metus, todėl galime atskirti.
     if len(nums) >= 4:
         return {"Grupė": conv(nums[0]), "Bendrovė": conv(nums[2]), "Neatskirta": None}
     return {"Grupė": None, "Bendrovė": None, "Neatskirta": conv(nums[0])}
 
+def _table_is_relevant_for_metrics(table: List[List[Any]], table_text: str) -> bool:
+    n = _norm(table_text)
+    if not n:
+        return False
+    if any(bad in n for bad in ["darbotvarke", "balsavimo", "susirinkimo sprend", "agenda", "voting", "remuneration report"]):
+        return False
+    labels_found = 0
+    for metric in METRIC_ORDER:
+        if any(_norm(label) in n for label in METRIC_LABELS.get(metric, [])):
+            labels_found += 1
+    if labels_found >= 2:
+        return True
+    if labels_found >= 1 and any(_norm(h) in n for h in FINANCIAL_TABLE_HINTS):
+        return True
+    return False
 
-def _extract_metrics_from_tables(tables: List[List[List[Any]]], document_text: str = "") -> Dict[Tuple[str, str], Dict[str, Any]]:
+
+def _is_plausible_metric_value(metric_name: str, group: str, value: Optional[float]) -> bool:
+    if value is None:
+        return False
+    try:
+        v = float(value)
+    except Exception:
+        return False
+    if metric_name == "Darbuotojų skaičius":
+        return 0 <= v <= 200000
+    if metric_name in {"Turtas", "Nuosavas kapitalas", "Pajamos"}:
+        # Listinguotų emitentų pagrindiniai balansiniai / pajamų rodikliai beveik niekada nėra keli eurai
+        # ar kelios dešimtys tūkst. EUR. Tokius XBRL/tekstinius artefaktus geriau palikti tuščius, nei įrašyti klaidingai.
+        return abs(v) >= 100
+    return abs(v) >= 0
+
+
+def _extract_metrics_from_tables(
+    tables: List[List[List[Any]]],
+    document_text: str = "",
+    source_type: str = "pdf_table",
+    confidence_base: int = 92,
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
     found: Dict[Tuple[str, str], Dict[str, Any]] = {}
     doc_unit_kind, doc_unit_note = _infer_unit_kind(document_text)
 
     for table_idx, table in enumerate(tables or []):
         table_text = " ".join(
             " ".join(_collapse_ws(c) for c in row if _collapse_ws(c))
-            for row in (table or [])[:12]
+            for row in (table or [])[:20]
         )
-        table_unit_kind, table_unit_note = _infer_unit_kind(table_text + " " + document_text[:3000])
+        if not _table_is_relevant_for_metrics(table, table_text):
+            continue
+        table_unit_kind, table_unit_note = _infer_unit_kind(table_text + " " + document_text[:5000])
         unit_kind = table_unit_kind if table_unit_kind != "unknown" else doc_unit_kind
         unit_note = table_unit_note if table_unit_kind != "unknown" else doc_unit_note
 
@@ -913,8 +1090,9 @@ def _extract_metrics_from_tables(tables: List[List[List[Any]]], document_text: s
             if not row:
                 continue
             row_text = " ".join(_collapse_ws(c) for c in row if _collapse_ws(c))
-            row_norm = _norm(row_text)
-            if not row_norm:
+            label_text = _row_label_text(row)
+            label_norm = _norm(label_text)
+            if not label_norm:
                 continue
 
             scope = _table_scope(table, row_idx)
@@ -922,28 +1100,33 @@ def _extract_metrics_from_tables(tables: List[List[List[Any]]], document_text: s
                 scope = _scope_from_text(table_text)
 
             for metric_name in METRIC_ORDER:
-                if not _label_matches(metric_name, row_norm):
+                if not _label_matches(metric_name, label_norm):
                     continue
-                nums = _numbers_from_cells(row)
-                assigned = _assign_group_company(nums, scope=scope, unit_kind=unit_kind)
+                nums = _numbers_after_label(row, metric_name=metric_name)
+                assigned = _assign_group_company(nums, scope=scope, unit_kind=unit_kind, metric_name=metric_name)
+                effective_unit_note = "darbuotojų skaičius saugomas vnt." if metric_name == "Darbuotojų skaičius" else unit_note
                 for group, value in assigned.items():
-                    if value is None:
+                    if value is None or not _is_plausible_metric_value(metric_name, group, value):
                         continue
                     key = (metric_name, group)
-                    if key not in found:
+                    confidence = confidence_base
+                    if group in {"Grupė", "Bendrovė"} and scope != "unknown":
+                        confidence += 4
+                    if metric_name == "Darbuotojų skaičius":
+                        confidence -= 8
+                    if key not in found or confidence > found[key].get("confidence", 0):
                         found[key] = {
                             "value": value,
-                            "source": "pdf_table",
-                            "note": f"PDF lentelė {table_idx + 1}, eilutė {row_idx + 1}: {row_text[:220]}; {unit_note}; scope={scope}",
-                            "confidence": 95 if group in {"Grupė", "Bendrovė"} and scope != "unknown" else 72,
-                            "unit_note": unit_note,
+                            "source": source_type,
+                            "note": f"{source_type} lentelė {table_idx + 1}, eilutė {row_idx + 1}: {row_text[:220]}; {effective_unit_note}; scope={scope}",
+                            "confidence": confidence,
+                            "unit_note": effective_unit_note,
                         }
     return found
 
-
 def _extract_metrics_from_text_lines(text: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
     found: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    unit_kind, unit_note = _infer_unit_kind(text[:8000])
+    unit_kind, unit_note = _infer_unit_kind(text[:12000])
     lines = [line for line in (text or "").splitlines() if _collapse_ws(line)]
 
     for line_idx, line in enumerate(lines):
@@ -951,26 +1134,29 @@ def _extract_metrics_from_text_lines(text: str) -> Dict[Tuple[str, str], Dict[st
         line_norm = _norm(line_clean)
         if not line_norm:
             continue
-        scope = _scope_from_text(" ".join(lines[max(0, line_idx - 5):line_idx + 1]))
+        context = " ".join(lines[max(0, line_idx - 8):line_idx + 1])
+        if not any(_norm(h) in _norm(context) for h in FINANCIAL_TABLE_HINTS) and "darbuoto" not in line_norm and "employee" not in line_norm:
+            continue
+        scope = _scope_from_text(context)
         for metric_name in METRIC_ORDER:
             if not _label_matches(metric_name, line_norm):
                 continue
-            nums = _numbers_from_cells([line_clean])
-            assigned = _assign_group_company(nums, scope=scope, unit_kind=unit_kind)
+            nums = _numbers_from_cells([line_clean], metric_name=metric_name)
+            assigned = _assign_group_company(nums, scope=scope, unit_kind=unit_kind, metric_name=metric_name)
+            effective_unit_note = "darbuotojų skaičius saugomas vnt." if metric_name == "Darbuotojų skaičius" else unit_note
             for group, value in assigned.items():
-                if value is None:
+                if value is None or not _is_plausible_metric_value(metric_name, group, value):
                     continue
                 key = (metric_name, group)
                 if key not in found:
                     found[key] = {
                         "value": value,
                         "source": "text_line",
-                        "note": f"Teksto eilutė {line_idx + 1}: {line_clean[:220]}; {unit_note}; scope={scope}",
-                        "confidence": 65 if scope != "unknown" else 50,
-                        "unit_note": unit_note,
+                        "note": f"Teksto eilutė {line_idx + 1}: {line_clean[:220]}; {effective_unit_note}; scope={scope}",
+                        "confidence": 55 if scope != "unknown" else 40,
+                        "unit_note": effective_unit_note,
                     }
     return found
-
 
 def _concept_key(value: Any) -> str:
     s = str(value or "")
@@ -1001,27 +1187,66 @@ def _parse_ixbrl_number(tag) -> Optional[float]:
     return val
 
 
-def _xbrl_value_to_teu(value: float) -> float:
-    # XBRL faktai dažniausiai yra EUR vienetais. Saugome tūkst. EUR.
-    # Jei reikšmė akivaizdžiai didelė, konvertuojame į tūkst. EUR.
+def _xbrl_value_to_storage(metric_name: str, value: float) -> Optional[float]:
     if value is None:
-        return value
-    if abs(value) >= 1_000_000:
-        return value / 1000.0
-    return value
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if metric_name == "Darbuotojų skaičius":
+        if 0 <= abs(v) <= 200000:
+            return round(v, 0)
+        return None
+    # XBRL faktai dažniausiai yra EUR vienetais. DB finansinius rodiklius saugo tūkst. EUR.
+    if abs(v) >= 1_000_000:
+        return v / 1000.0
+    # Jei iXBRL scale/formatas grąžina labai mažą reikšmę, dažniausiai tai nėra naudotinas finansinis faktas.
+    if metric_name in {"Turtas", "Nuosavas kapitalas", "Pajamos"} and abs(v) < 50:
+        return None
+    return v
+
+
+# Suderinamumo aliasas senam vardui, jei kur nors liktų naudojimas.
+def _xbrl_value_to_teu(value: float) -> float:
+    return _xbrl_value_to_storage("Pajamos", value)
+
+def _html_tables_from_soup(soup: BeautifulSoup) -> List[List[List[Any]]]:
+    tables: List[List[List[Any]]] = []
+    for table in soup.find_all("table"):
+        rows: List[List[Any]] = []
+        for tr in table.find_all("tr"):
+            cells = []
+            for cell in tr.find_all(["th", "td"]):
+                txt = _collapse_ws(cell.get_text(" ", strip=True))
+                cells.append(txt)
+            if any(_collapse_ws(c) for c in cells):
+                rows.append(cells)
+        if rows:
+            tables.append(rows)
+    return tables
 
 
 def _extract_metrics_from_xbrl(content: bytes) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], str]:
     found: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    raw_text = ""
     text = content.decode("utf-8", errors="ignore")
-    raw_text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)[:120000]
-
-    # Inline XBRL / XHTML: ix:nonFraction su name="ifrs-full:Assets".
     soup = BeautifulSoup(text, "html.parser")
+    raw_text = soup.get_text("\n", strip=True)[:120000]
+
+    # 1) Pirmiausia skaitome žmogui matomas XHTML/HTML lenteles. Tai patikimiau nei aklai imti visus XBRL faktus,
+    # nes lentelėse aiškiau matyti Grupė/Bendrovė, einamieji metai ir vienetai (tūkst. EUR / mln. EUR / EUR).
+    html_tables = _html_tables_from_soup(soup)
+    table_metrics = _extract_metrics_from_tables(
+        html_tables,
+        document_text=raw_text,
+        source_type="html_table",
+        confidence_base=98,
+    )
+    found.update(table_metrics)
+
+    # 2) Papildomai skaitome Inline XBRL faktus, bet jų pasitikėjimas mažesnis už matomas lenteles.
     fact_tags = []
     for tag in soup.find_all(True):
-        name_attr = tag.get("name") or tag.get("contextref") and tag.name
         if tag.get("name"):
             fact_tags.append(tag)
 
@@ -1038,21 +1263,25 @@ def _extract_metrics_from_xbrl(content: bytes) -> Tuple[Dict[Tuple[str, str], Di
             group = "Bendrovė"
 
         for metric_name, concepts in CONCEPTS.items():
-            if concept in concepts:
-                key = (metric_name, group)
-                value_teu = _xbrl_value_to_teu(val)
-                unit_ref = str(tag.get("unitref") or tag.get("unitRef") or "")
-                unit_note = "XBRL reikšmė konvertuota / saugoma tūkst. EUR"
-                if key not in found:
-                    found[key] = {
-                        "value": value_teu,
-                        "source": "xbrl_fact",
-                        "note": f"XBRL concept={concept}, context={ctx}, unitRef={unit_ref}; {unit_note}",
-                        "confidence": 88 if group != "Neatskirta" else 68,
-                        "unit_note": unit_note,
-                    }
+            if concept not in concepts:
+                continue
+            value_storage = _xbrl_value_to_storage(metric_name, val)
+            if value_storage is None or not _is_plausible_metric_value(metric_name, group, value_storage):
+                continue
+            key = (metric_name, group)
+            unit_ref = str(tag.get("unitref") or tag.get("unitRef") or "")
+            unit_note = "XBRL faktas; finansiniai rodikliai DB saugomi tūkst. EUR, darbuotojai vnt."
+            confidence = 78 if group != "Neatskirta" else 60
+            if key not in found or confidence > found[key].get("confidence", 0):
+                found[key] = {
+                    "value": value_storage,
+                    "source": "xbrl_fact",
+                    "note": f"XBRL concept={concept}, context={ctx}, unitRef={unit_ref}; {unit_note}",
+                    "confidence": confidence,
+                    "unit_note": unit_note,
+                }
 
-    # Paprastas XML XBRL: tagas pats yra concept.
+    # 3) Paprastas XML/XBRL. Čia nėra matomų HTML lentelių, todėl naudojame faktus kaip pagrindą.
     try:
         root = ET.fromstring(content)
         for elem in root.iter():
@@ -1067,28 +1296,33 @@ def _extract_metrics_from_xbrl(content: bytes) -> Tuple[Dict[Tuple[str, str], Di
             elif re.search(r"separate|company|bendrov|parent|individual", ctx, re.I):
                 group = "Bendrovė"
             for metric_name, concepts in CONCEPTS.items():
-                if concept in concepts:
-                    key = (metric_name, group)
-                    value_teu = _xbrl_value_to_teu(val)
-                    unit_ref = elem.attrib.get("unitRef") or elem.attrib.get("unitref") or ""
-                    unit_note = "XBRL reikšmė konvertuota / saugoma tūkst. EUR"
-                    if key not in found:
-                        found[key] = {
-                            "value": value_teu,
-                            "source": "xbrl_fact",
-                            "note": f"XBRL concept={concept}, context={ctx}, unitRef={unit_ref}; {unit_note}",
-                            "confidence": 88 if group != "Neatskirta" else 68,
-                            "unit_note": unit_note,
-                        }
+                if concept not in concepts:
+                    continue
+                value_storage = _xbrl_value_to_storage(metric_name, val)
+                if value_storage is None or not _is_plausible_metric_value(metric_name, group, value_storage):
+                    continue
+                key = (metric_name, group)
+                unit_ref = elem.attrib.get("unitRef") or elem.attrib.get("unitref") or ""
+                unit_note = "XML/XBRL faktas; finansiniai rodikliai DB saugomi tūkst. EUR, darbuotojai vnt."
+                confidence = 82 if group != "Neatskirta" else 65
+                if key not in found or confidence > found[key].get("confidence", 0):
+                    found[key] = {
+                        "value": value_storage,
+                        "source": "xbrl_fact",
+                        "note": f"XBRL concept={concept}, context={ctx}, unitRef={unit_ref}; {unit_note}",
+                        "confidence": confidence,
+                        "unit_note": unit_note,
+                    }
     except Exception:
         pass
 
-    # Jei XBRL faktai nerasti, bandome tekstines eilutes.
-    if not found and raw_text:
-        found.update(_extract_metrics_from_text_lines(raw_text))
+    # 4) Teksto fallback tik tada, kai nėra geresnio šaltinio.
+    fallback = _extract_metrics_from_text_lines(raw_text)
+    for key, val in fallback.items():
+        if key not in found:
+            found[key] = val
 
     return found, raw_text
-
 
 def parse_pdf_content(content: bytes) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], str, Dict[str, Any]]:
     text, tables = _extract_pdf_text_and_tables(content)
@@ -1163,7 +1397,12 @@ def ensure_annual_report(news: pd.Series) -> Optional[int]:
     if existing:
         report_id = int(existing[0]["id"])
         patch = {k: v for k, v in row.items() if k != "crib_url"}
-        _rest_patch(TABLE_REPORTS, {"id": f"eq.{report_id}"}, patch, return_representation=False)
+        try:
+            _rest_patch(TABLE_REPORTS, {"id": f"eq.{report_id}"}, patch, return_representation=False)
+        except Exception:
+            # Jei RLS neleidžia UPDATE, bet įrašas jau yra, leidžiame procesui tęstis:
+            # priedų parsisiuntimas ir metrics gali būti įrašomi pagal esamą annual_report_id.
+            pass
         return report_id
 
     inserted = _rest_insert(TABLE_REPORTS, row, return_representation=True)
@@ -1210,7 +1449,11 @@ def ensure_annual_report_file(
         # Jei senas raw_text ilgesnis ir naujas tuščias, nebloginame.
         if old_raw and len(old_raw) > len(row.get("raw_text") or ""):
             patch.pop("raw_text", None)
-        _rest_patch(TABLE_FILES, {"id": f"eq.{file_id}"}, patch, return_representation=False)
+        try:
+            _rest_patch(TABLE_FILES, {"id": f"eq.{file_id}"}, patch, return_representation=False)
+        except Exception:
+            # Existing failas svarbesnis nei nepavykęs PATCH. Tęsiame, kad metrics būtų išsaugomi.
+            pass
         return file_id
 
     inserted = _rest_insert(TABLE_FILES, row, return_representation=True)
@@ -1261,7 +1504,7 @@ def save_metrics_for_report(
             "metric_name": metric_name,
             "metric_group": metric_group,
             "metric_value": value,
-            "metric_unit": "tūkst. EUR",
+            "metric_unit": METRIC_UNITS.get(metric_name, "tūkst. EUR"),
             "source_type": info.get("source"),
             "source_file_url": info.get("file_url"),
             "source_storage_path": None,
@@ -1445,7 +1688,7 @@ def update_annual_reports_metrics(start_date: date, end_date: date, max_reports:
                 stats["raw_text_saved"] += 1 if content_text else 0
                 _merge_metric_sources(metric_sources, metrics, file_id, file_url)
 
-            for attachment in attachments[:12]:
+            for attachment in attachments:
                 attachment_url = attachment.get("url") or ""
                 attachment_name = attachment.get("name") or _file_name_from_url(attachment_url)
                 try:
@@ -1676,6 +1919,9 @@ def _prepare_metrics_display_df(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "Pajamos - Grupė": "Pajamos, tūkst. EUR - Grupė",
         "Pajamos - Bendrovė": "Pajamos, tūkst. EUR - Bendrovė",
         "Pajamos - Neatskirta": "Pajamos, tūkst. EUR - Neatskirta",
+        "Darbuotojų skaičius - Grupė": "Darbuotojų skaičius, vnt. - Grupė",
+        "Darbuotojų skaičius - Bendrovė": "Darbuotojų skaičius, vnt. - Bendrovė",
+        "Darbuotojų skaičius - Neatskirta": "Darbuotojų skaičius, vnt. - Neatskirta",
         "annual_report_id": "Ataskaitos ID",
     })
     return out
@@ -1854,7 +2100,7 @@ def show_metines_page():
     # Skaitinių stulpelių formatavimas.
     format_map = {}
     for col in filtered.columns:
-        if "tūkst. EUR" in col:
+        if "tūkst. EUR" in col or "vnt." in col:
             format_map[col] = "{:,.0f}"
 
     styler = filtered.style
