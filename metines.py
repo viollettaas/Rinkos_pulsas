@@ -52,7 +52,7 @@ except Exception:
 # KONFIGŪRACIJA
 # ============================================================
 
-MODULE_VERSION = "metines_zip_pdf_html_units_employees_2026-07-16c"
+MODULE_VERSION = "metines_zip_pdf_html_units_employees_2026-07-16d"
 
 TABLE_REPORTS = "annual_reports"
 TABLE_FILES = "annual_report_files"
@@ -725,11 +725,12 @@ def download_attachment(url: str, name: str = "") -> Tuple[bytes, str, str]:
 
 METRIC_LABELS = {
     "Turtas": [
-        "turtas iš viso", "turtas is viso", "viso turto", "visas turtas", "iš viso turto", "is viso turto",
+        "turtas iš viso", "turtas is viso", "turto iš viso", "turto is viso", "viso turto", "visas turtas", "iš viso turto", "is viso turto",
         "total assets", "assets total", "assets, total",
     ],
     "Nuosavas kapitalas": [
-        "nuosavas kapitalas iš viso", "nuosavas kapitalas is viso", "iš viso nuosavo kapitalo", "viso nuosavo kapitalo",
+        "nuosavas kapitalas iš viso", "nuosavas kapitalas is viso", "nuosavo kapitalo iš viso", "nuosavo kapitalo is viso",
+        "iš viso nuosavo kapitalo", "viso nuosavo kapitalo",
         "nuosavas kapitalas", "equity", "total equity", "equity total", "total shareholders equity",
         "shareholders equity", "equity attributable",
     ],
@@ -919,9 +920,12 @@ def _clean_statement_numbers(nums: List[float]) -> List[float]:
     # Pašaliname pastabų numerius eilutės pradžioje, kai po jų yra didesnės reikšmės.
     while len(out) >= 3 and abs(out[0]) < 100 and any(abs(x) >= 100 for x in out[1:]):
         out = out[1:]
-    # Jei liko daugiau nei 4, imame pirmus 4 po note numerių pašalinimo.
-    if len(out) > 4:
-        out = out[:4]
+    # Finansinėse ataskaitose dažnas 6 stulpelių formatas:
+    # Grupė einami metai, Grupė ankstesni metai, Grupė laikotarpio pradžia,
+    # Bendrovė einami metai, Bendrovė ankstesni metai, Bendrovė laikotarpio pradžia.
+    # Todėl negalima automatiškai patrumpinti iki 4 reikšmių.
+    if len(out) > 6:
+        out = out[:6]
     return out
 
 
@@ -1017,8 +1021,11 @@ def _assign_group_company(nums: List[float], scope: str = "unknown", unit_kind: 
         return _value_to_teu(x, unit_kind)
 
     if scope == "group_company":
+        if len(nums) >= 6:
+            # 6 stulpelių forma: Grupė CY, Grupė PY, Grupė pradžia, Bendrovė CY, Bendrovė PY, Bendrovė pradžia.
+            return {"Grupė": conv(nums[0]), "Bendrovė": conv(nums[3]), "Neatskirta": None}
         if len(nums) >= 4:
-            # Dažniausia forma: Grupė einami metai, Grupė ankstesni metai, Bendrovė einami metai, Bendrovė ankstesni metai.
+            # 4 stulpelių forma: Grupė CY, Grupė PY, Bendrovė CY, Bendrovė PY.
             return {"Grupė": conv(nums[0]), "Bendrovė": conv(nums[2]), "Neatskirta": None}
         if len(nums) >= 2:
             return {"Grupė": conv(nums[0]), "Bendrovė": conv(nums[1]), "Neatskirta": None}
@@ -1082,7 +1089,7 @@ def _extract_metrics_from_tables(
         )
         if not _table_is_relevant_for_metrics(table, table_text):
             continue
-        table_unit_kind, table_unit_note = _infer_unit_kind(table_text + " " + document_text[:5000])
+        table_unit_kind, table_unit_note = _infer_unit_kind(table_text)
         unit_kind = table_unit_kind if table_unit_kind != "unknown" else doc_unit_kind
         unit_note = table_unit_note if table_unit_kind != "unknown" else doc_unit_note
 
@@ -1227,13 +1234,236 @@ def _html_tables_from_soup(soup: BeautifulSoup) -> List[List[List[Any]]]:
     return tables
 
 
+def _tag_has_class(tag, class_name: str) -> bool:
+    classes = tag.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return class_name in classes
+
+
+def _xhtml_positioned_pages_from_soup(soup: BeautifulSoup) -> List[Tuple[str, List[str]]]:
+    """Iš pdf2htmlEX / ESEF XHTML surenka puslapių tekstinius tokenus.
+
+    Dalis lietuviškų ESEF paketų nėra normalios HTML lentelės. Ataskaitos tekstas
+    pateikiamas kaip absoliučiai pozicionuoti <div class="t"> elementai po
+    <div class="pf" id="pf..."> puslapiais. Tokiu atveju BeautifulSoup table parseris
+    nieko neranda, todėl reikia tokenų parserio.
+    """
+    pages: List[Tuple[str, List[str]]] = []
+    page_nodes = []
+    for div in soup.find_all("div"):
+        div_id = str(div.get("id") or "")
+        if div_id.startswith("pf") and _tag_has_class(div, "pf"):
+            page_nodes.append(div)
+
+    if page_nodes:
+        for idx, page in enumerate(page_nodes, start=1):
+            tokens: List[str] = []
+            for t in page.find_all("div"):
+                if not _tag_has_class(t, "t"):
+                    continue
+                txt = _collapse_ws(t.get_text(" ", strip=True))
+                if txt:
+                    tokens.append(txt)
+            if tokens:
+                pages.append((str(page.get("id") or f"page_{idx}"), tokens))
+        return pages
+
+    # Fallback: kai nėra pf puslapių, bet yra daug div.t tokenų.
+    tokens = []
+    for t in soup.find_all("div"):
+        if _tag_has_class(t, "t"):
+            txt = _collapse_ws(t.get_text(" ", strip=True))
+            if txt:
+                tokens.append(txt)
+    if tokens:
+        pages.append(("xhtml_tokens", tokens))
+    return pages
+
+
+def _is_number_token(token: Any) -> bool:
+    s = _collapse_ws(token)
+    if not s:
+        return False
+    if s in {"-", "–", "—"}:
+        return True
+    if _cell_is_year_or_date(s):
+        return False
+    return bool(re.fullmatch(r"\(?[-+]?\d[\d\s.,]*\)?", s))
+
+
+def _parse_number_with_unit_hint(token: Any, unit_kind: str = "unknown") -> Optional[float]:
+    """Skaičiaus parsavimas su vieneto užuomina.
+
+    Kai ataskaita pateikta mln. EUR, tokie įrašai kaip 1,377 arba 1.377 dažniau yra
+    dešimtainiai milijonai, o ne tūkstančių skirtukas. Bendras _parse_number to nežino,
+    todėl čia naudojame kitą taisyklę tik mln. EUR atvejams.
+    """
+    if unit_kind != "millions_eur":
+        return _parse_number(token)
+    s = str(token or "").strip().replace("\u00a0", " ")
+    if not s or s in {"-", "–", "—"}:
+        return 0.0 if s else None
+    neg = bool(re.search(r"\([^)]*\d[^)]*\)", s))
+    m = re.search(r"[-+]?\d[\d\s.,]*", s)
+    if not m:
+        return None
+    num = m.group(0).strip().replace(" ", "")
+    if "," in num and "." in num:
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "").replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    elif "," in num:
+        num = num.replace(",", ".")
+    # Vien tik tašką mln. EUR režime paliekame kaip dešimtainį skirtuką.
+    try:
+        out = float(num)
+        if neg and out > 0:
+            out = -out
+        return out
+    except Exception:
+        return _parse_number(token)
+
+
+def _numbers_after_token_label(tokens: List[str], label_idx: int, metric_name: str, max_count: int = 8, max_scan: int = 180, unit_kind: str = "unknown") -> List[float]:
+    nums: List[float] = []
+    scanned = 0
+    for token in tokens[label_idx + 1:]:
+        scanned += 1
+        if scanned > max_scan:
+            break
+        t = _collapse_ws(token)
+        if not t:
+            continue
+        # Stabdome, jeigu pasiekėme kitą aiškią finansinės eilutės etiketę ir jau turime bent vieną reikšmę.
+        if nums:
+            tn = _norm(t)
+            if any(_label_matches(m, tn) for m in FINANCIAL_METRICS if m != metric_name):
+                break
+        if not _is_number_token(t):
+            continue
+        val = _parse_number_with_unit_hint(t, unit_kind=unit_kind)
+        if val is None:
+            continue
+        nums.append(val)
+        if len(nums) >= max_count:
+            break
+    return _clean_statement_numbers(nums)
+
+
+def _find_token_label_indices(tokens: List[str], metric_name: str) -> List[int]:
+    out: List[int] = []
+    labels = METRIC_LABELS.get(metric_name, [])
+    norm_labels = [_norm(x) for x in labels]
+    for i, token in enumerate(tokens):
+        token_clean = _collapse_ws(token)
+        token_norm = _norm(token_clean)
+        if not token_norm:
+            continue
+        if not _label_matches(metric_name, token_norm):
+            continue
+        # Pirmenybė tikslioms arba beveik tikslioms etiketėms, kad „pajamos“ nebūtų paimtos iš pastraipos.
+        if token_norm in norm_labels or any(token_norm == lab or lab in token_norm for lab in norm_labels):
+            out.append(i)
+    return out
+
+
+def _extract_metrics_from_xhtml_positioned_tokens(soup: BeautifulSoup, raw_text: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    found: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    pages = _xhtml_positioned_pages_from_soup(soup)
+    if not pages:
+        return found
+
+    for page_id, tokens in pages:
+        page_text = "\n".join(tokens)
+        page_norm = _norm(page_text)
+        page_unit_kind, page_unit_note = _infer_unit_kind(page_text)
+        if page_unit_kind == "unknown":
+            page_unit_kind, page_unit_note = _infer_unit_kind((raw_text or "")[:5000])
+        scope = _scope_from_text(page_text)
+        if scope == "unknown" and any(x in page_norm for x in ["grupe bendrove", "group company"]):
+            scope = "group_company"
+
+        # Finansinės lentelės: turtas, nuosavas kapitalas, pelnas, pajamos.
+        is_financial_page = any(_norm(h) in page_norm for h in FINANCIAL_TABLE_HINTS) or any(
+            any(_norm(label) in page_norm for label in METRIC_LABELS[m]) for m in FINANCIAL_METRICS
+        )
+        if is_financial_page:
+            for metric_name in ["Turtas", "Nuosavas kapitalas", "Grynasis pelnas", "Pajamos"]:
+                for idx in _find_token_label_indices(tokens, metric_name):
+                    nums = _numbers_after_token_label(tokens, idx, metric_name, max_count=8, unit_kind=page_unit_kind)
+                    if not nums:
+                        continue
+                    # Jei yra 4 arba 6 reikšmės, tai beveik visada grupė + bendrovė.
+                    local_scope = scope
+                    if local_scope == "unknown" and len(nums) >= 4:
+                        local_scope = "group_company"
+                    assigned = _assign_group_company(nums, scope=local_scope, unit_kind=page_unit_kind, metric_name=metric_name)
+                    for group, value in assigned.items():
+                        if value is None or not _is_plausible_metric_value(metric_name, group, value):
+                            continue
+                        key = (metric_name, group)
+                        confidence = 116 if group in {"Grupė", "Bendrovė"} else 108
+                        info = {
+                            "value": value,
+                            "source": "xhtml_positioned_tokens",
+                            "note": f"XHTML tokenų puslapis {page_id}, etiketė '{tokens[idx][:80]}', skaičiai={nums[:6]}; {page_unit_note}; scope={local_scope}",
+                            "confidence": confidence,
+                            "unit_note": page_unit_note,
+                        }
+                        if key not in found or confidence > found[key].get("confidence", 0):
+                            found[key] = info
+
+        # Darbuotojai: dažnai būna ne finansinių ataskaitų lentelėje, o vadovybės/tvarumo dalyje.
+        employee_context = any(x in page_norm for x in [
+            "vidutinis darbuotoju skaicius", "darbuotoju skaicius", "average number of employees", "number of employees",
+            "bendras darbuotoju skaicius",
+        ])
+        if employee_context:
+            label_candidates = [
+                "Vidutinis darbuotojų skaičius", "Vidutinis darbuotoju skaicius", "Darbuotojų skaičius", "Darbuotoju skaicius",
+                "Average number of employees", "Number of employees", "Bendras darbuotojų skaičius", "Bendras darbuotoju skaicius", "Iš viso", "Is viso", "Total",
+            ]
+            for i, token in enumerate(tokens):
+                token_norm = _norm(token)
+                if not token_norm:
+                    continue
+                if not any(_norm(lbl) == token_norm or _norm(lbl) in token_norm for lbl in label_candidates):
+                    continue
+                nums = _numbers_after_token_label(tokens, i, "Darbuotojų skaičius", max_count=6, max_scan=100, unit_kind="unknown")
+                nums = [x for x in nums if x is not None and 0 <= abs(x) <= 200000]
+                if not nums:
+                    continue
+                # Darbuotojų lentelėse „Iš viso“ dažnai turi 2025, 2024 ir pokytį %. Imame einamųjų metų reikšmę.
+                value = round(float(nums[0]), 0)
+                key = ("Darbuotojų skaičius", "Grupė")
+                confidence = 104 if "vidutinis" in page_norm or "average" in page_norm else 98
+                info = {
+                    "value": value,
+                    "source": "xhtml_positioned_tokens",
+                    "note": f"XHTML tokenų puslapis {page_id}, darbuotojų etiketė '{tokens[i][:80]}', skaičiai={nums[:6]}; darbuotojų skaičius saugomas vnt.",
+                    "confidence": confidence,
+                    "unit_note": "darbuotojų skaičius saugomas vnt.",
+                }
+                if key not in found or confidence > found[key].get("confidence", 0):
+                    found[key] = info
+    return found
+
+
 def _extract_metrics_from_xbrl(content: bytes) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], str]:
     found: Dict[Tuple[str, str], Dict[str, Any]] = {}
     text = content.decode("utf-8", errors="ignore")
     soup = BeautifulSoup(text, "html.parser")
     raw_text = soup.get_text("\n", strip=True)[:120000]
 
-    # 1) Pirmiausia skaitome žmogui matomas XHTML/HTML lenteles. Tai patikimiau nei aklai imti visus XBRL faktus,
+    # 1) Pirmiausia skaitome žmogui matomą XHTML pozicionuotų tokenų struktūrą.
+    # Tai būtina lietuviškiems ESEF failams, pvz. abnovaturas-2025-12-31-lt.xhtml,
+    # kuriuose finansinės lentelės nėra <table>, o pdf2htmlEX tipo div.t tokenai.
+    token_metrics = _extract_metrics_from_xhtml_positioned_tokens(soup, raw_text)
+    found.update(token_metrics)
+
+    # 2) Tada skaitome žmogui matomas XHTML/HTML lenteles. Tai patikimiau nei aklai imti visus XBRL faktus,
     # nes lentelėse aiškiau matyti Grupė/Bendrovė, einamieji metai ir vienetai (tūkst. EUR / mln. EUR / EUR).
     html_tables = _html_tables_from_soup(soup)
     table_metrics = _extract_metrics_from_tables(
@@ -1242,9 +1472,11 @@ def _extract_metrics_from_xbrl(content: bytes) -> Tuple[Dict[Tuple[str, str], Di
         source_type="html_table",
         confidence_base=98,
     )
-    found.update(table_metrics)
+    for key, value in table_metrics.items():
+        if key not in found or value.get("confidence", 0) > found[key].get("confidence", 0):
+            found[key] = value
 
-    # 2) Papildomai skaitome Inline XBRL faktus, bet jų pasitikėjimas mažesnis už matomas lenteles.
+    # 3) Papildomai skaitome Inline XBRL faktus, bet jų pasitikėjimas mažesnis už matomas lenteles.
     fact_tags = []
     for tag in soup.find_all(True):
         if tag.get("name"):
