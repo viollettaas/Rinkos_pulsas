@@ -64,7 +64,7 @@ except Exception:
 # KONFIGŪRACIJA
 # ============================================================
 
-MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16i"
+MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16j"
 
 TABLE_REPORTS = "annual_reports"
 TABLE_FILES = "annual_report_files"
@@ -2736,9 +2736,18 @@ def show_metines_page():
                     max_reports=int(max_reports),
                     progress=progress,
                 )
-            st.session_state["metines_last_update_stats"] = stats
+            if full_btn:
+                st.session_state["metines_last_fetch_stats"] = stats
+                st.session_state["metines_last_update_stats"] = {
+                    "module_version": MODULE_VERSION,
+                    "mode": "full_update_fetch_stage_finished",
+                    "fetch_stage": stats,
+                    "message": "1 etapas baigtas. Toliau tame pačiame paleidime vykdomas 2 etapas.",
+                }
+            else:
+                st.session_state["metines_last_update_stats"] = stats
             progress_box.success(
-                "Baigta: "
+                "1 etapas baigtas: "
                 f"rasta pranešimų {stats.get('annual_news_found', 0)}, "
                 f"apdorota {stats.get('annual_news_processed', 0)}, "
                 f"priedų rasta {stats.get('attachments_found', 0)}, "
@@ -2755,6 +2764,21 @@ def show_metines_page():
             st.stop()
 
     if reparse_btn or full_btn:
+        # Jei vartotojas spaudžia tik 2 etapą, bet annual_reports šiame periode nėra,
+        # nereikia apsimesti, kad kažkas buvo perparsinta. Aiškiai pasakome, kad pirma reikalingas 1 etapas.
+        existing_reports_df, _existing_files_df = load_annual_reports_overview(start_date, end_date)
+        if reparse_btn and not full_btn and (existing_reports_df is None or existing_reports_df.empty):
+            stats = {
+                "module_version": MODULE_VERSION,
+                "mode": "reparse_saved_files_skipped_no_reports",
+                "reports_in_period": 0,
+                "metrics_saved": 0,
+                "message": "Pasirinktame periode annual_reports nėra. Pirma paleisk 1 etapą arba pilną atnaujinimą.",
+            }
+            st.session_state["metines_last_update_stats"] = stats
+            st.error("Pasirinktame periode annual_reports nėra. 2 etapas neturi ką perparsinti. Pirma spausk 1 etapą arba pilną atnaujinimą.")
+            st.stop()
+
         progress_box = st.empty()
 
         def progress_reparse(msg: str):
@@ -2770,9 +2794,32 @@ def show_metines_page():
                     force_redownload=bool(force_redownload_reparse),
                     progress=progress_reparse,
                 )
-            st.session_state["metines_last_update_stats"] = stats
+            if full_btn:
+                fetch_stats = st.session_state.get("metines_last_fetch_stats", {})
+                combined_stats = {
+                    "module_version": MODULE_VERSION,
+                    "mode": "full_update_fetch_plus_reparse",
+                    "fetch_stage": fetch_stats,
+                    "reparse_stage": stats,
+                    "summary": {
+                        "annual_news_found": fetch_stats.get("annual_news_found", 0),
+                        "annual_news_processed": fetch_stats.get("annual_news_processed", 0),
+                        "attachments_found": fetch_stats.get("attachments_found", 0),
+                        "attachments_downloaded": fetch_stats.get("attachments_downloaded", 0),
+                        "files_saved": fetch_stats.get("files_saved", 0),
+                        "reports_in_period_after_fetch": stats.get("reports_in_period", 0),
+                        "files_seen_reparse": stats.get("files_seen", 0),
+                        "metrics_found_reparse": stats.get("metrics_found", 0),
+                        "metrics_saved_reparse": stats.get("metrics_saved", 0),
+                        "fetch_errors": fetch_stats.get("errors", 0),
+                        "reparse_errors": stats.get("errors", 0),
+                    },
+                }
+                st.session_state["metines_last_update_stats"] = combined_stats
+            else:
+                st.session_state["metines_last_update_stats"] = stats
             progress_box.success(
-                "Perparsinta: "
+                "2 etapas baigtas: "
                 f"reportų periode {stats.get('reports_in_period', 0)}, "
                 f"apdorota {stats.get('reports_processed', 0)}, "
                 f"failų peržiūrėta {stats.get('files_seen', 0)}, "
