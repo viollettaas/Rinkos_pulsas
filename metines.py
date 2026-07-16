@@ -64,7 +64,7 @@ except Exception:
 # KONFIGŪRACIJA
 # ============================================================
 
-MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16j"
+MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16k_rls_guard"
 
 TABLE_REPORTS = "annual_reports"
 TABLE_FILES = "annual_report_files"
@@ -349,6 +349,68 @@ def _rest_delete(table: str, filters: Dict[str, str]) -> int:
             return len(resp.json() or [])
         except Exception:
             return 0
+
+
+
+def _is_rls_error_message(message: Any) -> bool:
+    txt = str(message or "").lower()
+    return (
+        "row-level security" in txt
+        or "violates row-level security policy" in txt
+        or '"code":"42501"' in txt
+        or "code 42501" in txt
+        or " 401" in txt
+        or "401 -" in txt
+    )
+
+
+def _annual_reports_write_preflight() -> Dict[str, Any]:
+    """Patikrina, ar Supabase leidžia rašyti į annual_reports.
+
+    Tai sąmoningai daroma prieš ilgą CRIB atsisiuntimą. Jei RLS blokuoja INSERT,
+    nėra prasmės siųstis ZIP/PDF, nes procesas sustos pirmajame žingsnyje ir
+    diagnostikoje bus daug pasikartojančių 401 klaidų.
+    """
+    token = hashlib.sha256(str(pd.Timestamp.utcnow()).encode("utf-8")).hexdigest()[:16]
+    test_crib_url = f"__metines_write_preflight__/{token}"
+    row = {
+        "issuer": "__WRITE_TEST__",
+        "issuer_norm": "write_test",
+        "company": "__WRITE_TEST__",
+        "market": "VLN",
+        "report_year": 2099,
+        "report_type": "Techninis testas",
+        "crib_url": test_crib_url,
+        "crib_title": "Techninis rašymo teisių testas",
+        "crib_category": "preflight",
+        "published_at": _to_iso(pd.Timestamp.utcnow()),
+        "parse_status": "preflight_write_test",
+        "parse_note": "Ši eilutė sukurta metines.py rašymo teisių patikrai ir turėjo būti ištrinta automatiškai.",
+        "updated_at": _to_iso(pd.Timestamp.utcnow()),
+    }
+    try:
+        inserted = _rest_insert(TABLE_REPORTS, row, return_representation=True)
+        report_id = int(inserted[0]["id"]) if inserted and inserted[0].get("id") is not None else None
+        if report_id:
+            try:
+                _rest_delete(TABLE_REPORTS, {"id": f"eq.{report_id}"})
+            except Exception:
+                pass
+        return {"ok": True, "message": "annual_reports INSERT leidžiamas", "report_id": report_id}
+    except Exception as exc:
+        msg = str(exc)
+        if _is_rls_error_message(msg):
+            return {
+                "ok": False,
+                "error_type": "rls_blocked",
+                "message": (
+                    "Supabase blokuoja INSERT į `annual_reports` dėl Row Level Security. "
+                    "Procesas sustabdytas prieš failų atsisiuntimą, nes kitaip visi CRIB pranešimai kartotų tą pačią 401 klaidą. "
+                    "Paleisk pateiktą `metines_fix_rls.sql` Supabase SQL Editor lange."
+                ),
+                "raw_error": msg[:1200],
+            }
+        return {"ok": False, "error_type": "write_preflight_failed", "message": msg[:1200], "raw_error": msg[:1200]}
 
 
 # ============================================================
@@ -1992,6 +2054,15 @@ def update_annual_reports_metrics(start_date: date, end_date: date, max_reports:
         if progress:
             progress(message)
 
+    preflight = _annual_reports_write_preflight()
+    stats["write_access_ok"] = bool(preflight.get("ok"))
+    stats["write_access_message"] = preflight.get("message")
+    if not preflight.get("ok"):
+        stats["errors"] = 1
+        stats["error_examples"].append(str(preflight.get("raw_error") or preflight.get("message") or "Rašymo teisių patikra nepavyko")[:1200])
+        log(str(preflight.get("message") or "Rašymo teisių patikra nepavyko"))
+        return stats
+
     allowed = load_vln_official_secondary_issuers()
     stats["allowed_issuers"] = int(len(allowed)) if allowed is not None else 0
 
@@ -2693,8 +2764,16 @@ def show_metines_page():
 
         st.warning(
             "Jeigu diagnostikoje annual_reports = 0 ir annual_report_files = 0, pirmiausia spausk 1 etapą arba pilną atnaujinimą. "
-            "2 etapas tokiu atveju neturės ką perparsinti."
+            "2 etapas tokiu atveju neturės ką perparsinti. Jei 1 etapas grąžina 401 / row-level security klaidą, reikia paleisti metines_fix_rls.sql Supabase SQL Editor lange."
         )
+        with st.expander("RLS / Supabase rašymo teisių patikra", expanded=False):
+            st.code(
+                "alter table public.annual_reports disable row level security;\n"
+                "alter table public.annual_report_files disable row level security;\n"
+                "alter table public.annual_report_metrics disable row level security;\n"
+                "notify pgrst, 'reload schema';",
+                language="sql",
+            )
 
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
