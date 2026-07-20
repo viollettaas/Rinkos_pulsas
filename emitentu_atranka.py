@@ -102,27 +102,95 @@ def slugify(value) -> str:
     return s[:120] or "unknown"
 
 
+def _parse_single_date_safe(value):
+    """
+    Datos parsavimas lietuviskai aplinkai.
+
+    Svarbu: CRIB / VZ tekstuose datos daznai buna DD/MM/YYYY arba DD.MM.YYYY.
+    Pandas pagal nutylejima dviprasme data 10/06/2026 gali suprasti kaip
+    spalio 6 d., todel tokias datas visada interpretuojame day-first.
+    ISO datos YYYY-MM-DD paliekamos year-first.
+    """
+    if value is None:
+        return pd.NaT
+
+    try:
+        if pd.isna(value):
+            return pd.NaT
+    except Exception:
+        pass
+
+    # Jeigu tai jau Timestamp / datetime / date, jo nebeperinterpretuojame kaip teksto.
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.to_datetime(value, errors="coerce")
+    if isinstance(value, date):
+        return pd.to_datetime(value, errors="coerce")
+
+    s = norm_text(value)
+    if not s:
+        return pd.NaT
+
+    # ISO / Supabase formatai: 2026-06-10, 2026-06-10T08:12:00, 2026-06-10 08:12:00+00:00
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
+        return pd.to_datetime(s, errors="coerce", yearfirst=True)
+
+    # Lietuviski / europiniai formatai: 10/06/2026, 10.06.2026, 10-06-2026, su laiku arba be jo.
+    m = re.match(
+        r"^(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>\d{4})"
+        r"(?:\s+(?P<h>\d{1,2}):(?P<mi>\d{2})(?::(?P<sec>\d{2}))?)?",
+        s,
+    )
+    if m:
+        day = int(m.group("d"))
+        month = int(m.group("m"))
+        year = int(m.group("y"))
+        hour = int(m.group("h") or 0)
+        minute = int(m.group("mi") or 0)
+        second = int(m.group("sec") or 0)
+        try:
+            return pd.Timestamp(year=year, month=month, day=day, hour=hour, minute=minute, second=second)
+        except Exception:
+            return pd.NaT
+
+    # Lietuviski menesiu pavadinimai, jeigu ateityje ateitu tekstas pvz. "10 birzelio 2026".
+    months = {
+        "sausio": 1, "sausis": 1,
+        "vasario": 2, "vasaris": 2,
+        "kovo": 3, "kovas": 3,
+        "balandzio": 4, "balandžio": 4, "balandis": 4,
+        "geguzes": 5, "gegužes": 5, "gegužės": 5, "geguze": 5, "gegužė": 5,
+        "birzelio": 6, "birželio": 6, "birzelis": 6, "birželis": 6,
+        "liepos": 7, "liepa": 7,
+        "rugpjucio": 8, "rugpjūcio": 8, "rugpjūčio": 8, "rugpjutis": 8, "rugpjūtis": 8,
+        "rugsejo": 9, "rugsėjo": 9, "rugsejis": 9, "rugsėjis": 9,
+        "spalio": 10, "spalis": 10,
+        "lapkricio": 11, "lapkričio": 11, "lapkritis": 11,
+        "gruodzio": 12, "gruodžio": 12, "gruodis": 12,
+    }
+    s_low = _remove_lithuanian_accents(s.lower())
+    month_pattern = "|".join(sorted(set(_remove_lithuanian_accents(k) for k in months), key=len, reverse=True))
+    m = re.search(rf"(?P<d>\d{{1,2}})\s+(?P<mon>{month_pattern})\s+(?P<y>\d{{4}})", s_low)
+    if m:
+        try:
+            mon_key = m.group("mon")
+            month = months.get(mon_key) or months.get(mon_key + "io")
+            if month:
+                return pd.Timestamp(year=int(m.group("y")), month=int(month), day=int(m.group("d")))
+        except Exception:
+            return pd.NaT
+
+    # Paskutinis bandymas taip pat dayfirst=True. Nenaudojame pandas default month-first.
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
+
 def parse_dates_safe(series: pd.Series) -> pd.Series:
-    """Saugus datų parsavimas iš kelių galimų formatų."""
+    """Saugus datų parsavimas iš kelių galimų formatų, prioritetas LT DD/MM/YYYY."""
     if series is None:
         return pd.Series(dtype="datetime64[ns]")
 
-    s = series.copy()
-    parsed = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
-
-    if parsed.isna().any():
-        idx = parsed[parsed.isna()].index
-        if len(idx) > 0:
-            parsed_alt = pd.to_datetime(s.loc[idx], dayfirst=True, errors="coerce")
-            parsed.loc[parsed_alt.index] = parsed_alt
-
-    if parsed.isna().any():
-        idx = parsed[parsed.isna()].index
-        if len(idx) > 0:
-            parsed_alt = pd.to_datetime(s.loc[idx], errors="coerce")
-            parsed.loc[parsed_alt.index] = parsed_alt
-
-    return parsed
+    s = pd.Series(series).copy()
+    parsed = s.map(_parse_single_date_safe)
+    return pd.to_datetime(parsed, errors="coerce")
 
 
 def _norm_for_dedup(value) -> str:
@@ -333,7 +401,7 @@ def _canonicalize_issuers(data: pd.DataFrame) -> pd.DataFrame:
 # SUPABASE PAGINATION - KAD NEBUTU 1000 IRASU RIBOS
 # ============================================================
 
-REPORT_VERSION = "emitentu_suvienodinimas_ir_puslapiavimas_2026-07-15d"
+REPORT_VERSION = "emitentu_date_dayfirst_fix_2026-07-17a"
 PAGE_SIZE = 1000
 
 
@@ -467,7 +535,7 @@ def prepare_classified_df(df: pd.DataFrame) -> pd.DataFrame:
     if "date_parsed" not in data.columns:
         data["date_parsed"] = parse_dates_safe(data["date"])
     else:
-        data["date_parsed"] = pd.to_datetime(data["date_parsed"], errors="coerce")
+        data["date_parsed"] = parse_dates_safe(data["date_parsed"])
 
     if "orig_order" not in data.columns:
         data["orig_order"] = data.index
@@ -533,12 +601,9 @@ def build_summary_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _format_date_for_html(value) -> str:
-    try:
-        dt = pd.to_datetime(value, errors="coerce")
-        if pd.notna(dt):
-            return dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        pass
+    dt = _parse_single_date_safe(value)
+    if pd.notna(dt):
+        return pd.to_datetime(dt).strftime("%Y-%m-%d %H:%M")
     return norm_text(value)
 
 
@@ -557,7 +622,7 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
         """
 
     report_df = _canonicalize_issuers(df.copy())
-    report_df["date_parsed"] = pd.to_datetime(report_df.get("date_parsed"), errors="coerce")
+    report_df["date_parsed"] = parse_dates_safe(report_df.get("date_parsed"))
     report_df = report_df.sort_values(["issuer", "date_parsed", "orig_order"], ascending=[True, True, True])
 
     issuer_order = list(report_df["issuer"].drop_duplicates())
