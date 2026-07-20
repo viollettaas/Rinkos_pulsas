@@ -130,9 +130,29 @@ def _parse_single_date_safe(value):
     if not s:
         return pd.NaT
 
-    # ISO / Supabase formatai: 2026-06-10, 2026-06-10T08:12:00, 2026-06-10 08:12:00+00:00
-    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
-        return pd.to_datetime(s, errors="coerce", yearfirst=True)
+    # Pašaliname laiko zonos trumpinius, pvz. EEST/EET, nes pandas juos kartais
+    # interpretuoja nevienodai arba meta warning. Datos reikšmė CRIB lentelėje jau yra vietiniu laiku.
+    s = re.sub(r"\s+(EEST|EET|UTC|GMT)\s*$", "", s, flags=re.I).strip()
+
+    # ISO / Supabase formatai: 2026-06-10, 2026-06-10T08:12:00, 2026-06-10 08:12:00+00:00.
+    # Čia niekada negalima taikyti dayfirst, nes YYYY-MM-DD turi būti year-first.
+    m_iso = re.match(
+        r"^(?P<y>\d{4})[-/](?P<m>\d{1,2})[-/](?P<d>\d{1,2})"
+        r"(?:[T\s]+(?P<h>\d{1,2}):(?P<mi>\d{2})(?::(?P<sec>\d{2}))?)?",
+        s,
+    )
+    if m_iso:
+        try:
+            return pd.Timestamp(
+                year=int(m_iso.group("y")),
+                month=int(m_iso.group("m")),
+                day=int(m_iso.group("d")),
+                hour=int(m_iso.group("h") or 0),
+                minute=int(m_iso.group("mi") or 0),
+                second=int(m_iso.group("sec") or 0),
+            )
+        except Exception:
+            return pd.NaT
 
     # Lietuviski / europiniai formatai: 10/06/2026, 10.06.2026, 10-06-2026, su laiku arba be jo.
     m = re.match(
@@ -401,7 +421,7 @@ def _canonicalize_issuers(data: pd.DataFrame) -> pd.DataFrame:
 # SUPABASE PAGINATION - KAD NEBUTU 1000 IRASU RIBOS
 # ============================================================
 
-REPORT_VERSION = "emitentu_date_dayfirst_fix_2026-07-17a"
+REPORT_VERSION = "emitentu_date_raw_first_fix_2026-07-17b"
 PAGE_SIZE = 1000
 
 
@@ -622,7 +642,12 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
         """
 
     report_df = _canonicalize_issuers(df.copy())
-    report_df["date_parsed"] = parse_dates_safe(report_df.get("date_parsed"))
+    # Svarbu: HTML generavime datą iš naujo parsinguojame iš pirminio `date` lauko,
+    # o ne iš galimai ankstesnėje versijoje klaidingai suformuoto `date_parsed`.
+    if "date" in report_df.columns:
+        report_df["date_parsed"] = parse_dates_safe(report_df["date"])
+    else:
+        report_df["date_parsed"] = parse_dates_safe(report_df.get("date_parsed"))
     report_df = report_df.sort_values(["issuer", "date_parsed", "orig_order"], ascending=[True, True, True])
 
     issuer_order = list(report_df["issuer"].drop_duplicates())
@@ -1023,7 +1048,9 @@ def build_pretty_html(df: pd.DataFrame, title: str = "Klasifikuotos naujienos �
         parts.append("<tbody>")
 
         for _, r in issuer_rows.iterrows():
-            date_raw = _format_date_for_html(r.get("date_parsed")) or _format_date_for_html(r.get("date", ""))
+            # Rodome datą pagal pirminį DB lauką `date`, nes jis ateina iš CRIB/Supabase teisingu formatu.
+            # `date_parsed` naudojamas tik rikiavimui.
+            date_raw = _format_date_for_html(r.get("date", "")) or _format_date_for_html(r.get("date_parsed"))
             title_raw = norm_text(r.get("title", ""))
             url = norm_text(r.get("url", ""))
             summary_raw = norm_text(r.get("summary", ""))
