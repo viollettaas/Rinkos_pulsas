@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from datetime import date
+from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -448,6 +448,141 @@ def show_styled_table(styler):
     )
 
 
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clear_generated_report_state():
+    """Pašalina jau sugeneruotus vaizdus, kurie gali remtis senais DB duomenimis."""
+    st.session_state.report_result = None
+    st.session_state.report_filename = None
+    st.session_state.emitentu_result = None
+    st.session_state.emitentu_dates = None
+    st.session_state.pop("manager_transactions_display_df", None)
+
+
+def refresh_all_data() -> dict:
+    """
+    Vienu paspaudimu atnaujina visus bendrus duomenų šaltinius.
+
+    Vykdymo seka svarbi:
+    1. CRIB pranešimai įrašomi į market_news;
+    2. išvalomas duomenų kešas;
+    3. vadovų sandoriai skaitomi iš jau atnaujintos market_news lentelės;
+    4. atnaujinamos VŽ naujienos;
+    5. išvalomi visi ataskaitų kešai ir seni sugeneruoti rezultatai.
+
+    Vieno modulio klaida nesustabdo kitų modulių atnaujinimo.
+    """
+    result = {
+        "crib_inserted": 0,
+        "crib_pages": 0,
+        "manager_found": 0,
+        "manager_processed": 0,
+        "manager_saved": 0,
+        "manager_errors": 0,
+        "vz_found": 0,
+        "vz_inserted": 0,
+        "vz_checked": 0,
+        "vz_matched": 0,
+        "notes": [],
+        "errors": [],
+        "refreshed_at": datetime.now(),
+    }
+
+    # 1. CRIB naujienos
+    try:
+        with st.spinner("Tikrinami nauji CRIB pranešimai..."):
+            stats = update_crib_news(
+                max_pages=20,
+                stop_empty_pages=3,
+                headless=True,
+                progress=None,
+            ) or {}
+
+        result["crib_inserted"] = _safe_int(stats.get("records_inserted"))
+        result["crib_pages"] = _safe_int(stats.get("pages_processed"))
+    except Exception as exc:
+        result["errors"].append(f"CRIB: {type(exc).__name__}: {exc}")
+
+    # Būtina išvalyti kešą prieš vadovų sandorių modulį, nes jis skaito market_news.
+    st.cache_data.clear()
+
+    # 2. Vadovų sandoriai
+    if update_manager_transactions_from_recent_crib is None:
+        result["notes"].append("Vadovų sandoriai neatnaujinti: modulis manager_transactions_update nerastas.")
+    else:
+        try:
+            with st.spinner("Tikrinami vadovų sandorių CRIB pranešimai..."):
+                mgr_stats = update_manager_transactions_from_recent_crib(
+                    days_back=45,
+                    max_messages=100,
+                    headless=True,
+                    progress=None,
+                ) or {}
+
+            result["manager_found"] = _safe_int(mgr_stats.get("manager_messages_found"))
+            result["manager_processed"] = _safe_int(mgr_stats.get("manager_messages_processed"))
+            result["manager_saved"] = _safe_int(mgr_stats.get("manager_transactions_saved"))
+            result["manager_errors"] = _safe_int(mgr_stats.get("manager_transactions_errors"))
+        except Exception as exc:
+            result["errors"].append(f"Vadovų sandoriai: {type(exc).__name__}: {exc}")
+
+    # 3. VŽ naujienos
+    try:
+        with st.spinner("Kraunamas emitentų sąrašas VŽ atrankai..."):
+            df_issuers_for_vz = load_issuer_df()
+
+        if df_issuers_for_vz is None or df_issuers_for_vz.empty:
+            result["notes"].append("VŽ neatnaujinta: DB nėra emitentų sąrašo.")
+        else:
+            with st.spinner("Tikrinamas VŽ puslapis pagal emitentų sąrašą..."):
+                vz_stats = update_vz_news_fast(
+                    df_issuers=df_issuers_for_vz,
+                    existing_url_limit=800,
+                    max_articles=80,
+                    progress=None,
+                ) or {}
+
+            result["vz_found"] = _safe_int(vz_stats.get("found"))
+            result["vz_inserted"] = _safe_int(vz_stats.get("inserted"))
+            result["vz_checked"] = _safe_int(vz_stats.get("checked"))
+            result["vz_matched"] = _safe_int(vz_stats.get("matched"))
+    except Exception as exc:
+        result["errors"].append(f"VŽ: {type(exc).__name__}: {exc}")
+
+    # 4. Galutinis visų kešų ir senų rezultatų išvalymas
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    _clear_generated_report_state()
+
+    result["refreshed_at"] = datetime.now()
+    return result
+
+
+def build_refresh_message(result: dict) -> str:
+    message = (
+        f"Atnaujinta: CRIB naujai įrašyta {result['crib_inserted']} pranešimų "
+        f"(patikrinta puslapių: {result['crib_pages']}); "
+        f"vadovų sandoriai: rasta {result['manager_found']}, "
+        f"apdorota {result['manager_processed']}, įrašyta {result['manager_saved']}, "
+        f"klaidų {result['manager_errors']}; "
+        f"VŽ rasta {result['vz_found']}, naujai įrašyta {result['vz_inserted']}, "
+        f"patikrinta {result['vz_checked']}, aktualių kandidatų {result['vz_matched']}."
+    )
+
+    if result.get("notes"):
+        message += " " + " ".join(result["notes"])
+
+    if result.get("errors"):
+        message += " Klaidos: " + " | ".join(result["errors"])
+
+    return message
+
+
 # ============================================================
 # ATASKAITOS PASIRINKIMAS
 # ============================================================
@@ -546,88 +681,12 @@ with st.sidebar:
 
     if update_news_btn:
         try:
-            crib_inserted = 0
-            crib_pages = 0
-            vz_inserted = 0
-            vz_found = 0
-            vz_note = ""
-
-            with st.spinner("Tikrinami nauji CRIB pranešimai..."):
-                stats = update_crib_news(
-                    max_pages=20,
-                    stop_empty_pages=3,
-                    headless=True,
-                    progress=None,
-                )
-                crib_inserted = int(stats.get("records_inserted", 0) or 0)
-                crib_pages = int(stats.get("pages_processed", 0) or 0)
-
-            manager_note = ""
-
-            if update_manager_transactions_from_recent_crib is not None:
-                with st.spinner("Tikrinami vadovų sandorių CRIB pranešimai..."):
-                    mgr_stats = update_manager_transactions_from_recent_crib(
-                        days_back=45,
-                        max_messages=30,
-                        headless=True,
-                        progress=None,
-                    )
-
-                manager_found = int(mgr_stats.get("manager_messages_found", 0) or 0)
-                manager_processed = int(mgr_stats.get("manager_messages_processed", 0) or 0)
-                manager_saved = int(mgr_stats.get("manager_transactions_saved", 0) or 0)
-
-                manager_note = (
-                    f" Vadovų sandoriai: rasta CRIB pranešimų {manager_found}, "
-                    f"apdorota {manager_processed}, įrašyta {manager_saved};"
-                )
-            else:
-                manager_note = " Vadovų sandoriai neatnaujinti: modulis nerastas;"
-
-            df_issuers_for_vz = None
-
-            with st.spinner("Kraunamas emitentų sąrašas VŽ atrankai..."):
-                try:
-                    df_issuers_for_vz = load_issuer_df()
-                except Exception as issuer_exc:
-                    vz_note = f" VŽ neatnaujinta: nepavyko užkrauti emitentų sąrašo ({issuer_exc})."
-
-            if df_issuers_for_vz is not None and not df_issuers_for_vz.empty:
-                with st.spinner("Tikrinamas VŽ puslapis pagal emitentų sąrašą..."):
-                    vz_stats = update_vz_news_fast(
-                        df_issuers=df_issuers_for_vz,
-                        existing_url_limit=800,
-                        max_articles=80,
-                        progress=None,
-                    )
-
-                vz_found = int(vz_stats.get("found", 0) or 0)
-                vz_inserted = int(vz_stats.get("inserted", 0) or 0)
-                vz_checked = int(vz_stats.get("checked", 0) or 0)
-                vz_matched = int(vz_stats.get("matched", 0) or 0)
-
-                vz_note += (
-                    f" VŽ patikrinta {vz_checked} straipsnių, "
-                    f"aktualių kandidatų {vz_matched}."
-                )
-            elif not vz_note:
-                vz_note = " VŽ neatnaujinta: DB nėra emitentų sąrašo."
-
-            st.session_state.report_result = None
-            st.session_state.emitentu_result = None
-
-            st.session_state.news_update_message = (
-                f"Atnaujinta: CRIB naujai įrašyta {crib_inserted} pranešimų "
-                f"(patikrinta puslapių: {crib_pages});"
-                f"{manager_note} "
-                f"VŽ rasta {vz_found}, naujai įrašyta {vz_inserted}."
-                f"{vz_note}"
-            )
-
+            refresh_result = refresh_all_data()
+            st.session_state.news_update_message = build_refresh_message(refresh_result)
             st.rerun()
 
         except Exception as exc:
-            st.error("Nepavyko atnaujinti naujienų bazės.")
+            st.error("Nepavyko atnaujinti duomenų bazės.")
             st.exception(exc)
 
 
