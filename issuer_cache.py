@@ -2,8 +2,9 @@
 """
 issuer_cache.py
 
-Emitentų / instrumentų sąrašo cache Supabase duomenų bazėje.
-Naudojama VŽ atnaujinimui, kad nereikėtų kiekvieną kartą siųstis Nasdaq statistics.
+Emitentų sąrašo cache Supabase duomenų bazėje.
+Naudojama VŽ atnaujinimui, kad nereikėtų kiekvieną kartą
+siųstis Nasdaq statistics.
 
 Reikalinga Supabase lentelė: market_issuers
 Unikali kolona: unique_key
@@ -14,7 +15,11 @@ from datetime import date, datetime, timezone
 
 import pandas as pd
 
-from supabase_cache import _supabase_headers, _supabase_rest_url, _http_client
+from supabase_cache import (
+    _supabase_headers,
+    _supabase_rest_url,
+    _http_client,
+)
 
 
 def _norm(value) -> str:
@@ -31,15 +36,19 @@ def _find_col(df: pd.DataFrame, candidates):
     if df is None or df.empty:
         return None
 
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    lower_map = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
 
-    # Pirma ieškome tikslaus sutapimo
+    # Tikslus stulpelio pavadinimo sutapimas
     for c in candidates:
         key = str(c).strip().lower()
+
         if key in lower_map:
             return lower_map[key]
 
-    # Jei tikslaus nėra – dalinio
+    # Dalinis sutapimas
     for col in df.columns:
         col_l = str(col).strip().lower()
 
@@ -56,27 +65,20 @@ def _issuer_unique_key(
     source: str,
     issuer: str,
     market: str = "VLN",
-    isin: str = "",
-    ticker: str = "",
 ) -> str:
     """
-    Unikalų raktą kuriame instrumento lygiu.
+    Dabartinė logika:
+    vienas unique_key vienam emitentui.
 
-    Prioritetas:
-    1. ISIN
-    2. ticker
-    3. emitento pavadinimas
-
-    Taip tas pats emitentas gali turėti kelis instrumentus.
+    Kol kas nekeičiam šios logikos,
+    kad nesugadintume kitų Rinkos pulso dalių.
     """
 
-    instrument_key = (
-        _norm_key(isin)
-        or _norm_key(ticker)
-        or _norm_key(issuer)
+    base = (
+        f"{source}|"
+        f"{market}|"
+        f"{_norm_key(issuer)}"
     )
-
-    base = f"{source}|{market}|{instrument_key}"
 
     return hashlib.sha256(
         base.encode("utf-8")
@@ -84,17 +86,22 @@ def _issuer_unique_key(
 
 
 def build_issuer_df_from_stat_df(
-    df_stat: pd.DataFrame
+    df_stat: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Iš Nasdaq statistics DataFrame suformuoja
-    emitentų / instrumentų sąrašą.
+    Iš Nasdaq statistics DataFrame suformuoja emitentų sąrašą.
+
+    Nasdaq Statistics VLN lape:
+    E stulpelis = ISIN.
+
+    Pandas pozicija:
+    E = 5-as stulpelis = iloc[:, 4]
 
     Grąžina:
-    - Bendrovė
-    - Trumpinys
-    - ISIN
-    - Sąrašas/segmentas
+        Bendrovė
+        Trumpinys
+        ISIN
+        Sąrašas/segmentas
     """
 
     output_columns = [
@@ -105,7 +112,9 @@ def build_issuer_df_from_stat_df(
     ]
 
     if df_stat is None or df_stat.empty:
-        return pd.DataFrame(columns=output_columns)
+        return pd.DataFrame(
+            columns=output_columns
+        )
 
     company_col = _find_col(
         df_stat,
@@ -127,16 +136,6 @@ def build_issuer_df_from_stat_df(
         ],
     )
 
-    isin_col = _find_col(
-        df_stat,
-        [
-            "ISIN",
-            "ISIN kodas",
-            "ISIN Code",
-            "ISIN code",
-        ],
-    )
-
     segment_col = _find_col(
         df_stat,
         [
@@ -149,10 +148,13 @@ def build_issuer_df_from_stat_df(
     )
 
     if company_col is None:
-        return pd.DataFrame(columns=output_columns)
+        return pd.DataFrame(
+            columns=output_columns
+        )
 
     out = pd.DataFrame()
 
+    # Emitentas / bendrovė
     out["Bendrovė"] = (
         df_stat[company_col]
         .fillna("")
@@ -160,6 +162,7 @@ def build_issuer_df_from_stat_df(
         .str.strip()
     )
 
+    # Ticker
     if ticker_col:
         out["Trumpinys"] = (
             df_stat[ticker_col]
@@ -170,16 +173,25 @@ def build_issuer_df_from_stat_df(
     else:
         out["Trumpinys"] = ""
 
-    if isin_col:
+    # ----------------------------------------
+    # ISIN
+    # Nasdaq Statistics faile:
+    # E stulpelis = index 4
+    # ----------------------------------------
+    if len(df_stat.columns) >= 5:
+
         out["ISIN"] = (
-            df_stat[isin_col]
+            df_stat.iloc[:, 4]
             .fillna("")
             .astype(str)
             .str.strip()
         )
+
     else:
+
         out["ISIN"] = ""
 
+    # Segmentas
     if segment_col:
         out["Sąrašas/segmentas"] = (
             df_stat[segment_col]
@@ -190,23 +202,17 @@ def build_issuer_df_from_stat_df(
     else:
         out["Sąrašas/segmentas"] = ""
 
-    # Pašaliname tik eilutes be bendrovės
+    # Pašaliname tuščius emitentus
     out = out[
         out["Bendrovė"] != ""
-    ].copy()
+    ]
 
-    # Instrumento lygio deduplikacija.
-    # Nebededuplikuojame vien tik pagal Bendrovė,
-    # nes vienas emitentas gali turėti kelis ISIN.
+    # Kol kas paliekame vieną eilutę bendrovei,
+    # kaip buvo dabartinėje Rinkos pulso logikoje.
     out = (
         out
         .drop_duplicates(
-            subset=[
-                "Bendrovė",
-                "Trumpinys",
-                "ISIN",
-                "Sąrašas/segmentas",
-            ]
+            subset=["Bendrovė"]
         )
         .reset_index(drop=True)
     )
@@ -220,51 +226,77 @@ def save_issuer_list_from_stat_df(
     market: str = "VLN",
 ) -> int:
     """
-    Išsaugo arba atnaujina emitentų / instrumentų sąrašą
+    Išsaugo arba atnaujina emitentų sąrašą
     Supabase market_issuers lentelėje.
+
+    Įrašomi:
+        issuer
+        company
+        ticker
+        isin
+        segment
+        last_seen_date
+        updated_at
+        unique_key
     """
 
-    issuer_df = build_issuer_df_from_stat_df(df_stat)
+    issuer_df = build_issuer_df_from_stat_df(
+        df_stat
+    )
 
     if issuer_df.empty:
         return 0
 
     today = date.today().isoformat()
-    now = datetime.now(timezone.utc).isoformat()
+
+    now = (
+        datetime.now(timezone.utc)
+        .isoformat()
+    )
 
     rows = []
 
     for _, r in issuer_df.iterrows():
 
         issuer = _norm(
-            r.get("Bendrovė", "")
+            r.get(
+                "Bendrovė",
+                "",
+            )
         )
 
         if not issuer:
             continue
 
+        issuer_norm = _norm_key(
+            issuer
+        )
+
         ticker = _norm(
-            r.get("Trumpinys", "")
+            r.get(
+                "Trumpinys",
+                "",
+            )
         )
 
         isin = _norm(
-            r.get("ISIN", "")
+            r.get(
+                "ISIN",
+                "",
+            )
         )
 
         segment = _norm(
-            r.get("Sąrašas/segmentas", "")
-        )
-
-        issuer_norm = _norm_key(
-            issuer
+            r.get(
+                "Sąrašas/segmentas",
+                "",
+            )
         )
 
         unique_key = _issuer_unique_key(
             source=source,
             issuer=issuer,
             market=market,
-            isin=isin,
-            ticker=ticker,
         )
 
         rows.append(
@@ -275,13 +307,16 @@ def save_issuer_list_from_stat_df(
                 "issuer": issuer,
                 "issuer_norm": issuer_norm,
 
-                # Paliekame dėl suderinamumo
-                # su esama DB schema
+                # Paliekame company dėl
+                # suderinamumo su esama DB schema
                 "company": issuer,
                 "company_norm": issuer_norm,
 
                 "ticker": ticker,
+
+                # NAUJAS LAUKAS
                 "isin": isin,
+
                 "segment": segment,
 
                 "last_seen_date": today,
@@ -324,9 +359,11 @@ def save_issuer_list_from_stat_df(
                 201,
                 204,
             ):
+
                 saved += 1
 
             else:
+
                 raise RuntimeError(
                     "Supabase emitentų sąrašo "
                     "įrašymo klaida: "
@@ -342,14 +379,14 @@ def load_issuer_df(
     market: str = "VLN",
 ) -> pd.DataFrame:
     """
-    Užkrauna emitentų / instrumentų sąrašą
+    Užkrauna emitentų sąrašą
     iš Supabase market_issuers.
 
-    Grąžina:
-    - Bendrovė
-    - Trumpinys
-    - ISIN
-    - Sąrašas/segmentas
+    Grąžina struktūrą:
+        Bendrovė
+        Trumpinys
+        ISIN
+        Sąrašas/segmentas
     """
 
     url = _supabase_rest_url(
@@ -366,8 +403,10 @@ def load_issuer_df(
             "last_seen_date,"
             "updated_at"
         ),
+
         "source": f"eq.{source}",
         "market": f"eq.{market}",
+
         "order": "issuer.asc",
     }
 
@@ -407,8 +446,8 @@ def load_issuer_df(
         .astype(str)
     )
 
-    # Suderinamumas su senesniais įrašais,
-    # kuriuose issuer galėjo būti tuščias
+    # Jei senuose įrašuose issuer buvo tuščias,
+    # naudojame company
     if (
         issuer_series
         .str
@@ -417,6 +456,7 @@ def load_issuer_df(
         .all()
         and "company" in df.columns
     ):
+
         issuer_series = (
             df["company"]
             .fillna("")
@@ -425,37 +465,32 @@ def load_issuer_df(
 
     out = pd.DataFrame(
         {
-            "Bendrovė": issuer_series,
+            "Bendrovė":
+                issuer_series,
 
-            "Trumpinys": (
-                df
-                .get(
+            "Trumpinys":
+                df.get(
                     "ticker",
                     pd.Series(dtype=str),
                 )
                 .fillna("")
-                .astype(str)
-            ),
+                .astype(str),
 
-            "ISIN": (
-                df
-                .get(
+            "ISIN":
+                df.get(
                     "isin",
                     pd.Series(dtype=str),
                 )
                 .fillna("")
-                .astype(str)
-            ),
+                .astype(str),
 
-            "Sąrašas/segmentas": (
-                df
-                .get(
+            "Sąrašas/segmentas":
+                df.get(
                     "segment",
                     pd.Series(dtype=str),
                 )
                 .fillna("")
-                .astype(str)
-            ),
+                .astype(str),
         }
     )
 
@@ -469,12 +504,7 @@ def load_issuer_df(
     out = (
         out
         .drop_duplicates(
-            subset=[
-                "Bendrovė",
-                "Trumpinys",
-                "ISIN",
-                "Sąrašas/segmentas",
-            ]
+            subset=["Bendrovė"]
         )
         .reset_index(drop=True)
     )
