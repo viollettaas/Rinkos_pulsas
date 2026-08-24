@@ -113,18 +113,60 @@ section[data-testid="stSidebar"][data-expanded="false"] > div {
 
 section[data-testid="stSidebar"] * { color: #ffffff; }
 
-/* DateInput teksto spalva: kad vedant laikotarpi tekstas nebutu baltas */
-section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
+/*
+Datos pasirinkimo laukai.
+
+Anksciau bendra taisykle
+    section[data-testid="stSidebar"] * { color: #ffffff; }
+datos laukams taip pat priskirdavo balta teksta. Naujesnese Streamlit
+versijose vidine DateInput struktura gali skirtis, todel naudojami ir
+data-testid, ir klases, ir BaseWeb selektoriai.
+*/
+section[data-testid="stSidebar"] [data-testid="stDateInput"] div[data-baseweb="input"],
+section[data-testid="stSidebar"] .stDateInput div[data-baseweb="input"] {
+    background-color: #ffffff !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 12px !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input,
+section[data-testid="stSidebar"] .stDateInput input,
+section[data-testid="stSidebar"] input[type="date"] {
     color: #061b34 !important;
-    background: #ffffff !important;
+    background-color: #ffffff !important;
     caret-color: #061b34 !important;
     -webkit-text-fill-color: #061b34 !important;
+    opacity: 1 !important;
 }
-section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder,
+section[data-testid="stSidebar"] .stDateInput input::placeholder {
     color: #6b7280 !important;
+    -webkit-text-fill-color: #6b7280 !important;
+    opacity: 1 !important;
 }
-section[data-testid="stSidebar"] [data-testid="stDateInput"] svg {
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] button,
+section[data-testid="stSidebar"] [data-testid="stDateInput"] svg,
+section[data-testid="stSidebar"] .stDateInput button,
+section[data-testid="stSidebar"] .stDateInput svg {
     color: #061b34 !important;
+    fill: #061b34 !important;
+}
+
+/* Kalendoriaus langas kuriame pasirenkama konkreti diena. */
+div[data-baseweb="popover"] div[data-baseweb="calendar"],
+div[data-baseweb="popover"] div[data-baseweb="calendar"] * {
+    color: #061b34 !important;
+}
+
+div[data-baseweb="popover"] div[data-baseweb="calendar"] button {
+    -webkit-text-fill-color: #061b34 !important;
+}
+
+div[data-baseweb="popover"] div[data-baseweb="calendar"] button[aria-selected="true"] {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
 }
 
 .sidebar-card {
@@ -1152,24 +1194,3 @@ with tab5:
         height=900,
         scrolling=True,
     )
-/* Datos pasirinkimo laukai */
-section[data-testid="stSidebar"] div[data-testid="stDateInput"] div[data-baseweb="input"] {
-    background-color: #ffffff !important;
-    border: 1px solid #cbd5e1 !important;
-}
-
-section[data-testid="stSidebar"] div[data-testid="stDateInput"] input {
-    color: #0f172a !important;
-    -webkit-text-fill-color: #0f172a !important;
-    caret-color: #0f172a !important;
-    background-color: transparent !important;
-}
-
-section[data-testid="stSidebar"] div[data-testid="stDateInput"] button {
-    color: #0f172a !important;
-}
-
-section[data-testid="stSidebar"] div[data-testid="stDateInput"] svg {
-    fill: #0f172a !important;
-    color: #0f172a !important;
-}
