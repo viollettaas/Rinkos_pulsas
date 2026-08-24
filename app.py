@@ -111,8 +111,6 @@ section[data-testid="stSidebar"][data-expanded="false"] > div {
     left: 0.75rem !important;
 }
 
-section[data-testid="stSidebar"] * { color: #ffffff; }
-
 /*
 Datos pasirinkimo laukai.
 
