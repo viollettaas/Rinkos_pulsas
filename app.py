@@ -1152,3 +1152,24 @@ with tab5:
         height=900,
         scrolling=True,
     )
+/* Datos pasirinkimo laukai */
+section[data-testid="stSidebar"] div[data-testid="stDateInput"] div[data-baseweb="input"] {
+    background-color: #ffffff !important;
+    border: 1px solid #cbd5e1 !important;
+}
+
+section[data-testid="stSidebar"] div[data-testid="stDateInput"] input {
+    color: #0f172a !important;
+    -webkit-text-fill-color: #0f172a !important;
+    caret-color: #0f172a !important;
+    background-color: transparent !important;
+}
+
+section[data-testid="stSidebar"] div[data-testid="stDateInput"] button {
+    color: #0f172a !important;
+}
+
+section[data-testid="stSidebar"] div[data-testid="stDateInput"] svg {
+    fill: #0f172a !important;
+    color: #0f172a !important;
+}
