@@ -129,11 +129,19 @@ section[data-testid="stSidebar"] .stDateInput div[data-baseweb="input"] {
     border-radius: 12px !important;
 }
 
+/* BaseWeb kai kuriose Streamlit versijose datos reiksme ideda ne tiesiai i input. */
+section[data-testid="stSidebar"] [data-testid="stDateInput"] div[data-baseweb="input"] *,
+section[data-testid="stSidebar"] .stDateInput div[data-baseweb="input"] * {
+    color: #061b34 !important;
+    -webkit-text-fill-color: #061b34 !important;
+}
+
 section[data-testid="stSidebar"] [data-testid="stDateInput"] input,
 section[data-testid="stSidebar"] .stDateInput input,
 section[data-testid="stSidebar"] input[type="date"] {
     color: #061b34 !important;
     background-color: #ffffff !important;
+    color-scheme: light !important;
     caret-color: #061b34 !important;
     -webkit-text-fill-color: #061b34 !important;
     opacity: 1 !important;
@@ -144,6 +152,49 @@ section[data-testid="stSidebar"] .stDateInput input::placeholder {
     color: #6b7280 !important;
     -webkit-text-fill-color: #6b7280 !important;
     opacity: 1 !important;
+}
+
+/*
+Chrome / Edge datos lauka skaido i atskirus menesio, dienos ir metu
+segmentus. Bendra sidebar balto teksto taisykle siuos segmentus padarydavo
+nematomus baltame fone, nors datos skirtukai "/" likdavo matomi.
+*/
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-datetime-edit,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-datetime-edit,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-datetime-edit,
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-datetime-edit-fields-wrapper,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-datetime-edit-fields-wrapper,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-datetime-edit-fields-wrapper {
+    color: #061b34 !important;
+    -webkit-text-fill-color: #061b34 !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-datetime-edit-day-field,
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-datetime-edit-month-field,
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-datetime-edit-year-field,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-datetime-edit-day-field,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-datetime-edit-month-field,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-datetime-edit-year-field,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-datetime-edit-day-field,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-datetime-edit-month-field,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-datetime-edit-year-field {
+    color: #061b34 !important;
+    -webkit-text-fill-color: #061b34 !important;
+    opacity: 1 !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-datetime-edit-text,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-datetime-edit-text,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-datetime-edit-text {
+    color: #64748b !important;
+    -webkit-text-fill-color: #64748b !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stDateInput"] input::-webkit-calendar-picker-indicator,
+section[data-testid="stSidebar"] .stDateInput input::-webkit-calendar-picker-indicator,
+section[data-testid="stSidebar"] input[type="date"]::-webkit-calendar-picker-indicator {
+    opacity: 1 !important;
+    filter: none !important;
 }
 
 section[data-testid="stSidebar"] [data-testid="stDateInput"] button,
