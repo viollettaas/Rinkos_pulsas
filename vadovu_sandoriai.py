@@ -2,6 +2,8 @@
 
 import os
 import re
+import tempfile
+import time
 import warnings
 from datetime import date, timedelta
 from io import BytesIO
@@ -80,6 +82,8 @@ def _notify(progress, message: str):
 
 
 def _init_driver(headless: bool = True):
+    download_dir = os.path.join(tempfile.gettempdir(), "rinkos_pulsas_pdf")
+    os.makedirs(download_dir, exist_ok=True)
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -91,6 +95,12 @@ def _init_driver(headless: bool = True):
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors=yes")
     options.set_capability("acceptInsecureCerts", True)
+    options.add_experimental_option("prefs", {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "plugins.always_open_pdf_externally": True,
+    })
     return webdriver.Chrome(options=options)
 
 
@@ -631,8 +641,53 @@ def _download_pdf_bytes(pdf_url: str) -> bytes:
     return content
 
 
-def _extract_pdf_text(pdf_url: str) -> str:
+def _download_pdf_bytes_with_browser(driver, pdf_url: str, crib_url: str = "") -> bytes:
+    """Atsisiunčia PDF per Chrome, kai GlobeNewswire blokuoja requests klientą."""
+    if driver is None or not pdf_url:
+        return b""
+    download_dir = os.path.join(tempfile.gettempdir(), "rinkos_pulsas_pdf")
+    os.makedirs(download_dir, exist_ok=True)
+    started_at = time.time()
+    try:
+        driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": download_dir},
+        )
+        # GlobeNewswire kai kuriems priedams reikalauja, kad PDF užklausa
+        # ateitų iš pranešimo puslapio, o ne iš tiesioginio serverio kliento.
+        if crib_url:
+            try:
+                driver.get(crib_url)
+            except Exception:
+                pass
+        driver.get(pdf_url)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            files = []
+            for filename in os.listdir(download_dir):
+                path = os.path.join(download_dir, filename)
+                if (
+                    not filename.endswith(".crdownload")
+                    and os.path.isfile(path)
+                    and os.path.getmtime(path) >= started_at - 1
+                ):
+                    files.append(path)
+            if files:
+                newest = max(files, key=os.path.getmtime)
+                with open(newest, "rb") as pdf_file:
+                    content = pdf_file.read()
+                if content[:20].lstrip().startswith(b"%PDF"):
+                    return content
+            time.sleep(0.5)
+    except Exception:
+        return b""
+    return b""
+
+
+def _extract_pdf_text(pdf_url: str, driver=None, crib_url: str = "") -> str:
     content = _download_pdf_bytes(pdf_url)
+    if not content:
+        content = _download_pdf_bytes_with_browser(driver, pdf_url, crib_url=crib_url)
     if not content:
         return ""
 
@@ -1086,7 +1141,7 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
         if _manager_pdf_already_saved(pdf_url):
             continue
         try:
-            text = _extract_pdf_text(pdf_url)
+            text = _extract_pdf_text(pdf_url, driver=driver, crib_url=crib_url)
             if not text:
                 row = {
                     "crib_url": crib_url,
@@ -1452,7 +1507,7 @@ def _issuer_hint_from_crib_news(crib_url: str, published_at=None) -> str:
         return ""
 
 
-def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", preferred_pdf_url: str = "", issuer_hint: str = "") -> dict | None:
+def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", preferred_pdf_url: str = "", issuer_hint: str = "", driver=None) -> dict | None:
     """Bando parsinti nurodytą PDF, o jei jis tuščias - ieško geresnės CRIB attachment nuorodos tame pačiame pranešime."""
     candidate_links = []
     if preferred_pdf_url:
@@ -1473,7 +1528,7 @@ def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: s
 
     for pdf_url in _rank_pdf_links(candidate_links):
         try:
-            text = _extract_pdf_text(pdf_url)
+            text = _extract_pdf_text(pdf_url, driver=driver, crib_url=crib_url)
             if not text:
                 continue
             parsed = _parse_manager_transaction_pdf_text(
@@ -1523,6 +1578,12 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
         return stats
 
     stats["bad_found"] = len(bad_df)
+    browser_driver = None
+    try:
+        browser_driver = _init_driver(headless=True)
+    except Exception:
+        # Tiesioginis PDF nuskaitymas vis tiek bus bandomas ir be naršyklės.
+        browser_driver = None
 
     for _, r in bad_df.iterrows():
         current_row = r.to_dict()
@@ -1549,12 +1610,13 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                     crib_category=str(current_row.get("crib_category") or ""),
                     preferred_pdf_url=pdf_url,
                     issuer_hint=issuer_hint,
+                    driver=browser_driver,
                 )
 
             # 2) Jei CRIB alternatyvų nėra, bet turime PDF URL, bandome tiesiogiai.
             if parsed is None and pdf_url:
                 try:
-                    text = _extract_pdf_text(pdf_url)
+                    text = _extract_pdf_text(pdf_url, driver=browser_driver, crib_url=crib_url)
                     if text:
                         parsed = _parse_manager_transaction_pdf_text(
                             text,
@@ -1614,6 +1676,11 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
             except Exception:
                 pass
 
+    if browser_driver is not None:
+        try:
+            browser_driver.quit()
+        except Exception:
+            pass
     return stats
 
 
