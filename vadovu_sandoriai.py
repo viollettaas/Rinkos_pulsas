@@ -142,7 +142,7 @@ def _is_hidden_manager_report_row(row: dict) -> bool:
 
 
 def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Palieka visus DB įrašus, pašalindama tik tikslius jų dublikatus.
+    """Grąžina visas DB eilutes tokias, kokios jos yra.
 
     Nepilnai nuskaitytas PDF yra svarbus vadovų sandorių pranešimas, todėl jo
     negalima slėpti vien dėl ``parse_status``. Statusas ir pastaba rodomi
@@ -155,18 +155,6 @@ def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["issuer", "parse_status", "price_quantity_note", "raw_text"]:
         if col not in df.columns:
             df[col] = ""
-
-    # Papildoma apsauga nuo to paties sandorio dubliavimo, jei jis į DB pateko keliais keliais.
-    dedup_cols = [
-        "pdf_url", "crib_url", "issuer", "person_name", "transaction_date",
-        "isin", "transaction_type", "price", "quantity",
-    ]
-    existing = [c for c in dedup_cols if c in df.columns]
-    if existing:
-        sort_cols = [c for c in ["created_at", "id"] if c in df.columns]
-        if sort_cols:
-            df = df.sort_values(sort_cols, ascending=True)
-        df = df.drop_duplicates(subset=existing, keep="last")
 
     return df.reset_index(drop=True)
 
@@ -1855,7 +1843,9 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["transaction_value"] = df["price"] * df["quantity"]
-    df = _remove_manager_duplicates_for_display(df)
+    # Ataskaita turi atitikti manager_transactions lentelę: net ir panašūs
+    # sandoriai ar „Correction“ pranešimai negali būti slepiami. Dublikatų
+    # šalinimas atliekamas tik naudotojui aiškiai paspaudus DB valymo mygtuką.
     return df
 
 
