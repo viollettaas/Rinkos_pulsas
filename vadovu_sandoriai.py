@@ -939,6 +939,12 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
 # ------------------------------------------------------------
 
 def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> int:
+    """Išsaugo po vieną DB eilutę kiekvienam CRIB PDF priedui.
+
+    ``manager_transactions`` lentelėje privalomi tik CRIB ir PDF URL, todėl
+    nepilnai išparsintas MAR pranešimas nėra priežastis jo prarasti. Tokius
+    įrašus vėliau galima perparsinti pagal ``pdf_url`` / ``raw_text``.
+    """
     if not crib_url:
         return 0
 
@@ -953,26 +959,49 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
         try:
             text = _extract_pdf_text(pdf_url)
             if not text:
-                # Tuščių / ne PDF mirror nuorodų nebeįrašome į DB.
-                continue
-            row = _parse_manager_transaction_pdf_text(
-                text,
-                pdf_url=pdf_url,
-                crib_url=crib_url,
-                published_at=published_at,
-                crib_title=crib_title,
-                crib_category=crib_category,
-            )
-            if not _is_good_parsed_row(row):
-                # Nekuriame naujų tuščių eilučių. Blogus senuosius įrašus tvarko repair funkcija.
-                continue
-            if _manager_transaction_already_saved_by_signature(row):
-                continue
+                row = {
+                    "crib_url": crib_url,
+                    "crib_title": crib_title or "",
+                    "crib_category": crib_category or "",
+                    "published_at": _to_iso_timestamp(published_at),
+                    "pdf_url": pdf_url,
+                    "pdf_name": pdf_url.split("/")[-1].split("?")[0],
+                    "raw_text": "",
+                    "parse_status": "pdf_text_empty",
+                    "price_quantity_note": "PDF priedas rastas, bet nepavyko ištraukti teksto.",
+                }
+            else:
+                row = _parse_manager_transaction_pdf_text(
+                    text,
+                    pdf_url=pdf_url,
+                    crib_url=crib_url,
+                    published_at=published_at,
+                    crib_title=crib_title,
+                    crib_category=crib_category,
+                )
+
+            # Vienas PDF = viena eilutė. Negalima atmesti įrašo vien todėl,
+            # kad PDF forma kitokia ir parseris dar nerado visų MAR laukų.
             if _post_manager_transaction(row):
                 saved += 1
-        except Exception:
-            # Sąmoningai nebeįrašome pdf_parse_error eilučių, nes jos vėliau teršia lentelę.
-            continue
+        except Exception as exc:
+            # PDF nelieka prarastas: įrašą vėliau galima perparsinti per DB.
+            try:
+                error_row = {
+                    "crib_url": crib_url,
+                    "crib_title": crib_title or "",
+                    "crib_category": crib_category or "",
+                    "published_at": _to_iso_timestamp(published_at),
+                    "pdf_url": pdf_url,
+                    "pdf_name": pdf_url.split("/")[-1].split("?")[0],
+                    "raw_text": "",
+                    "parse_status": "pdf_parse_error",
+                    "price_quantity_note": str(exc)[:500],
+                }
+                if _post_manager_transaction(error_row):
+                    saved += 1
+            except Exception:
+                pass
     return saved
 
 
@@ -2418,7 +2447,11 @@ def show_manager_transactions_page():
                 f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
                 f"klaidų {stats.get('manager_transactions_errors', 0)}."
             )
-            st.rerun()
+            if stats.get("error_messages"):
+                st.warning(
+                    "Nepavyko apdoroti kai kurių CRIB pranešimų:\n\n"
+                    + "\n\n".join(stats["error_messages"][:5])
+                )
         except Exception as exc:
             st.error("Nepavyko atnaujinti vadovų sandorių.")
             st.exception(exc)
