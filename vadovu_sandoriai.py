@@ -31,13 +31,13 @@ except Exception:
 
 
 MANAGER_CATEGORY_TOKENS = (
-    "praneÅ¡imai apie vadovÅ³ sandorius",
+    "pranešimai apie vadovų sandorius",
     "pranesimai apie vadovu sandorius",
     "notifications on transactions concluded by managers",
     "managers' transaction",
-    "managersâ€™ transaction",
+    "managers’ transaction",
     "manager transaction",
-    "vadovÅ³ sandori",
+    "vadovų sandori",
     "vadovu sandori",
 )
 
@@ -48,9 +48,9 @@ MANAGER_TRANSACTION_COLUMNS = {
     "parse_status", "price_quantity_note",
 }
 
-# Ä®raÅ¡ai su Å¡iais statusais / pastabomis yra techniniai nesÄ—kmingo PDF
-# nuskaitymo rezultatai. Juos laikome ne ataskaitos duomenimis, todÄ—l
-# Streamlit lentelÄ—je jÅ³ nerodome ir Ä¯ santraukas neÄ¯traukiame.
+# Įrašai su šiais statusais / pastabomis yra techniniai nesėkmingo PDF
+# nuskaitymo rezultatai. Juos laikome ne ataskaitos duomenimis, todėl
+# Streamlit lentelėje jų nerodome ir į santraukas neįtraukiame.
 HIDDEN_MANAGER_PARSE_STATUSES = {
     "pdf_parse_empty_after_retry",
     "pdf_text_empty",
@@ -60,13 +60,13 @@ HIDDEN_MANAGER_PARSE_STATUSES = {
 
 HIDDEN_MANAGER_NOTE_TOKENS = (
     "pakartotinai nepavyko nuskaityti pdf teksto",
-    "db raw_text buvo tuÅ¡Äias",
+    "db raw_text buvo tuščias",
     "db raw_text buvo tuscias",
 )
 
 
 # ------------------------------------------------------------
-# Bendros pagalbinÄ—s funkcijos
+# Bendros pagalbinės funkcijos
 # ------------------------------------------------------------
 
 def _notify(progress, message: str):
@@ -124,7 +124,7 @@ def _is_good_parsed_row(row: dict) -> bool:
 
 
 def _is_hidden_manager_report_row(row: dict) -> bool:
-    """Ar eilutÄ— yra techninis nepavykusio PDF nuskaitymo Ä¯raÅ¡as, kurio ataskaitoje nerodome."""
+    """Ar eilutė yra techninis nepavykusio PDF nuskaitymo įrašas, kurio ataskaitoje nerodome."""
     status = str((row or {}).get("parse_status") or "").strip().lower()
     note = str((row or {}).get("price_quantity_note") or "").strip().lower()
     issuer = str((row or {}).get("issuer") or "").strip()
@@ -134,15 +134,15 @@ def _is_hidden_manager_report_row(row: dict) -> bool:
         return True
     if any(token in note for token in HIDDEN_MANAGER_NOTE_TOKENS):
         return True
-    # TuÅ¡Äias emitentas beveik visada reiÅ¡kia, kad PDF nebuvo sÄ—kmingai iÅ¡parsintas.
-    # Tokios eilutÄ—s gadina santraukas ir atrodo kaip pasikartojimai.
+    # Tuščias emitentas beveik visada reiškia, kad PDF nebuvo sėkmingai išparsintas.
+    # Tokios eilutės gadina santraukas ir atrodo kaip pasikartojimai.
     if not issuer and (not raw_text or status in {"parsed_incomplete", "repaired_partial_fields", ""}):
         return True
     return False
 
 
 def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """PaÅ¡alina techninius / tuÅ¡Äius PDF Ä¯raÅ¡us prieÅ¡ rodant Streamlit ataskaitoje."""
+    """Pašalina techninius / tuščius PDF įrašus prieš rodant Streamlit ataskaitoje."""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -154,7 +154,7 @@ def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
     mask_hidden = df.apply(lambda r: _is_hidden_manager_report_row(r.to_dict()), axis=1)
     df = df[~mask_hidden].copy()
 
-    # Papildoma apsauga nuo to paties sandorio dubliavimo, jei jis Ä¯ DB pateko keliais keliais.
+    # Papildoma apsauga nuo to paties sandorio dubliavimo, jei jis į DB pateko keliais keliais.
     dedup_cols = [
         "pdf_url", "crib_url", "issuer", "person_name", "transaction_date",
         "isin", "transaction_type", "price", "quantity",
@@ -179,7 +179,7 @@ _ISSUER_LOOKUP_CACHE = None
 def _issuer_norm_key(value) -> str:
     """Suvienodintas raktas emitentu palyginimui."""
     s = str(value or "").lower().strip()
-    repl = str.maketrans({"Ä…":"a","Ä":"c","Ä™":"e","Ä—":"e","Ä¯":"i","Å¡":"s","Å³":"u","Å«":"u","Å¾":"z"})
+    repl = str.maketrans({"ą":"a","č":"c","ę":"e","ė":"e","į":"i","š":"s","ų":"u","ū":"u","ž":"z"})
     s = s.translate(repl)
     s = re.sub(r"\b(ab|uab|as|asa|akcine bendrove|uzdaroji akcine bendrove)\b", " ", s)
     s = s.replace(" group", " ").replace(" grupe", " ")
@@ -289,7 +289,7 @@ def _post_manager_transaction(row: dict) -> bool:
             return True
         if resp.status_code == 409:
             return False
-        raise RuntimeError(f"Supabase manager_transactions Ä¯raÅ¡ymo klaida: {resp.status_code} - {resp.text}")
+        raise RuntimeError(f"Supabase manager_transactions įrašymo klaida: {resp.status_code} - {resp.text}")
 
 
 def _update_manager_transaction_by_id(row_id: int, parsed_row: dict) -> bool:
@@ -311,7 +311,7 @@ def _update_manager_transaction_by_id(row_id: int, parsed_row: dict) -> bool:
 
 
 def _is_empty_db_value(value) -> bool:
-    """Ar manager_transactions laukas laikytinas tuÅ¡Äiu."""
+    """Ar manager_transactions laukas laikytinas tuščiu."""
     if value is None:
         return True
     try:
@@ -328,8 +328,8 @@ def _is_empty_db_value(value) -> bool:
 
 
 def _looks_like_valid_isin(value) -> bool:
-    """Tikras ISIN turi prasidÄ—ti valstybÄ—s kodu ir turÄ—ti 12 simboliÅ³.
-    Å is patikrinimas neleidÅ¾ia ISIN lauke palikti tokiÅ³ Å¾odÅ¾iÅ³ kaip VADOVAUJAMAS.
+    """Tikras ISIN turi prasidėti valstybės kodu ir turėti 12 simbolių.
+    Šis patikrinimas neleidžia ISIN lauke palikti tokių žodžių kaip VADOVAUJAMAS.
     """
     if _is_empty_db_value(value):
         return False
@@ -338,7 +338,7 @@ def _looks_like_valid_isin(value) -> bool:
 
 
 def _is_bad_existing_value(col: str, value) -> bool:
-    """Ar DB reikÅ¡mÄ— nÄ—ra tuÅ¡Äia, bet aiÅ¡kiai blogai nuskaityta ir jÄ… reikia perraÅ¡yti."""
+    """Ar DB reikšmė nėra tuščia, bet aiškiai blogai nuskaityta ir ją reikia perrašyti."""
     if _is_empty_db_value(value):
         return True
     s = str(value).strip()
@@ -348,7 +348,7 @@ def _is_bad_existing_value(col: str, value) -> bool:
         return not _looks_like_valid_isin(s)
 
     if col in {"issuer", "person_name"}:
-        bad_tokens = ["/ vardas", "pavardÄ—", "pavarde", "vadovaujamas", "pareigas einanÄio"]
+        bad_tokens = ["/ vardas", "pavardė", "pavarde", "vadovaujamas", "pareigas einančio"]
         return any(t in s_l for t in bad_tokens)
 
     if col == "instrument":
@@ -358,7 +358,7 @@ def _is_bad_existing_value(col: str, value) -> bool:
         return len(s) > 220 or "kaina(-os)" in s_l or "apimtis" in s_l
 
     if col == "venue":
-        return len(s) > 260 or "vadovaujamas pareigas" in s_l or "pasiraÅ¡" in s_l or "pasiras" in s_l
+        return len(s) > 260 or "vadovaujamas pareigas" in s_l or "pasiraš" in s_l or "pasiras" in s_l
 
     return False
 
@@ -369,9 +369,9 @@ def _has_useful_value(value) -> bool:
 
 def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dict, parsed_row: dict) -> bool:
     """
-    Atnaujina tuÅ¡Äius laukus pagal id. Taip pat perraÅ¡o kelias aiÅ¡kiai blogas
-    senas reikÅ¡mes, pvz. ISIN='VADOVAUJAMAS' arba asmenÄ¯ su '/ vardas'.
-    GerÅ³ reikÅ¡miÅ³ tuÅ¡Äiomis neperraÅ¡ome.
+    Atnaujina tuščius laukus pagal id. Taip pat perrašo kelias aiškiai blogas
+    senas reikšmes, pvz. ISIN='VADOVAUJAMAS' arba asmenį su '/ vardas'.
+    Gerų reikšmių tuščiomis neperrašome.
     """
     update = {}
 
@@ -387,7 +387,7 @@ def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dic
         if col == "issuer" and _has_useful_value(new_val):
             new_val = _canonical_issuer_name(new_val)
         if (_is_empty_db_value(old_val) or _is_bad_existing_value(col, old_val)) and _has_useful_value(new_val):
-            # NeÄ¯raÅ¡ome akivaizdÅ¾iai blogos naujos reikÅ¡mÄ—s.
+            # Neįrašome akivaizdžiai blogos naujos reikšmės.
             if not _is_bad_existing_value(col, new_val):
                 update[col] = new_val
 
@@ -396,13 +396,13 @@ def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dic
     if _has_useful_value(old_issuer) and canonical_old_issuer and canonical_old_issuer != str(old_issuer).strip():
         update["issuer"] = canonical_old_issuer
 
-    # raw_text atnaujiname, jei DB tuÅ¡Äias arba naujas tekstas ilgesnis.
+    # raw_text atnaujiname, jei DB tuščias arba naujas tekstas ilgesnis.
     new_raw = str(parsed_row.get("raw_text") or "")
     old_raw = str(current_row.get("raw_text") or "")
     if new_raw and (not old_raw.strip() or len(new_raw) > len(old_raw)):
         update["raw_text"] = new_raw
 
-    # pdf_url keiÄiame tik jei senas tuÅ¡Äias.
+    # pdf_url keičiame tik jei senas tuščias.
     if _is_empty_db_value(current_row.get("pdf_url")) and _has_useful_value(parsed_row.get("pdf_url")):
         update["pdf_url"] = parsed_row.get("pdf_url")
 
@@ -458,11 +458,11 @@ def _delete_manager_transactions_for_crib_url(crib_url: str) -> int:
 
 
 def delete_hidden_manager_report_rows(limit: int = 1000) -> dict:
-    """IÅ¡ DB paÅ¡alina techninius nepavykusio PDF nuskaitymo Ä¯raÅ¡us.
+    """Iš DB pašalina techninius nepavykusio PDF nuskaitymo įrašus.
 
-    Naudoti nebÅ«tina, nes ataskaita juos jau filtruoja, bet mygtukas praverÄia
-    norint susitvarkyti senus Ä¯raÅ¡us, kuriuose yra pastaba
-    â€žPakartotinai nepavyko nuskaityti PDF teksto...â€œ.
+    Naudoti nebūtina, nes ataskaita juos jau filtruoja, bet mygtukas praverčia
+    norint susitvarkyti senus įrašus, kuriuose yra pastaba
+    „Pakartotinai nepavyko nuskaityti PDF teksto...“.
     """
     stats = {"found": 0, "deleted": 0, "errors": 0}
     try:
@@ -522,10 +522,10 @@ def _has_good_transaction_for_crib_url(crib_url: str) -> bool:
 # ------------------------------------------------------------
 
 def _rank_pdf_links(links: list[str]) -> list[str]:
-    """CRIB puslapyje daÅ¾nai bÅ«na dvi nuorodos Ä¯ tÄ… patÄ¯ PDF:
+    """CRIB puslapyje dažnai būna dvi nuorodos į tą patį PDF:
     1) https://www.crib.lt/cns-web/oam/viewAttachment.action?...  -- patikima;
-    2) https://ml-eu.globenewswire.com/Resource/Download/...       -- daÅ¾nai grÄ…Å¾ina tuÅ¡ÄiÄ… / ne PDF turinÄ¯.
-    TodÄ—l pirmiausia imame CRIB attachment nuorodas, o globenewswire paliekame tik atsargai.
+    2) https://ml-eu.globenewswire.com/Resource/Download/...       -- dažnai grąžina tuščią / ne PDF turinį.
+    Todėl pirmiausia imame CRIB attachment nuorodas, o globenewswire paliekame tik atsargai.
     """
     seen = set()
     clean = []
@@ -619,7 +619,7 @@ def _download_pdf_bytes(pdf_url: str) -> bytes:
     resp = requests.get(pdf_url, headers=headers, verify=False, timeout=45, allow_redirects=True)
     resp.raise_for_status()
     content = resp.content or b""
-    # Kai kuriÅ³ ml-eu.globenewswire nuorodÅ³ turinys nÄ—ra PDF arba yra tuÅ¡Äias.
+    # Kai kurių ml-eu.globenewswire nuorodų turinys nėra PDF arba yra tuščias.
     if len(content) < 100 or not content[:20].lstrip().startswith(b"%PDF"):
         return b""
     return content
@@ -679,7 +679,7 @@ def _text_after_label(text: str, labels, max_len: int = 160) -> str:
     if not text:
         return ""
     for label in labels:
-        pattern = rf"(?:^|\n|\s){label}\s*[:\-]?\s*(.+?)(?=\n[a-z]\)|\n\d\.|\n[A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][^\n]{{0,80}}\s*[:\-]?|$)"
+        pattern = rf"(?:^|\n|\s){label}\s*[:\-]?\s*(.+?)(?=\n[a-z]\)|\n\d\.|\n[A-ZĄČĘĖĮŠŲŪŽ][^\n]{{0,80}}\s*[:\-]?|$)"
         m = re.search(pattern, text, flags=re.I | re.S)
         if m:
             value = _collapse_ws(m.group(1))
@@ -708,11 +708,11 @@ def _clean_person_name(value: str) -> str:
     if not v:
         return ""
     v = re.sub(r"^[/\\]?\s*vardas\s*,?\s*", "", v, flags=re.I)
-    v = re.sub(r"\bpavard[Ä—e]\b", "", v, flags=re.I)
+    v = re.sub(r"\bpavard[ėe]\b", "", v, flags=re.I)
     v = re.sub(r"\bvardas\b", "", v, flags=re.I)
     v = _collapse_ws(v.strip(" ,;:-"))
-    # Jei liko daug teksto, paimame pirmÄ… dviejÅ³ Å¾odÅ¾iÅ³ asmens vardÄ….
-    m = re.search(r"([A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][a-zÄ…ÄÄ™Ä—Ä¯Å¡Å³Å«Å¾]+\s+[A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][a-zÄ…ÄÄ™Ä—Ä¯Å¡Å³Å«Å¾]+(?:-[A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][a-zÄ…ÄÄ™Ä—Ä¯Å¡Å³Å«Å¾]+)?)", v)
+    # Jei liko daug teksto, paimame pirmą dviejų žodžių asmens vardą.
+    m = re.search(r"([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+\s+[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+(?:-[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)?)", v)
     if m:
         return _collapse_ws(m.group(1))
     return v[:140]
@@ -731,10 +731,10 @@ def _extract_person_fallback(text: str) -> str:
         return ""
     patterns = [
         r"1\..*?a\)\s*Pavadinimas\s+(.+?)\s+2\.",
-        r"(?:Vadovaujamas pareigas einanÄio asmens|Vadovo|Asmens)\s+(?:vardas ir pavardÄ—|vardas,?\s*pavardÄ—)\s+(.+?)(?:\n|$)",
+        r"(?:Vadovaujamas pareigas einančio asmens|Vadovo|Asmens)\s+(?:vardas ir pavardė|vardas,?\s*pavardė)\s+(.+?)(?:\n|$)",
         r"(?:Name of the person|Person name)\s+(.+?)(?:\n|$)",
-        r"([A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][a-zÄ…ÄÄ™Ä—Ä¯Å¡Å³Å«Å¾]+\s+[A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][a-zÄ…ÄÄ™Ä—Ä¯Å¡Å³Å«Å¾]+(?:-[A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][a-zÄ…ÄÄ™Ä—Ä¯Å¡Å³Å«Å¾]+)?),\s*(?:AB|AkcinÄ— bendrovÄ—|UAB|AS|A/S)",
-        r"(Darius\s+Å ulnis|ArtÅ«ras\s+Å ilinis|Andrius\s+PranckeviÄius|Regina\s+KvaraciejienÄ—|Rokas\s+Kvaraciejus|EglÄ—\s+KvaraciejÅ«tÄ—-IvanauskienÄ—)",
+        r"([A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+\s+[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+(?:-[A-ZĄČĘĖĮŠŲŪŽ][a-ząčęėįšųūž]+)?),\s*(?:AB|Akcinė bendrovė|UAB|AS|A/S)",
+        r"(Darius\s+Šulnis|Artūras\s+Šilinis|Andrius\s+Pranckevičius|Regina\s+Kvaraciejienė|Rokas\s+Kvaraciejus|Eglė\s+Kvaraciejūtė-Ivanauskienė)",
     ]
     for pat in patterns:
         m = re.search(pat, text, flags=re.I | re.S)
@@ -750,11 +750,11 @@ def _extract_issuer_fallback(text: str, role: str = "", venue: str = "", crib_ti
     patterns = [
         r"3\..*?a\)\s*Pavadinimas\s+(.+?)\s+b\)\s*LEI",
         r"(?:Emitento pavadinimas|Issuer name|Name of the issuer)\s+(.+?)(?:\n|LEI|$)",
-        r"(AkcinÄ—\s+bendrovÄ—\s+[â€ž\"A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][^\n,;]{2,80})",
-        r"(AB\s+[â€ž\"A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][^\n,;]{2,80})\s+(?:vadovas|valdybos|stebÄ—tojÅ³|stebetojÅ³)",
-        r",\s*(AB\s+[â€ž\"A-ZÄ„ÄŒÄ˜Ä–Ä®Å Å²ÅªÅ½][^,;\n]{2,80})\s+vadov",
+        r"(Akcinė\s+bendrovė\s+[„\"A-ZĄČĘĖĮŠŲŪŽ][^\n,;]{2,80})",
+        r"(AB\s+[„\"A-ZĄČĘĖĮŠŲŪŽ][^\n,;]{2,80})\s+(?:vadovas|valdybos|stebėtojų|stebetojų)",
+        r",\s*(AB\s+[„\"A-ZĄČĘĖĮŠŲŪŽ][^,;\n]{2,80})\s+vadov",
         r"(AB\s+Akola\s+group)",
-        r"(AB\s+â€žInvalda\s+INVLâ€œ)",
+        r"(AB\s+„Invalda\s+INVL“)",
     ]
     for pat in patterns:
         m = re.search(pat, combined, flags=re.I | re.S)
@@ -767,8 +767,8 @@ def _extract_issuer_fallback(text: str, role: str = "", venue: str = "", crib_ti
 
 def _clean_instrument(value: str) -> str:
     v = _collapse_ws(value)
-    v = re.sub(r"FinansinÄ—s priemonÄ—s", "", v, flags=re.I)
-    v = re.sub(r"apraÅ¡ymas,?\s*priemonÄ—s\s*rÅ«Å¡is", "", v, flags=re.I)
+    v = re.sub(r"Finansinės priemonės", "", v, flags=re.I)
+    v = re.sub(r"aprašymas,?\s*priemonės\s*rūšis", "", v, flags=re.I)
     v = re.sub(r"Identifikavimo\s+kodas", "", v, flags=re.I)
     v = re.sub(r"ISIN\s*(?:kodas)?\s*[:\-]?\s*(?:LT|LV|EE)[A-Z0-9]{10}", "", v, flags=re.I)
     v = re.sub(r"Kaina\(-?os\)?.*$", "", v, flags=re.I | re.S)
@@ -776,11 +776,11 @@ def _clean_instrument(value: str) -> str:
 
 
 def _extract_isin(text: str) -> str:
-    """GrieÅ¾tas ISIN iÅ¡traukimas.
+    """Griežtas ISIN ištraukimas.
 
-    AnkstesnÄ— logika su re.I leisdavo paimti 12 raidÅ¾iÅ³ Å¾odÅ¾ius, pvz.
-    VADOVAUJAMAS. Dabar pirmiausia ieÅ¡kome tik po aiÅ¡kaus ISIN labelio,
-    o atsarginiu atveju leidÅ¾iame tik Baltijos ISIN prefiksus LT/LV/EE.
+    Ankstesnė logika su re.I leisdavo paimti 12 raidžių žodžius, pvz.
+    VADOVAUJAMAS. Dabar pirmiausia ieškome tik po aiškaus ISIN labelio,
+    o atsarginiu atveju leidžiame tik Baltijos ISIN prefiksus LT/LV/EE.
     """
     if not text:
         return ""
@@ -808,16 +808,16 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     role = _regex_value(text, r"Pareigos\s*/\s*statusas\s+(.+?)\s+b\)\s*Pirminis")
     issuer = _regex_value(text, r"3\..*?a\)\s*Pavadinimas\s+(.+?)\s+b\)\s*LEI")
     lei = _regex_value(text, r"b\)\s*LEI\s+([A-Z0-9]{18,20})")
-    transaction_type = _regex_value(text, r"b\)\s*Sandorio pobÅ«dis\s+(.+?)\s+c\)\s*Kaina")
+    transaction_type = _regex_value(text, r"b\)\s*Sandorio pobūdis\s+(.+?)\s+c\)\s*Kaina")
     venue = _regex_value(text, r"f\)\s*Sandorio vieta\s+(.+?)\s*$")
     transaction_date = _regex_value(text, r"e\)\s*Sandorio data\s+(\d{4}[-.]\d{2}[-.]\d{2})") or _extract_date_from_text(text)
 
     # Alternatyvios formos, kur laukai vadinasi kitaip.
     if not person:
         person = _text_after_label(text, [
-            r"Vadovaujamas pareigas einanÄio asmens vardas ir pavardÄ—",
-            r"Vadovo vardas ir pavardÄ—",
-            r"Asmens vardas ir pavardÄ—",
+            r"Vadovaujamas pareigas einančio asmens vardas ir pavardė",
+            r"Vadovo vardas ir pavardė",
+            r"Asmens vardas ir pavardė",
             r"Name of the person",
             r"Person name",
         ], max_len=180)
@@ -826,7 +826,7 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     if not role:
         role = _text_after_label(text, [
             r"Pareigos / statusas",
-            r"Vadovaujamas pareigas einanÄio asmens pareigos",
+            r"Vadovaujamas pareigas einančio asmens pareigos",
             r"Pareigos",
             r"Statusas",
             r"Position",
@@ -845,8 +845,8 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
 
     if not transaction_type:
         transaction_type = _text_after_label(text, [
-            r"Sandorio pobÅ«dis",
-            r"Sandorio rÅ«Å¡is",
+            r"Sandorio pobūdis",
+            r"Sandorio rūšis",
             r"Nature of the transaction",
             r"Transaction type",
         ], max_len=220)
@@ -860,17 +860,17 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
             r"Trading venue",
             r"Venue",
         ], max_len=220)
-    venue = _collapse_ws(re.sub(r"(?:Pagal|Under the power|Vadovaujamas pareigas|pasiraÅ¡).*", "", venue or "", flags=re.I | re.S))
+    venue = _collapse_ws(re.sub(r"(?:Pagal|Under the power|Vadovaujamas pareigas|pasiraš).*", "", venue or "", flags=re.I | re.S))
 
     isin = _extract_isin(text)
     if isin and not _looks_like_valid_isin(isin):
         isin = ""
 
-    instrument_block = _regex_value(text, r"a\)\s*FinansinÄ—s priemonÄ—s\s+(.+?)\s+b\)\s*Sandorio pobÅ«dis")
+    instrument_block = _regex_value(text, r"a\)\s*Finansinės priemonės\s+(.+?)\s+b\)\s*Sandorio pobūdis")
     if not instrument_block:
         instrument_block = _text_after_label(text, [
-            r"FinansinÄ—s priemonÄ—s apraÅ¡ymas.*?Identifikavimo kodas",
-            r"FinansinÄ— priemonÄ—",
+            r"Finansinės priemonės aprašymas.*?Identifikavimo kodas",
+            r"Finansinė priemonė",
             r"Financial instrument",
         ], max_len=260)
     instrument = _clean_instrument(instrument_block)
@@ -879,20 +879,20 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     quantity = None
 
     # LT MAR forma: Kaina Kiekis / 1,66 EUR 78 718
-    pq = re.search(r"Kaina\s+Kiekis\s+([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|â‚¬)?\s+([\d\s]+)", text, flags=re.I)
+    pq = re.search(r"Kaina\s+Kiekis\s+([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|€)?\s+([\d\s]+)", text, flags=re.I)
     if not pq:
         # Kita forma: Kaina(-os) Apimtis / 0,00 EUR 2 340 249
-        pq = re.search(r"Kaina\(-?os\)?\s+Apimtis\s+([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|â‚¬)?\s+([\d\s]+)", text, flags=re.I)
+        pq = re.search(r"Kaina\(-?os\)?\s+Apimtis\s+([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|€)?\s+([\d\s]+)", text, flags=re.I)
     if pq:
         price = _parse_number(pq.group(1))
         quantity = _parse_number(pq.group(2), as_int=True)
 
     if quantity is None:
-        q = re.search(r"(?:AkcijÅ³\s+kiekis|apibendrinta\s+apimtis)\s*[:\-]?\s*([\d\s]+)", text, flags=re.I)
+        q = re.search(r"(?:Akcijų\s+kiekis|apibendrinta\s+apimtis)\s*[:\-]?\s*([\d\s]+)", text, flags=re.I)
         if q:
             quantity = _parse_number(q.group(1), as_int=True)
     if price is None:
-        pr = re.search(r"(?:Vienos\s+akcijos\s+kaina|kaina)\s*[:\-]?\s*([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|â‚¬)", text, flags=re.I)
+        pr = re.search(r"(?:Vienos\s+akcijos\s+kaina|kaina)\s*[:\-]?\s*([\d\s]+(?:[,.]\d+)?)\s*(?:EUR|€)", text, flags=re.I)
         if pr:
             price = _parse_number(pr.group(1))
 
@@ -928,14 +928,14 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
         "raw_text": text[:12000] if text else "",
     }
 
-    # Jei nÄ—ra kainos/kiekio dÄ—l paveldÄ—jimo ar Ä¯keitimo, bet pagrindiniai laukai yra, nelaikome tuÅ¡Äiu parseriu.
+    # Jei nėra kainos/kiekio dėl paveldėjimo ar įkeitimo, bet pagrindiniai laukai yra, nelaikome tuščiu parseriu.
     if status == "parsed_mar_form" and not _is_good_parsed_row(row):
         row["parse_status"] = "parsed_incomplete"
     return row
 
 
 # ------------------------------------------------------------
-# NaujÅ³ vadovÅ³ sandoriÅ³ Ä¯raÅ¡ymas iÅ¡ market_news
+# Naujų vadovų sandorių įrašymas iš market_news
 # ------------------------------------------------------------
 
 def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> int:
@@ -953,7 +953,7 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
         try:
             text = _extract_pdf_text(pdf_url)
             if not text:
-                # TuÅ¡ÄiÅ³ / ne PDF mirror nuorodÅ³ nebeÄ¯raÅ¡ome Ä¯ DB.
+                # Tuščių / ne PDF mirror nuorodų nebeįrašome į DB.
                 continue
             row = _parse_manager_transaction_pdf_text(
                 text,
@@ -964,14 +964,14 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
                 crib_category=crib_category,
             )
             if not _is_good_parsed_row(row):
-                # Nekuriame naujÅ³ tuÅ¡ÄiÅ³ eiluÄiÅ³. Blogus senuosius Ä¯raÅ¡us tvarko repair funkcija.
+                # Nekuriame naujų tuščių eilučių. Blogus senuosius įrašus tvarko repair funkcija.
                 continue
             if _manager_transaction_already_saved_by_signature(row):
                 continue
             if _post_manager_transaction(row):
                 saved += 1
         except Exception:
-            # SÄ…moningai nebeÄ¯raÅ¡ome pdf_parse_error eiluÄiÅ³, nes jos vÄ—liau terÅ¡ia lentelÄ™.
+            # Sąmoningai nebeįrašome pdf_parse_error eilučių, nes jos vėliau teršia lentelę.
             continue
     return saved
 
@@ -982,13 +982,13 @@ def _is_manager_notice(row) -> bool:
         str(row.get("title", "") or ""),
         str(row.get("content", "") or "")[:500],
     ]).lower()
-    # CRIB angliÅ¡koje versijoje kategorija dabar rodoma kaip
-    # â€žManagersâ€™ transactionâ€œ (su lenkta apostrofa), o ne ankstesniu ilgu
-    # pavadinimu â€žNotifications on transactions concluded by managersâ€œ.
-    # Abi formos turi bÅ«ti atpaÅ¾Ä¯stamos.
+    # CRIB angliškoje versijoje kategorija dabar rodoma kaip
+    # „Managers’ transaction“ (su lenkta apostrofa), o ne ankstesniu ilgu
+    # pavadinimu „Notifications on transactions concluded by managers“.
+    # Abi formos turi būti atpažįstamos.
     return (
         any(token in text for token in MANAGER_CATEGORY_TOKENS)
-        or bool(re.search(r"\bmanagers?['â€™]?\s+transactions?\b", text, flags=re.I))
+        or bool(re.search(r"\bmanagers?['’]?\s+transactions?\b", text, flags=re.I))
     )
 
 
@@ -1018,11 +1018,11 @@ def _load_recent_manager_crib_notices(days_back: int = 45) -> pd.DataFrame:
 
 
 def _load_manager_crib_notices_directly(driver, days_back: int = 45, max_scrolls: int = 8) -> pd.DataFrame:
-    """Nuskaito vadovÅ³ sandoriÅ³ praneÅ¡imus tiesiai iÅ¡ CRIB naujienÅ³ sÄ…raÅ¡o.
+    """Nuskaito vadovų sandorių pranešimus tiesiai iš CRIB naujienų sąrašo.
 
     Tai yra atsarginis ir nepriklausomas kelias nuo ``market_news``: naujas
-    CRIB praneÅ¡imas gali bÅ«ti Ä¯raÅ¡omas Ä¯ ``manager_transactions`` tÄ… paÄiÄ…
-    dienÄ…, net jei bendras naujienÅ³ surinkÄ—jas jo dar neperkÄ—lÄ— Ä¯ Supabase.
+    CRIB pranešimas gali būti įrašomas į ``manager_transactions`` tą pačią
+    dieną, net jei bendras naujienų surinkėjas jo dar neperkėlė į Supabase.
     """
     columns = ["url", "published_at", "title", "category", "content", "company"]
     start = pd.Timestamp(date.today() - timedelta(days=days_back))
@@ -1035,9 +1035,9 @@ def _load_manager_crib_notices_directly(driver, days_back: int = 45, max_scrolls
         except Exception:
             pass
 
-        # CRIB Ä¯kelia ankstesnius praneÅ¡imus slenkant sÄ…raÅ¡Ä… Å¾emyn.
-        # Trumpas ciklas pakanka Ä¯prastam 45â€“180 d. papildymui ir neapkrauna
-        # svetainÄ—s viena ilga uÅ¾klausa.
+        # CRIB įkelia ankstesnius pranešimus slenkant sąrašą žemyn.
+        # Trumpas ciklas pakanka įprastam 45–180 d. papildymui ir neapkrauna
+        # svetainės viena ilga užklausa.
         previous_height = 0
         for _ in range(max_scrolls):
             height = int(driver.execute_script("return document.body.scrollHeight") or 0)
@@ -1102,10 +1102,10 @@ def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messag
 
     driver = _init_driver(headless=headless)
     try:
-        # 1) Jau sukaupti bendrojo naujienÅ³ srauto Ä¯raÅ¡ai.
+        # 1) Jau sukaupti bendrojo naujienų srauto įrašai.
         cached_notices = _load_recent_manager_crib_notices(days_back=days_back)
-        # 2) Tiesioginis CRIB patikrinimas â€” padengia naujienas, kuriÅ³ dar
-        # nÄ—ra market_news lentelÄ—je.
+        # 2) Tiesioginis CRIB patikrinimas — padengia naujienas, kurių dar
+        # nėra market_news lentelėje.
         direct_notices = _load_manager_crib_notices_directly(driver, days_back=days_back)
         stats["manager_messages_found_directly"] = len(direct_notices)
 
@@ -1137,7 +1137,7 @@ def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messag
                 published_at = None
 
             stats["manager_messages_processed"] += 1
-            _notify(progress, f"Tikrinamas vadovÅ³ sandoriÅ³ CRIB praneÅ¡imas: {url}")
+            _notify(progress, f"Tikrinamas vadovų sandorių CRIB pranešimas: {url}")
 
             try:
                 saved = save_manager_transactions_from_crib_selenium(
@@ -1150,7 +1150,7 @@ def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messag
                 stats["manager_transactions_saved"] += int(saved or 0)
             except Exception as exc:
                 stats["manager_transactions_errors"] += 1
-                _notify(progress, f"VadovÅ³ sandoriÅ³ PDF klaida: {exc}")
+                _notify(progress, f"Vadovų sandorių PDF klaida: {exc}")
 
     finally:
         try:
@@ -1162,7 +1162,7 @@ def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messag
 
 
 # ------------------------------------------------------------
-# Blogai nuskaitytÅ³ PDF taisymas
+# Blogai nuskaitytų PDF taisymas
 # ------------------------------------------------------------
 
 def _load_bad_manager_transactions(limit: int = 200) -> pd.DataFrame:
@@ -1209,7 +1209,7 @@ def _load_bad_manager_transactions(limit: int = 200) -> pd.DataFrame:
 
 
 def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", preferred_pdf_url: str = "") -> dict | None:
-    """Bando parsinti nurodytÄ… PDF, o jei jis tuÅ¡Äias - ieÅ¡ko geresnÄ—s CRIB attachment nuorodos tame paÄiame praneÅ¡ime."""
+    """Bando parsinti nurodytą PDF, o jei jis tuščias - ieško geresnės CRIB attachment nuorodos tame pačiame pranešime."""
     candidate_links = []
     if preferred_pdf_url:
         candidate_links.append(preferred_pdf_url)
@@ -1249,16 +1249,16 @@ def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: s
 
 def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
     """
-    Pakartotinai perparsina blogai / tuÅ¡Äiai nuskaitytus manager_transactions Ä¯raÅ¡us
-    ir pagal id uÅ¾pildo tuÅ¡Äius / aiÅ¡kiai blogus laukus.
+    Pakartotinai perparsina blogai / tuščiai nuskaitytus manager_transactions įrašus
+    ir pagal id užpildo tuščius / aiškiai blogus laukus.
 
-    Papildomai visada suvienodina issuer pagal market_issuers lentelÄ™, net jeigu
-    pats issuer laukas nÄ—ra tuÅ¡Äias.
+    Papildomai visada suvienodina issuer pagal market_issuers lentelę, net jeigu
+    pats issuer laukas nėra tuščias.
 
-    Nieko netrina ir nekuria naujÅ³ dublikatÅ³. Jei konkretaus PDF teksto nepavyksta
+    Nieko netrina ir nekuria naujų dublikatų. Jei konkretaus PDF teksto nepavyksta
     paimti, bandoma naudoti:
-    1) esamÄ… raw_text iÅ¡ DB;
-    2) kitÄ… PDF / attachment nuorodÄ… iÅ¡ to paties crib_url.
+    1) esamą raw_text iš DB;
+    2) kitą PDF / attachment nuorodą iš to paties crib_url.
     """
     stats = {
         "bad_found": 0,
@@ -1290,7 +1290,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
         try:
             parsed = None
 
-            # 1) Pirmiausia bandome per esamÄ… PDF URL ir, jei reikia, alternatyvias CRIB PDF nuorodas.
+            # 1) Pirmiausia bandome per esamą PDF URL ir, jei reikia, alternatyvias CRIB PDF nuorodas.
             if crib_url:
                 parsed = _try_parse_best_pdf_for_crib(
                     crib_url=crib_url,
@@ -1300,7 +1300,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                     preferred_pdf_url=pdf_url,
                 )
 
-            # 2) Jei CRIB alternatyvÅ³ nÄ—ra, bet turime PDF URL, bandome tiesiogiai.
+            # 2) Jei CRIB alternatyvų nėra, bet turime PDF URL, bandome tiesiogiai.
             if parsed is None and pdf_url:
                 try:
                     text = _extract_pdf_text(pdf_url)
@@ -1316,7 +1316,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                 except Exception:
                     parsed = None
 
-            # 3) Jei DB jau turi raw_text, bet seni struktÅ«riniai laukai tuÅ¡ti, perparsiname raw_text.
+            # 3) Jei DB jau turi raw_text, bet seni struktūriniai laukai tušti, perparsiname raw_text.
             if parsed is None and str(current_row.get("raw_text") or "").strip():
                 parsed = _parse_manager_transaction_pdf_text(
                     str(current_row.get("raw_text") or ""),
@@ -1330,7 +1330,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
             if parsed is None:
                 _update_manager_transaction_by_id(row_id, {
                     "parse_status": "pdf_parse_empty_after_retry",
-                    "price_quantity_note": "Pakartotinai nepavyko nuskaityti PDF teksto ir DB raw_text buvo tuÅ¡Äias.",
+                    "price_quantity_note": "Pakartotinai nepavyko nuskaityti PDF teksto ir DB raw_text buvo tuščias.",
                 })
                 stats["failed"] += 1
                 continue
@@ -1342,7 +1342,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                 stats["unchanged"] += 1
             else:
                 merged = dict(current_row)
-                # simuliuojame merge pagal tuÅ¡ÄiÅ³ laukÅ³ taisyklÄ™
+                # simuliuojame merge pagal tuščių laukų taisyklę
                 for k, v in parsed.items():
                     if k in MANAGER_TRANSACTION_COLUMNS and _is_empty_db_value(merged.get(k)) and _has_useful_value(v):
                         merged[k] = v
@@ -1411,7 +1411,7 @@ def recalc_latest_manager_notice(headless: bool = True, progress=None) -> dict:
 
 
 # ------------------------------------------------------------
-# LentelÄ—s paruoÅ¡imas
+# Lentelės paruošimas
 # ------------------------------------------------------------
 
 def _load_manager_transactions_df_fallback(start_date, end_date) -> pd.DataFrame:
@@ -1427,7 +1427,7 @@ def _load_manager_transactions_df_fallback(start_date, end_date) -> pd.DataFrame
             data = response.json() or []
         return pd.DataFrame(data)
     except Exception as exc:
-        st.error(f"Nepavyko nuskaityti manager_transactions lentelÄ—s: {exc}")
+        st.error(f"Nepavyko nuskaityti manager_transactions lentelės: {exc}")
         return pd.DataFrame()
 
 
@@ -1438,7 +1438,7 @@ def load_manager_transactions_from_db(start_date, end_date) -> pd.DataFrame:
 
 
 def _infer_issuer_from_news_text(title: str = "", content: str = "") -> str:
-    """Bando nustatyti emitentÄ… iÅ¡ CRIB antraÅ¡tÄ—s / turinio, jei market_news company tuÅ¡Äias."""
+    """Bando nustatyti emitentą iš CRIB antraštės / turinio, jei market_news company tuščias."""
     text = f"{title or ''} {content or ''}"
     key_text = _issuer_norm_key(text)
     if not key_text:
@@ -1475,8 +1475,8 @@ def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
 
     df["issuer"] = df["company"].fillna("").astype(str).str.strip().apply(_canonical_issuer_name)
 
-    # Jei Supabase market_news.company tuÅ¡Äias arba nesutampa su market_issuers,
-    # emitentÄ… bandome iÅ¡traukti iÅ¡ CRIB antraÅ¡tÄ—s / turinio pagal market_issuers Å¾odynÄ….
+    # Jei Supabase market_news.company tuščias arba nesutampa su market_issuers,
+    # emitentą bandome ištraukti iš CRIB antraštės / turinio pagal market_issuers žodyną.
     missing_issuer = df["issuer"].fillna("").astype(str).str.strip().eq("")
     if missing_issuer.any():
         df.loc[missing_issuer, "issuer"] = df.loc[missing_issuer].apply(
@@ -1492,7 +1492,7 @@ def load_crib_news_df(start_date, end_date) -> pd.DataFrame:
 
 ANNUAL_PATTERNS = [
     r"\bmetin",
-    r"\bmetÅ³\s+ataskait",
+    r"\bmetų\s+ataskait",
     r"\bmetines?\s+finansin",
     r"\baudituot",
     r"\baudited\b",
@@ -1500,9 +1500,9 @@ ANNUAL_PATTERNS = [
 ]
 
 HALF_YEAR_PATTERNS = [
-    r"\b6\s*m[Ä—e]n",
-    r"\b6\s*m[Ä—e]nes",
-    r"\bÅ¡eÅ¡iÅ³\s+m[Ä—e]nesiÅ³\b",
+    r"\b6\s*m[ėe]n",
+    r"\b6\s*m[ėe]nes",
+    r"\bšešių\s+m[ėe]nesių\b",
     r"\bsesiu\s+menesiu\b",
     r"\bpusme",
     r"\bi\s+pusme",
@@ -1517,20 +1517,20 @@ HALF_YEAR_PATTERNS = [
 ]
 
 QUARTER_REPORT_PATTERNS = [
-    r"\b3\s*m[Ä—e]n",
-    r"\b3\s*m[Ä—e]nes",
-    r"\btrijÅ³\s+m[Ä—e]nesiÅ³\b",
+    r"\b3\s*m[ėe]n",
+    r"\b3\s*m[ėe]nes",
+    r"\btrijų\s+m[ėe]nesių\b",
     r"\btriju\s+menesiu\b",
-    r"\b9\s*m[Ä—e]n",
-    r"\b9\s*m[Ä—e]nes",
-    r"\bdevyniÅ³\s+m[Ä—e]nesiÅ³\b",
+    r"\b9\s*m[ėe]n",
+    r"\b9\s*m[ėe]nes",
+    r"\bdevynių\s+m[ėe]nesių\b",
     r"\bdevyniu\s+menesiu\b",
     r"\bq1\b",
     r"\bq3\b",
     r"\bi\s+ketv",
     r"\biii\s+ketv",
     r"\bpirm[ao]\s+ketv",
-    r"\btre[cÄ]i[ao]\s+ketv",
+    r"\btre[cč]i[ao]\s+ketv",
     r"\bthree\s+months\b",
     r"\bnine\s+months\b",
 ]
@@ -1564,13 +1564,13 @@ def _is_interim_category(category: str) -> bool:
 
 def _classify_financial_report(row) -> str:
     """
-    CRIB kategorija yra pagrindinis Å¡altinis:
-    - â€žMetinÄ— informacijaâ€œ / â€žAnnual informationâ€œ => metinÄ— ataskaita;
-    - â€žTarpinÄ— informacijaâ€œ / â€žInterim informationâ€œ => gali bÅ«ti 3 mÄ—n., 6 mÄ—n. arba 9 mÄ—n.
+    CRIB kategorija yra pagrindinis šaltinis:
+    - „Metinė informacija“ / „Annual information“ => metinė ataskaita;
+    - „Tarpinė informacija“ / „Interim information“ => gali būti 3 mėn., 6 mėn. arba 9 mėn.
 
-    DPL patikrai Ä¯traukiame tik metines ir 6 mÄ—n. / pusmeÄio ataskaitas.
-    TodÄ—l tarpinÄ—s informacijos atveju papildomai tikriname antraÅ¡tÄ™ ir turinÄ¯,
-    kad neatimtume 3 mÄ—n. arba 9 mÄ—n. praneÅ¡imÅ³ kaip pusmeÄio ataskaitÅ³.
+    DPL patikrai įtraukiame tik metines ir 6 mėn. / pusmečio ataskaitas.
+    Todėl tarpinės informacijos atveju papildomai tikriname antraštę ir turinį,
+    kad neatimtume 3 mėn. arba 9 mėn. pranešimų kaip pusmečio ataskaitų.
     """
     category = _norm_text(row.get("category", ""))
     title = _norm_text(row.get("title", ""))
@@ -1581,17 +1581,17 @@ def _classify_financial_report(row) -> str:
         return ""
 
     if _is_annual_category(category) or _matches_any(text, ANNUAL_PATTERNS):
-        return "MetinÄ—"
+        return "Metinė"
 
     if _is_interim_category(category):
         if _matches_any(text, QUARTER_REPORT_PATTERNS):
             return ""
         if _matches_any(text, HALF_YEAR_PATTERNS):
-            return "PusmeÄio / 6 mÄ—n."
+            return "Pusmečio / 6 mėn."
         return ""
 
     if _matches_any(text, HALF_YEAR_PATTERNS):
-        return "PusmeÄio / 6 mÄ—n."
+        return "Pusmečio / 6 mėn."
 
     return ""
 
@@ -1621,11 +1621,11 @@ def _issuer_key(value) -> str:
 
 def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Prideda DPL patikrÄ… prie vadovÅ³ sandoriÅ³.
+    Prideda DPL patikrą prie vadovų sandorių.
 
-    Pataisyta: pandas naujesnÄ—se versijose nebeleidÅ¾ia Ä¯ datetime64 stulpelÄ¯
-    tiesiogiai Ä¯raÅ¡yti datetime.date reikÅ¡mÄ—s. TodÄ—l DPL datos laikomos kaip
-    object/date, o ne kaip datetime64[ns]. Tai paÅ¡alina klaidÄ…:
+    Pataisyta: pandas naujesnėse versijose nebeleidžia į datetime64 stulpelį
+    tiesiogiai įrašyti datetime.date reikšmės. Todėl DPL datos laikomos kaip
+    object/date, o ne kaip datetime64[ns]. Tai pašalina klaidą:
     TypeError: Invalid value 'YYYY-MM-DD' for dtype datetime64[ns].
     """
     if transactions_df is None or transactions_df.empty:
@@ -1633,7 +1633,7 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
 
     df = transactions_df.copy()
 
-    # Å iuos stulpelius sÄ…moningai kuriame kaip object, nes vÄ—liau Ä¯raÅ¡ome datetime.date.
+    # Šiuos stulpelius sąmoningai kuriame kaip object, nes vėliau įrašome datetime.date.
     df["is_dpl_period"] = False
     df["dpl_report_type"] = ""
     df["dpl_report_date"] = pd.Series([None] * len(df), index=df.index, dtype="object")
@@ -1662,7 +1662,7 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
         periods["issuer_key"] = periods["issuer"].apply(_issuer_key)
         df["issuer_key"] = df["issuer"].apply(_issuer_key)
 
-        # UÅ¾tikriname vienodÄ… datÅ³ tipÄ… palyginimui.
+        # Užtikriname vienodą datų tipą palyginimui.
         for col in ["dpl_start_date", "dpl_end_date", "report_published_date"]:
             if col in periods.columns:
                 periods[col] = periods[col].apply(_to_date_obj)
@@ -1704,20 +1704,20 @@ def add_dpl_check_to_transactions(transactions_df: pd.DataFrame, dpl_periods_df:
 
     df["DPL"] = df["is_dpl_period"].apply(lambda x: "Taip" if x else "Ne")
     df["DPL tipas"] = df["dpl_report_type"].fillna("")
-    df["DPL pradÅ¾ia"] = df["dpl_start_date"]
+    df["DPL pradžia"] = df["dpl_start_date"]
     df["DPL pabaiga"] = df["dpl_end_date"]
     df["Ataskaitos paskelbimo data"] = df["dpl_report_date"]
-    df["DPL dienÅ³ iki ataskaitos"] = df["dpl_days_to_report"]
+    df["DPL dienų iki ataskaitos"] = df["dpl_days_to_report"]
     df["Susijusi ataskaita"] = df["dpl_report_title"].fillna("")
     df["Ataskaitos nuoroda"] = df["dpl_report_url"].fillna("")
 
-    df["DPL paaiÅ¡kinimas"] = df.apply(
+    df["DPL paaiškinimas"] = df.apply(
         lambda r: (
             f"Sandoris sudarytas DPL laikotarpiu: {r['dpl_days_to_report']} k. d. iki "
             f"{str(r['dpl_report_type']).lower()} ataskaitos paskelbimo "
-            f"({r['dpl_report_date']}). DPL: {r['dpl_start_date']}â€“{r['dpl_end_date']}."
+            f"({r['dpl_report_date']}). DPL: {r['dpl_start_date']}–{r['dpl_end_date']}."
             if r["is_dpl_period"]
-            else "Sandorio data nepatenka Ä¯ identifikuotus metinÄ—s arba pusmeÄio / 6 mÄ—n. ataskaitos DPL laikotarpius."
+            else "Sandorio data nepatenka į identifikuotus metinės arba pusmečio / 6 mėn. ataskaitos DPL laikotarpius."
         ),
         axis=1,
     )
@@ -1728,8 +1728,8 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # ÄŒia atliekamas pagrindinis pataisymas: techniniai nepavykusio PDF
-    # nuskaitymo Ä¯raÅ¡ai nerodomi ataskaitoje ir nepatenka Ä¯ santraukas.
+    # Čia atliekamas pagrindinis pataisymas: techniniai nepavykusio PDF
+    # nuskaitymo įrašai nerodomi ataskaitoje ir nepatenka į santraukas.
     df = _filter_hidden_manager_report_rows(df)
     if df.empty:
         return pd.DataFrame()
@@ -1770,7 +1770,7 @@ def _apply_multiselect_filter(df: pd.DataFrame, col: str, label: str) -> pd.Data
 
 
 def _format_dpl_period(row) -> str:
-    """Suformuoja trumpÄ… DPL laikotarpio tekstÄ… lentelei."""
+    """Suformuoja trumpą DPL laikotarpio tekstą lentelei."""
     if row is None or row.empty:
         return ""
     start = row.get("dpl_start_date", "")
@@ -1789,7 +1789,7 @@ def _format_dpl_period(row) -> str:
         except Exception:
             return str(x or "")
 
-    period = f"{fmt(start)} â€“ {fmt(end)}".strip(" â€“")
+    period = f"{fmt(start)} – {fmt(end)}".strip(" –")
     if report_date:
         period = f"{period} (ataskaita: {fmt(report_date)})" if period else f"Ataskaita: {fmt(report_date)}"
     if title:
@@ -1799,12 +1799,12 @@ def _format_dpl_period(row) -> str:
 
 def build_dpl_dates_summary_df(dpl_periods_df: pd.DataFrame) -> pd.DataFrame:
     """
-    ParuoÅ¡ia Ä¯moniÅ³ DPL datÅ³ lentelÄ™:
-    - Ä¯monÄ—s pavadinimas;
-    - paskutinis 6 mÄ—n. / pusmeÄio DPL laikotarpis;
-    - paskutinis metinÄ—s ataskaitos DPL laikotarpis.
+    Paruošia įmonių DPL datų lentelę:
+    - įmonės pavadinimas;
+    - paskutinis 6 mėn. / pusmečio DPL laikotarpis;
+    - paskutinis metinės ataskaitos DPL laikotarpis.
     """
-    columns = ["Ä®monÄ—", "6 mÄ—n. DPL laikotarpis", "MetÅ³ DPL laikotarpis"]
+    columns = ["Įmonė", "6 mėn. DPL laikotarpis", "Metų DPL laikotarpis"]
     if dpl_periods_df is None or dpl_periods_df.empty:
         return pd.DataFrame(columns=columns)
 
@@ -1831,33 +1831,33 @@ def build_dpl_dates_summary_df(dpl_periods_df: pd.DataFrame) -> pd.DataFrame:
         annual_text = _format_dpl_period(annual.iloc[0]) if not annual.empty else ""
 
         rows.append({
-            "Ä®monÄ—": issuer,
-            "6 mÄ—n. DPL laikotarpis": half_text,
-            "MetÅ³ DPL laikotarpis": annual_text,
+            "Įmonė": issuer,
+            "6 mėn. DPL laikotarpis": half_text,
+            "Metų DPL laikotarpis": annual_text,
         })
 
     return pd.DataFrame(rows, columns=columns)
 
 
 def show_dpl_dates_table(dpl_periods_df: pd.DataFrame):
-    """Parodo DPL datÅ³ lentelÄ™ vadovÅ³ sandoriÅ³ ataskaitoje."""
-    st.subheader("DPL laikotarpiai pagal Ä¯mones")
+    """Parodo DPL datų lentelę vadovų sandorių ataskaitoje."""
+    st.subheader("DPL laikotarpiai pagal įmones")
     dpl_dates_df = build_dpl_dates_summary_df(dpl_periods_df)
     if dpl_dates_df.empty:
-        st.info("DPL laikotarpiÅ³ nerasta pagal pasirinktÄ… vadovÅ³ sandoriÅ³ laikotarpÄ¯.")
+        st.info("DPL laikotarpių nerasta pagal pasirinktą vadovų sandorių laikotarpį.")
     else:
         st.dataframe(dpl_dates_df, use_container_width=True, hide_index=True)
 
 
 
 # ------------------------------------------------------------
-# VadovÅ³ sandoriÅ³ dublikatÅ³ valymas
+# Vadovų sandorių dublikatų valymas
 # ------------------------------------------------------------
 
 def _dup_norm_text(value) -> str:
-    """Normalizuoja tekstÄ… dublikatÅ³ palyginimui."""
+    """Normalizuoja tekstą dublikatų palyginimui."""
     s = str(value or "").strip().lower()
-    repl = str.maketrans({"Ä…":"a","Ä":"c","Ä™":"e","Ä—":"e","Ä¯":"i","Å¡":"s","Å³":"u","Å«":"u","Å¾":"z"})
+    repl = str.maketrans({"ą":"a","č":"c","ę":"e","ė":"e","į":"i","š":"s","ų":"u","ū":"u","ž":"z"})
     s = s.translate(repl)
     s = re.sub(r"\b(ab|uab|as|akcine bendrove|uzdaroji akcine bendrove)\b", " ", s)
     s = s.replace("paprastoji vardine akcija", "akcija")
@@ -1883,8 +1883,8 @@ def _dup_number(value, decimals: int = 6) -> str:
             return ""
         val = float(value)
         if abs(val) < 1e-12:
-            # Nulis vadovÅ³ sandoriuose daÅ¾nai reiÅ¡kia opcionÄ… / paveldÄ—jimÄ…;
-            # paliekame kaip tikrÄ… reikÅ¡mÄ™, o ne kaip tuÅ¡ÄiÄ….
+            # Nulis vadovų sandoriuose dažnai reiškia opcioną / paveldėjimą;
+            # paliekame kaip tikrą reikšmę, o ne kaip tuščią.
             return "0"
         return f"{val:.{decimals}f}".rstrip("0").rstrip(".")
     except Exception:
@@ -1905,7 +1905,7 @@ def _row_has_price_quantity(row) -> bool:
 
 
 def _manager_duplicate_score(row) -> float:
-    """Kuo didesnis balas, tuo Ä¯raÅ¡as laikomas geresniu dublikato variante."""
+    """Kuo didesnis balas, tuo įrašas laikomas geresniu dublikato variante."""
     score = 0.0
     important_cols = [
         "issuer", "person_name", "person_role", "transaction_date", "transaction_date_dt",
@@ -1945,7 +1945,7 @@ def _manager_duplicate_score(row) -> float:
 
     try:
         if row.get("id") is not None and not pd.isna(row.get("id")):
-            # Jei viskas vienoda, paliekame naujesnÄ¯ / vÄ—lesnÄ¯ Ä¯raÅ¡Ä….
+            # Jei viskas vienoda, paliekame naujesnį / vėlesnį įrašą.
             score += min(float(row.get("id")) / 1000000.0, 1.0)
     except Exception:
         pass
@@ -1969,14 +1969,14 @@ def _manager_duplicate_key_strict(row) -> tuple:
 def _manager_duplicate_key_loose(row) -> tuple:
     """Platesnis raktas silpniems dublikatams.
 
-    Kai tas pats CRIB praneÅ¡imas turi ir gerÄ… CRIB attachment Ä¯raÅ¡Ä…, ir
-    prastesnÄ¯ Globenewswire veidrodinÄ¯ Ä¯raÅ¡Ä…, prastesniame variante daÅ¾nai
+    Kai tas pats CRIB pranešimas turi ir gerą CRIB attachment įrašą, ir
+    prastesnį Globenewswire veidrodinį įrašą, prastesniame variante dažnai
     skiriasi `transaction_type`, `instrument` arba `venue` tekstai. Pvz.
-    vienoje eilutÄ—je yra â€žÄ®sigijimasâ€œ, kitoje â€“ ilgas tekstas
-    â€žFinansiniÅ³ priemoniÅ³ Ä¯gijimas paveldÄ—jimo bÅ«duâ€œ, o vietoje dar prisiklijuoja
-    pareigos. TodÄ—l plataus rakto sÄ…moningai neribojame pagal pusÄ™ / vietÄ… /
-    priemonÄ™. JÄ¯ taikome tik tada, kai grupÄ—je yra pilnas ir nepilnas Ä¯raÅ¡as,
-    todÄ—l tikri keli sandoriai su skirtingais kiekiais nÄ—ra trinami.
+    vienoje eilutėje yra „Įsigijimas“, kitoje – ilgas tekstas
+    „Finansinių priemonių įgijimas paveldėjimo būdu“, o vietoje dar prisiklijuoja
+    pareigos. Todėl plataus rakto sąmoningai neribojame pagal pusę / vietą /
+    priemonę. Jį taikome tik tada, kai grupėje yra pilnas ir nepilnas įrašas,
+    todėl tikri keli sandoriai su skirtingais kiekiais nėra trinami.
     """
     crib = str(row.get("crib_url") or "").strip().lower()
     return (
@@ -1989,11 +1989,11 @@ def _manager_duplicate_key_loose(row) -> tuple:
 
 
 def _duplicate_ids_from_rows(rows: list[dict]) -> list[int]:
-    """GrÄ…Å¾ina ID, kuriuos galima saugiai trinti kaip dublikatus."""
+    """Grąžina ID, kuriuos galima saugiai trinti kaip dublikatus."""
     if not rows:
         return []
 
-    # Pirmas etapas: visiÅ¡kai tas pats sandoris pagal faktinius laukus.
+    # Pirmas etapas: visiškai tas pats sandoris pagal faktinius laukus.
     by_strict = {}
     for r in rows:
         key = _manager_duplicate_key_strict(r)
@@ -2013,12 +2013,12 @@ def _duplicate_ids_from_rows(rows: list[dict]) -> list[int]:
                 except Exception:
                     pass
 
-    # Antras etapas: tas pats CRIB praneÅ¡imas ir sandorio tapatybÄ—, bet viena eilutÄ— nepilna.
+    # Antras etapas: tas pats CRIB pranešimas ir sandorio tapatybė, bet viena eilutė nepilna.
     remaining = [r for r in rows if r.get("id") is not None and pd.notna(r.get("id")) and int(r.get("id")) not in delete_ids]
     by_loose = {}
     for r in remaining:
         key = _manager_duplicate_key_loose(r)
-        # Be crib_url tokio plataus palyginimo netaikome, kad nesutrintume realiÅ³ atskirÅ³ sandoriÅ³.
+        # Be crib_url tokio plataus palyginimo netaikome, kad nesutrintume realių atskirų sandorių.
         if not key[0] or not key[1] or not key[2] or not key[3]:
             continue
         by_loose.setdefault(key, []).append(r)
@@ -2029,14 +2029,14 @@ def _duplicate_ids_from_rows(rows: list[dict]) -> list[int]:
         complete = [r for r in group if _row_has_price_quantity(r)]
         incomplete = [r for r in group if not _row_has_price_quantity(r)]
         if complete and incomplete:
-            # Paliekame pilnus Ä¯raÅ¡us. Triname tik nepilnus veidrodinius Ä¯raÅ¡us.
+            # Paliekame pilnus įrašus. Triname tik nepilnus veidrodinius įrašus.
             for r in incomplete:
                 try:
                     delete_ids.add(int(r.get("id")))
                 except Exception:
                     pass
         else:
-            # Jei visi vienodai pilni arba visi nepilni, paliekame geriausiÄ….
+            # Jei visi vienodai pilni arba visi nepilni, paliekame geriausią.
             ranked = sorted(group, key=_manager_duplicate_score, reverse=True)
             for r in ranked[1:]:
                 try:
@@ -2048,7 +2048,7 @@ def _duplicate_ids_from_rows(rows: list[dict]) -> list[int]:
 
 
 def _remove_manager_duplicates_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Paslepia dublikatus ataskaitoje, net jei jie dar fiziÅ¡kai yra DB."""
+    """Paslepia dublikatus ataskaitoje, net jei jie dar fiziškai yra DB."""
     if df is None or df.empty:
         return pd.DataFrame()
     if "id" not in df.columns:
@@ -2062,7 +2062,7 @@ def _remove_manager_duplicates_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def delete_duplicate_manager_transactions(limit: int = 3000) -> dict:
-    """FiziÅ¡kai iÅ¡trina dublikatus iÅ¡ Supabase manager_transactions lentelÄ—s."""
+    """Fiziškai ištrina dublikatus iš Supabase manager_transactions lentelės."""
     stats = {"checked": 0, "duplicates_found": 0, "deleted": 0, "errors": 0, "error_messages": []}
     try:
         _headers, _url, _client = _supabase_client_parts()
@@ -2102,15 +2102,15 @@ def _show_summary_cards(df: pd.DataFrame):
     late = int(df["is_late_notification"].sum())
     dpl = int(df["is_dpl_period"].sum())
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("PraneÅ¡imÅ³ / PDF", total)
-    c2.metric("EmitentÅ³", issuers)
-    c3.metric("AsmenÅ³", persons)
-    c4.metric("VÄ—luojanÄiÅ³ >3 d.", late)
+    c1.metric("Pranešimų / PDF", total)
+    c2.metric("Emitentų", issuers)
+    c3.metric("Asmenų", persons)
+    c4.metric("Vėluojančių >3 d.", late)
     c5.metric("Per DPL", dpl)
 
 
 def _style_dpl_value(value):
-    """Spalvina DPL stulpelÄ¯ detalioje vadovÅ³ sandoriÅ³ lentelÄ—je."""
+    """Spalvina DPL stulpelį detalioje vadovų sandorių lentelėje."""
     v = str(value or "").strip().lower()
     if v == "taip":
         return "background-color: #f8d7da; color: #721c24; font-weight: 700;"
@@ -2120,7 +2120,7 @@ def _style_dpl_value(value):
 
 
 def _style_delay_value(value):
-    """Spalvina vÄ—lavimo dienÅ³ stulpelÄ¯ detalioje vadovÅ³ sandoriÅ³ lentelÄ—je."""
+    """Spalvina vėlavimo dienų stulpelį detalioje vadovų sandorių lentelėje."""
     try:
         if pd.isna(value):
             return ""
@@ -2134,12 +2134,12 @@ def _style_delay_value(value):
 
 
 def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """ParuoÅ¡ia detalios vadovÅ³ sandoriÅ³ lentelÄ—s rodymo / eksporto DataFrame.
+    """Paruošia detalios vadovų sandorių lentelės rodymo / eksporto DataFrame.
 
-    Pageidaujama pradÅ¾ios tvarka:
-    Ä®monÄ—s pavadinimas, Asmuo, PraneÅ¡imo data, Sandorio data,
-    PraneÅ¡ta per d., Pavadinimas, PusÄ—, Kiekis, Kaina, VertÄ—, Vieta, DPL.
-    Visi kiti turimi parametrai paliekami lentelÄ—s gale.
+    Pageidaujama pradžios tvarka:
+    Įmonės pavadinimas, Asmuo, Pranešimo data, Sandorio data,
+    Pranešta per d., Pavadinimas, Pusė, Kiekis, Kaina, Vertė, Vieta, DPL.
+    Visi kiti turimi parametrai paliekami lentelės gale.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -2159,17 +2159,17 @@ def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "DPL",
     ]
 
-    # Å ie stulpeliai rodomi po pagrindiniÅ³. Jei ateityje atsiras naujÅ³ DB laukÅ³,
-    # jie automatiÅ¡kai bus pridÄ—ti dar toliau per extra_cols.
+    # Šie stulpeliai rodomi po pagrindinių. Jei ateityje atsiras naujų DB laukų,
+    # jie automatiškai bus pridėti dar toliau per extra_cols.
     preferred_tail_cols = [
         "person_role",
         "DPL tipas",
         "Susijusi ataskaita",
         "isin",
         "Ataskaitos paskelbimo data",
-        "DPL pradÅ¾ia",
+        "DPL pradžia",
         "DPL pabaiga",
-        "DPL dienÅ³ iki ataskaitos",
+        "DPL dienų iki ataskaitos",
         "Ataskaitos nuoroda",
         "lei",
         "pdf_name",
@@ -2179,7 +2179,7 @@ def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "parse_status",
     ]
 
-    # Techninius / tarpinius stulpelius, kurie neturi bÅ«ti rodomi lentelÄ—s gale, paslepiame.
+    # Techninius / tarpinius stulpelius, kurie neturi būti rodomi lentelės gale, paslepiame.
     hidden_cols = {
         "raw_text",
         "published_at",
@@ -2195,7 +2195,7 @@ def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "dpl_days_to_report",
         "dpl_report_title",
         "dpl_report_url",
-        "DPL paaiÅ¡kinimas",
+        "DPL paaiškinimas",
     }
 
     ordered_cols = []
@@ -2211,16 +2211,16 @@ def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
     display_df = df[detail_cols].copy()
     display_df = display_df.rename(columns={
-        "issuer": "Ä®monÄ—s pavadinimas",
+        "issuer": "Įmonės pavadinimas",
         "person_name": "Asmuo",
-        "published_date": "PraneÅ¡imo data",
+        "published_date": "Pranešimo data",
         "transaction_date_dt": "Sandorio data",
-        "days_to_publish": "PraneÅ¡ta per d.",
+        "days_to_publish": "Pranešta per d.",
         "instrument": "Pavadinimas",
-        "transaction_type": "PusÄ—",
+        "transaction_type": "Pusė",
         "quantity": "Kiekis",
         "price": "Kaina",
-        "transaction_value": "VertÄ—",
+        "transaction_value": "Vertė",
         "venue": "Vieta",
         "person_role": "Pareigos",
         "isin": "ISIN",
@@ -2228,7 +2228,7 @@ def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "pdf_name": "PDF pavadinimas",
         "pdf_url": "PDF nuoroda",
         "crib_url": "CRIB nuoroda",
-        "price_quantity_note": "Pastaba dÄ—l kainos / kiekio",
+        "price_quantity_note": "Pastaba dėl kainos / kiekio",
         "parse_status": "Apdorojimo statusas",
     })
 
@@ -2236,7 +2236,7 @@ def _prepare_manager_transactions_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _show_tables(df: pd.DataFrame):
-    st.subheader("1. Detali vadovÅ³ sandoriÅ³ lentelÄ—")
+    st.subheader("1. Detali vadovų sandorių lentelė")
 
     display_df = _prepare_manager_transactions_display_df(df)
 
@@ -2245,35 +2245,35 @@ def _show_tables(df: pd.DataFrame):
         format_map["Kaina"] = "{:.4f}"
     if "Kiekis" in display_df.columns:
         format_map["Kiekis"] = "{:.0f}"
-    if "VertÄ—" in display_df.columns:
-        format_map["VertÄ—"] = "{:,.2f}"
-    if "PraneÅ¡ta per d." in display_df.columns:
-        format_map["PraneÅ¡ta per d."] = "{:.0f}"
+    if "Vertė" in display_df.columns:
+        format_map["Vertė"] = "{:,.2f}"
+    if "Pranešta per d." in display_df.columns:
+        format_map["Pranešta per d."] = "{:.0f}"
 
-    # TÄ… patÄ¯ DataFrame iÅ¡saugome CSV atsisiuntimui, kad eksportas turÄ—tÅ³
-    # tokiÄ… paÄiÄ… stulpeliÅ³ tvarkÄ… kaip matoma lentelÄ—.
+    # Tą patį DataFrame išsaugome CSV atsisiuntimui, kad eksportas turėtų
+    # tokią pačią stulpelių tvarką kaip matoma lentelė.
     st.session_state["manager_transactions_display_df"] = display_df.copy()
 
     styler = display_df.style
     if format_map:
         styler = styler.format(format_map, na_rep="")
 
-    # pandas >= 2.1 Styler.applymap nebepalaikomas, todÄ—l naudojame Styler.map.
-    # Paliekame atsarginÄ¯ variantÄ… senesnÄ—ms pandas versijoms.
+    # pandas >= 2.1 Styler.applymap nebepalaikomas, todėl naudojame Styler.map.
+    # Paliekame atsarginį variantą senesnėms pandas versijoms.
     if "DPL" in display_df.columns:
         if hasattr(styler, "map"):
             styler = styler.map(_style_dpl_value, subset=["DPL"])
         else:
             styler = styler.applymap(_style_dpl_value, subset=["DPL"])
-    if "PraneÅ¡ta per d." in display_df.columns:
+    if "Pranešta per d." in display_df.columns:
         if hasattr(styler, "map"):
-            styler = styler.map(_style_delay_value, subset=["PraneÅ¡ta per d."])
+            styler = styler.map(_style_delay_value, subset=["Pranešta per d."])
         else:
-            styler = styler.applymap(_style_delay_value, subset=["PraneÅ¡ta per d."])
+            styler = styler.applymap(_style_delay_value, subset=["Pranešta per d."])
 
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
-    st.subheader("2. Santrauka pagal asmenÄ¯")
+    st.subheader("2. Santrauka pagal asmenį")
     person_summary = (
         df.groupby(["issuer", "person_name"], dropna=False)
         .agg(
@@ -2298,13 +2298,13 @@ def show_manager_transactions_page():
         """
         <div class="hero-card">
             <div class="hero-inner">
-                <div class="hero-icon">ðŸ‘”</div>
+                <div class="hero-icon">👔</div>
                 <div>
-                    <h1 class="hero-title">VadovÅ³ sandoriai</h1>
+                    <h1 class="hero-title">Vadovų sandoriai</h1>
                     <div class="hero-text">
-                        CRIB kategorijos â€žPraneÅ¡imai apie vadovÅ³ sandoriusâ€œ PDF dokumentai.
-                        LentelÄ—je papildomai tikrinama, ar sandoris vyko DPL laikotarpiu
-                        prieÅ¡ metinÄ—s arba pusmeÄio / 6 mÄ—n. ataskaitos paskelbimÄ….
+                        CRIB kategorijos „Pranešimai apie vadovų sandorius“ PDF dokumentai.
+                        Lentelėje papildomai tikrinama, ar sandoris vyko DPL laikotarpiu
+                        prieš metinės arba pusmečio / 6 mėn. ataskaitos paskelbimą.
                     </div>
                 </div>
             </div>
@@ -2313,157 +2313,157 @@ def show_manager_transactions_page():
         unsafe_allow_html=True,
     )
     st.markdown("<br>", unsafe_allow_html=True)
-    st.caption("VadovÅ³ sandoriÅ³ modulis: dublikatÅ³ valymo versija 2026-07-03b")
+    st.caption("Vadovų sandorių modulis: dublikatų valymo versija 2026-07-03b")
 
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-card-title">ðŸ‘” VadovÅ³ sandoriai</div>', unsafe_allow_html=True)
-        manager_start_date = st.date_input("PraneÅ¡imo data nuo", value=date.today() - timedelta(days=30), key="manager_start_date")
-        manager_end_date = st.date_input("PraneÅ¡imo data iki", value=date.today(), key="manager_end_date")
+        st.markdown('<div class="sidebar-card-title">👔 Vadovų sandoriai</div>', unsafe_allow_html=True)
+        manager_start_date = st.date_input("Pranešimo data nuo", value=date.today() - timedelta(days=30), key="manager_start_date")
+        manager_end_date = st.date_input("Pranešimo data iki", value=date.today(), key="manager_end_date")
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-card-subtitle">Tiesiogiai tikrina CRIB ir papildomai naudoja jau sukauptus market_news praneÅ¡imus. TodÄ—l gali Ä¯raÅ¡yti ir iki Å¡iol praleistus sandorius.</div>',
+            '<div class="sidebar-card-subtitle">Tiesiogiai tikrina CRIB ir papildomai naudoja jau sukauptus market_news pranešimus. Todėl gali įrašyti ir iki šiol praleistus sandorius.</div>',
             unsafe_allow_html=True,
         )
         manager_update_days = st.number_input("Tikrinti paskutines dienas", min_value=7, max_value=180, value=45, step=1, key="manager_update_days")
-        manager_update_btn = st.button("ðŸ”„ Atnaujinti vadovÅ³ sandorius", use_container_width=True, key="manager_transactions_update_btn")
-        latest_recalc_btn = st.button("ðŸ” PerskaiÄiuoti paskutinÄ¯ praneÅ¡imÄ…", use_container_width=True, key="manager_latest_recalc_btn")
-        duplicate_cleanup_btn = st.button("ðŸ§½ IÅ¡trinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_btn")
-        repair_bad_btn = st.button("ðŸ”§ Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
-        cleanup_hidden_btn = st.button("ðŸ§¹ IÅ¡trinti techninius tuÅ¡Äius Ä¯raÅ¡us", use_container_width=True, key="manager_cleanup_hidden_btn")
-        repair_limit = st.number_input("BlogÅ³ PDF / dublikatÅ³ limitas", min_value=10, max_value=5000, value=1000, step=10, key="manager_repair_limit")
+        manager_update_btn = st.button("🔄 Atnaujinti vadovų sandorius", use_container_width=True, key="manager_transactions_update_btn")
+        latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
+        duplicate_cleanup_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_btn")
+        repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
+        cleanup_hidden_btn = st.button("🧹 Ištrinti techninius tuščius įrašus", use_container_width=True, key="manager_cleanup_hidden_btn")
+        repair_limit = st.number_input("Blogų PDF / dublikatų limitas", min_value=10, max_value=5000, value=1000, step=10, key="manager_repair_limit")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if manager_update_btn:
         try:
-            with st.spinner("Tikrinami paskutiniai CRIB vadovÅ³ sandoriÅ³ praneÅ¡imai ir PDF..."):
+            with st.spinner("Tikrinami paskutiniai CRIB vadovų sandorių pranešimai ir PDF..."):
                 stats = update_manager_transactions_from_recent_crib(days_back=int(manager_update_days), max_messages=50, headless=True, progress=None)
             st.success(
-                "VadovÅ³ sandoriai atnaujinti: "
-                f"rasta CRIB praneÅ¡imÅ³ {stats.get('manager_messages_found', 0)}, "
-                f"iÅ¡ jÅ³ tiesiogiai CRIB {stats.get('manager_messages_found_directly', 0)}, "
+                "Vadovų sandoriai atnaujinti: "
+                f"rasta CRIB pranešimų {stats.get('manager_messages_found', 0)}, "
+                f"iš jų tiesiogiai CRIB {stats.get('manager_messages_found_directly', 0)}, "
                 f"apdorota {stats.get('manager_messages_processed', 0)}, "
-                f"naujai Ä¯raÅ¡yta sandoriÅ³/PDF {stats.get('manager_transactions_saved', 0)}, "
-                f"klaidÅ³ {stats.get('manager_transactions_errors', 0)}."
+                f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
+                f"klaidų {stats.get('manager_transactions_errors', 0)}."
             )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko atnaujinti vadovÅ³ sandoriÅ³.")
+            st.error("Nepavyko atnaujinti vadovų sandorių.")
             st.exception(exc)
             st.stop()
 
     if latest_recalc_btn:
         try:
-            with st.spinner("PerskaiÄiuojamas paskutinis vadovÅ³ sandoriÅ³ praneÅ¡imas..."):
+            with st.spinner("Perskaičiuojamas paskutinis vadovų sandorių pranešimas..."):
                 stats = recalc_latest_manager_notice(headless=True, progress=None)
             st.success(
-                "Paskutinis praneÅ¡imas perskaiÄiuotas: "
+                "Paskutinis pranešimas perskaičiuotas: "
                 f"rastas={stats.get('notice_found')}, "
-                f"iÅ¡trinta {stats.get('deleted', 0)}, "
-                f"Ä¯raÅ¡yta {stats.get('inserted', 0)}, "
-                f"klaidÅ³ {stats.get('errors', 0)}."
+                f"ištrinta {stats.get('deleted', 0)}, "
+                f"įrašyta {stats.get('inserted', 0)}, "
+                f"klaidų {stats.get('errors', 0)}."
             )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko perskaiÄiuoti paskutinio praneÅ¡imo.")
+            st.error("Nepavyko perskaičiuoti paskutinio pranešimo.")
             st.exception(exc)
             st.stop()
 
     if duplicate_cleanup_btn:
         try:
-            with st.spinner("IeÅ¡komi ir trinami vadovÅ³ sandoriÅ³ dublikatai DB..."):
+            with st.spinner("Ieškomi ir trinami vadovų sandorių dublikatai DB..."):
                 stats = delete_duplicate_manager_transactions(limit=int(repair_limit))
             if stats.get("errors", 0):
                 st.warning(
-                    "DublikatÅ³ valymas baigtas su klaidomis: "
+                    "Dublikatų valymas baigtas su klaidomis: "
                     f"patikrinta {stats.get('checked', 0)}, "
-                    f"rasta dublikatÅ³ {stats.get('duplicates_found', 0)}, "
-                    f"iÅ¡trinta {stats.get('deleted', 0)}, "
-                    f"klaidÅ³ {stats.get('errors', 0)}."
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}, "
+                    f"klaidų {stats.get('errors', 0)}."
                 )
                 if stats.get("error_messages"):
                     st.code("\n".join(stats.get("error_messages", [])[:10]))
             else:
                 st.success(
-                    "DublikatÅ³ valymas baigtas: "
+                    "Dublikatų valymas baigtas: "
                     f"patikrinta {stats.get('checked', 0)}, "
-                    f"rasta dublikatÅ³ {stats.get('duplicates_found', 0)}, "
-                    f"iÅ¡trinta {stats.get('deleted', 0)}."
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}."
                 )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko iÅ¡trinti dublikatÅ³.")
+            st.error("Nepavyko ištrinti dublikatų.")
             st.exception(exc)
             st.stop()
 
     if repair_bad_btn:
         try:
-            with st.spinner("Taisomi blogai nuskaityti PDF Ä¯raÅ¡ai..."):
+            with st.spinner("Taisomi blogai nuskaityti PDF įrašai..."):
                 stats = repair_bad_manager_transactions(limit=int(repair_limit), progress=None)
             st.success(
-                "BlogÅ³ PDF taisymas baigtas: "
+                "Blogų PDF taisymas baigtas: "
                 f"rasta {stats.get('bad_found', 0)}, "
                 f"sutvarkyta {stats.get('repaired', 0)}, "
-                f"iÅ¡trinta tuÅ¡ÄiÅ³ dublikatÅ³ {stats.get('deleted_duplicates', 0)}, "
+                f"ištrinta tuščių dublikatų {stats.get('deleted_duplicates', 0)}, "
                 f"dalinai {stats.get('partial', 0)}, nepakeista {stats.get('unchanged', 0)}, nepavyko {stats.get('failed', 0)}."
             )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko sutvarkyti blogai nuskaitytÅ³ PDF.")
+            st.error("Nepavyko sutvarkyti blogai nuskaitytų PDF.")
             st.exception(exc)
             st.stop()
 
     if cleanup_hidden_btn:
         try:
-            with st.spinner("Trinami techniniai tuÅ¡ti vadovÅ³ sandoriÅ³ Ä¯raÅ¡ai..."):
+            with st.spinner("Trinami techniniai tušti vadovų sandorių įrašai..."):
                 stats = delete_hidden_manager_report_rows(limit=int(repair_limit))
             st.success(
-                "Techniniai tuÅ¡ti Ä¯raÅ¡ai sutvarkyti: "
+                "Techniniai tušti įrašai sutvarkyti: "
                 f"rasta {stats.get('found', 0)}, "
-                f"iÅ¡trinta {stats.get('deleted', 0)}, "
-                f"klaidÅ³ {stats.get('errors', 0)}."
+                f"ištrinta {stats.get('deleted', 0)}, "
+                f"klaidų {stats.get('errors', 0)}."
             )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko iÅ¡trinti techniniÅ³ tuÅ¡ÄiÅ³ Ä¯raÅ¡Å³.")
+            st.error("Nepavyko ištrinti techninių tuščių įrašų.")
             st.exception(exc)
             st.stop()
 
     if manager_start_date > manager_end_date:
-        st.error("Data â€žnuoâ€œ negali bÅ«ti vÄ—lesnÄ— uÅ¾ datÄ… â€žikiâ€œ.")
+        st.error("Data „nuo“ negali būti vėlesnė už datą „iki“.")
         st.stop()
 
     st.markdown("### DB tvarkymas")
     c_db1, c_db2 = st.columns([1, 3])
     with c_db1:
-        duplicate_cleanup_main_btn = st.button("ðŸ§½ IÅ¡trinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_main_btn")
+        duplicate_cleanup_main_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_main_btn")
     with c_db2:
-        st.caption("Mygtukas patikrina naujausius manager_transactions Ä¯raÅ¡us ir iÅ¡trina dubliuotus techninius / veidrodinius Ä¯raÅ¡us. Ataskaitoje dublikatai paslepiami ir be trynimo.")
+        st.caption("Mygtukas patikrina naujausius manager_transactions įrašus ir ištrina dubliuotus techninius / veidrodinius įrašus. Ataskaitoje dublikatai paslepiami ir be trynimo.")
 
     if duplicate_cleanup_main_btn:
         try:
-            with st.spinner("IeÅ¡komi ir trinami vadovÅ³ sandoriÅ³ dublikatai DB..."):
+            with st.spinner("Ieškomi ir trinami vadovų sandorių dublikatai DB..."):
                 stats = delete_duplicate_manager_transactions(limit=int(repair_limit))
             if stats.get("errors", 0):
                 st.warning(
-                    "DublikatÅ³ valymas baigtas su klaidomis: "
+                    "Dublikatų valymas baigtas su klaidomis: "
                     f"patikrinta {stats.get('checked', 0)}, "
-                    f"rasta dublikatÅ³ {stats.get('duplicates_found', 0)}, "
-                    f"iÅ¡trinta {stats.get('deleted', 0)}, "
-                    f"klaidÅ³ {stats.get('errors', 0)}."
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}, "
+                    f"klaidų {stats.get('errors', 0)}."
                 )
                 if stats.get("error_messages"):
                     st.code("\n".join(stats.get("error_messages", [])[:10]))
             else:
                 st.success(
-                    "DublikatÅ³ valymas baigtas: "
+                    "Dublikatų valymas baigtas: "
                     f"patikrinta {stats.get('checked', 0)}, "
-                    f"rasta dublikatÅ³ {stats.get('duplicates_found', 0)}, "
-                    f"iÅ¡trinta {stats.get('deleted', 0)}."
+                    f"rasta dublikatų {stats.get('duplicates_found', 0)}, "
+                    f"ištrinta {stats.get('deleted', 0)}."
                 )
             st.rerun()
         except Exception as exc:
-            st.error("Nepavyko iÅ¡trinti dublikatÅ³.")
+            st.error("Nepavyko ištrinti dublikatų.")
             st.exception(exc)
             st.stop()
 
@@ -2472,9 +2472,9 @@ def show_manager_transactions_page():
     df = prepare_manager_transactions_df(raw_df)
     hidden_count = max(raw_count - len(df), 0)
     if hidden_count:
-        st.caption(f"Ataskaitoje paslÄ—pta techniniÅ³ / tuÅ¡ÄiÅ³ PDF nuskaitymo Ä¯raÅ¡Å³: {hidden_count}.")
+        st.caption(f"Ataskaitoje paslėpta techninių / tuščių PDF nuskaitymo įrašų: {hidden_count}.")
     if df.empty:
-        st.info("Pasirinktu laikotarpiu vadovÅ³ sandoriÅ³ duomenÅ³ nÄ—ra.")
+        st.info("Pasirinktu laikotarpiu vadovų sandorių duomenų nėra.")
         st.stop()
 
     news_start_date = manager_start_date - timedelta(days=370)
@@ -2484,21 +2484,21 @@ def show_manager_transactions_page():
     df = add_dpl_check_to_transactions(df, dpl_periods_df)
 
     with st.expander("DPL diagnostika", expanded=False):
-        st.write("CRIB naujienÅ³ eiluÄiÅ³ sk.:", len(crib_news_df))
-        st.write("IdentifikuotÅ³ metiniÅ³ / pusmeÄio ataskaitÅ³ sk.:", len(dpl_periods_df))
-        st.write("CRIB naujienÅ³ stulpeliai:")
+        st.write("CRIB naujienų eilučių sk.:", len(crib_news_df))
+        st.write("Identifikuotų metinių / pusmečio ataskaitų sk.:", len(dpl_periods_df))
+        st.write("CRIB naujienų stulpeliai:")
         st.write(list(crib_news_df.columns))
         if dpl_periods_df.empty:
             st.warning(
-                "DPL ataskaitÅ³ nerasta. Patikrink, ar market_news lentelÄ—je yra CRIB "
-                "naujienÅ³ su kategorijomis â€žMetinÄ— informacijaâ€œ ir â€žTarpinÄ— informacijaâ€œ, "
-                "taip pat ar antraÅ¡tÄ—se yra metinÄ—s arba pusmeÄio / 6 mÄ—n. ataskaitos poÅ¾ymiÅ³."
+                "DPL ataskaitų nerasta. Patikrink, ar market_news lentelėje yra CRIB "
+                "naujienų su kategorijomis „Metinė informacija“ ir „Tarpinė informacija“, "
+                "taip pat ar antraštėse yra metinės arba pusmečio / 6 mėn. ataskaitos požymių."
             )
         else:
             st.dataframe(dpl_periods_df[["issuer", "dpl_report_type", "report_published_date", "dpl_start_date", "dpl_end_date", "category", "title", "crib_url"]], use_container_width=True, hide_index=True)
 
-        # Papildoma diagnostika: matome tarpinÄ™ informacijÄ…, kuri nebuvo priskirta 6 mÄ—n. ataskaitoms
-        # daÅ¾niausiai todÄ—l, kad tai 3 mÄ—n. arba 9 mÄ—n. rezultatai.
+        # Papildoma diagnostika: matome tarpinę informaciją, kuri nebuvo priskirta 6 mėn. ataskaitoms
+        # dažniausiai todėl, kad tai 3 mėn. arba 9 mėn. rezultatai.
         if crib_news_df is not None and not crib_news_df.empty:
             tmp_diag = crib_news_df.copy()
             tmp_diag["report_class"] = tmp_diag.apply(_classify_financial_report, axis=1)
@@ -2507,7 +2507,7 @@ def show_manager_transactions_page():
                 & tmp_diag["report_class"].eq("")
             ].copy()
             if not interim_unmatched.empty:
-                st.markdown("**TarpinÄ— informacija, neÄ¯traukta Ä¯ DPL kaip 6 mÄ—n. ataskaita**")
+                st.markdown("**Tarpinė informacija, neįtraukta į DPL kaip 6 mėn. ataskaita**")
                 st.dataframe(
                     interim_unmatched[["issuer", "published_at", "category", "title", "crib_url"]],
                     use_container_width=True,
@@ -2522,17 +2522,17 @@ def show_manager_transactions_page():
         with c1:
             df = _apply_multiselect_filter(df, "issuer", "Emitentas")
         with c2:
-            df = _apply_multiselect_filter(df, "person_name", "Vadovas / susijÄ™s asmuo")
+            df = _apply_multiselect_filter(df, "person_name", "Vadovas / susijęs asmuo")
         with c3:
-            df = _apply_multiselect_filter(df, "transaction_type", "Sandorio pobÅ«dis")
+            df = _apply_multiselect_filter(df, "transaction_type", "Sandorio pobūdis")
         with c4:
             df = _apply_multiselect_filter(df, "parse_status", "Apdorojimo statusas")
-        delay_filter = st.selectbox("VÄ—lavimo filtras", ["Visi", "Tik vÄ—luojantys >3 d.", "Tik nevÄ—luojantys <=3 d.", "Be apskaiÄiuoto termino"], key="mgr_delay_filter")
-        if delay_filter == "Tik vÄ—luojantys >3 d.":
+        delay_filter = st.selectbox("Vėlavimo filtras", ["Visi", "Tik vėluojantys >3 d.", "Tik nevėluojantys <=3 d.", "Be apskaičiuoto termino"], key="mgr_delay_filter")
+        if delay_filter == "Tik vėluojantys >3 d.":
             df = df[df["is_late_notification"] == True]
-        elif delay_filter == "Tik nevÄ—luojantys <=3 d.":
+        elif delay_filter == "Tik nevėluojantys <=3 d.":
             df = df[(df["days_to_publish"].notna()) & (df["days_to_publish"] <= 3)]
-        elif delay_filter == "Be apskaiÄiuoto termino":
+        elif delay_filter == "Be apskaičiuoto termino":
             df = df[df["days_to_publish"].isna()]
         dpl_filter = st.selectbox("DPL filtras", ["Visi", "Tik sandoriai per DPL", "Tik ne DPL"], key="mgr_dpl_filter")
         if dpl_filter == "Tik sandoriai per DPL":
@@ -2550,7 +2550,7 @@ def show_manager_transactions_page():
         export_df = _prepare_manager_transactions_display_df(df)
 
     st.download_button(
-        "â¬‡ AtsisiÅ³sti CSV",
+        "⬇ Atsisiųsti CSV",
         data=export_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="vadovu_sandoriai_su_dpl.csv",
         mime="text/csv",
