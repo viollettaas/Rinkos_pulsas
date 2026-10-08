@@ -110,6 +110,7 @@ def update_manager_transactions_from_recent_crib(
                     published_at=notice.get("published_at"),
                     crib_title=str(notice.get("title") or ""),
                     crib_category=str(notice.get("category") or ""),
+                    issuer_hint=str(notice.get("company") or ""),
                 )
                 stats["manager_transactions_saved"] += int(saved or 0)
             except Exception as exc:
