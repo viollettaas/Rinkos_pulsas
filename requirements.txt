@@ -10,6 +10,9 @@ supabase
 bs4 
 pdfplumber
 pypdf
+pymupdf
+pytesseract
+Pillow
 beautifulsoup4
 httpx
 requests
