@@ -1159,14 +1159,35 @@ def update_manager_transactions_from_recent_crib(days_back: int = 365, max_messa
     sync_from = (last_saved_date - timedelta(days=1)) if last_saved_date else (date.today() - timedelta(days=days_back))
     stats["sync_from_date"] = sync_from.isoformat()
     notices = _load_manager_crib_notices_since(sync_from)
-    if notices is None or notices.empty:
-        return stats
-
-    notices = notices.head(max_messages).copy()
-    stats["manager_messages_found"] = len(notices)
-
     driver = _init_driver(headless=headless)
     try:
+        # Papildomas tiesioginis CRIB patikrinimas. Jo reikia tada, kai
+        # market_news jau turi kitų CRIB naujienų, bet konkreti vadovų
+        # sandorio kategorija dar nebuvo perkelta į šią lentelę.
+        days_to_scan = max(7, (date.today() - sync_from).days + 1)
+        direct_notices = _load_manager_crib_notices_directly(
+            driver,
+            days_back=days_to_scan,
+            max_scrolls=min(100, max(12, days_to_scan // 2)),
+        )
+        stats["manager_messages_found_directly"] = len(direct_notices)
+
+        notice_frames = [df for df in [notices, direct_notices] if df is not None and not df.empty]
+        if not notice_frames:
+            return stats
+        notices = pd.concat(notice_frames, ignore_index=True, sort=False)
+        for col in ["url", "published_at", "title", "category", "content", "company"]:
+            if col not in notices.columns:
+                notices[col] = ""
+        notices["published_at_dt"] = pd.to_datetime(notices["published_at"], errors="coerce")
+        notices = (
+            notices.drop_duplicates(subset=["url"], keep="first")
+            .sort_values("published_at_dt", ascending=True)
+            .head(max_messages)
+            .copy()
+        )
+        stats["manager_messages_found"] = len(notices)
+
         for _, row in notices.iterrows():
             url = str(row.get("url", "") or "").strip()
             if not url:
@@ -2390,6 +2411,7 @@ def show_manager_transactions_page():
                 "Vadovų sandoriai atnaujinti: "
                 f"tikrinta nuo {stats.get('sync_from_date', '—')}, "
                 f"rasta CRIB pranešimų {stats.get('manager_messages_found', 0)}, "
+                f"iš jų tiesiogiai CRIB {stats.get('manager_messages_found_directly', 0)}, "
                 f"apdorota {stats.get('manager_messages_processed', 0)}, "
                 f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
                 f"klaidų {stats.get('manager_transactions_errors', 0)}."
