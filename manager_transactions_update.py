@@ -82,6 +82,7 @@ def update_manager_transactions_from_recent_crib(
         "manager_messages_processed": 0,
         "manager_transactions_saved": 0,
         "manager_transactions_errors": 0,
+        "error_messages": [],
     }
 
     notices = _load_new_manager_notices(start_date).head(max_messages)
@@ -107,8 +108,9 @@ def update_manager_transactions_from_recent_crib(
                     crib_category=str(notice.get("category") or ""),
                 )
                 stats["manager_transactions_saved"] += int(saved or 0)
-            except Exception:
+            except Exception as exc:
                 stats["manager_transactions_errors"] += 1
+                stats["error_messages"].append(f"{url}: {exc}")
     finally:
         try:
             driver.quit()
