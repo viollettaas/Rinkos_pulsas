@@ -1017,6 +1017,58 @@ def _load_recent_manager_crib_notices(days_back: int = 45) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _last_saved_manager_notice_date():
+    """Grąžina paskutinio DB įrašyto CRIB pranešimo datą.
+
+    Pagal ją atliekamas papildymas: nereikia ranka spėlioti dienų skaičiaus ir
+    kiekvieną kartą iš naujo tikrinti viso laikotarpio.
+    """
+    try:
+        _headers, _url, _client = _supabase_client_parts()
+        url = _url("manager_transactions")
+        params = {
+            "select": "published_at",
+            "published_at": "not.is.null",
+            "order": "published_at.desc",
+            "limit": "1",
+        }
+        with _client() as client:
+            response = client.get(url, headers=_headers(), params=params)
+            response.raise_for_status()
+            rows = response.json() or []
+        if not rows:
+            return None
+        value = pd.to_datetime(rows[0].get("published_at"), errors="coerce")
+        return None if pd.isna(value) else value.date()
+    except Exception:
+        return None
+
+
+def _load_manager_crib_notices_since(start_date) -> pd.DataFrame:
+    """Paima visus vadovų sandorių pranešimus nuo nurodytos datos.
+
+    Vieną dieną sąmoningai perskaitome pakartotinai: jau esantys PDF bus
+    praleisti pagal ``pdf_url`` / sandorio parašą, o keli tos pačios dienos
+    pranešimai niekada nebus prarasti.
+    """
+    df = load_news_df("crib", start_date, date.today())
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    for col in ["category", "title", "url", "published_at", "content", "company"]:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[df.apply(_is_manager_notice, axis=1)].copy()
+    if df.empty:
+        return df
+    df["published_at_dt"] = pd.to_datetime(df["published_at"], errors="coerce")
+    return (
+        df.sort_values("published_at_dt", ascending=True)
+        .drop_duplicates(subset=["url"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
 def _load_manager_crib_notices_directly(driver, days_back: int = 45, max_scrolls: int = 8) -> pd.DataFrame:
     """Nuskaito vadovų sandorių pranešimus tiesiai iš CRIB naujienų sąrašo.
 
@@ -1090,37 +1142,31 @@ def _load_manager_crib_notices_directly(driver, days_back: int = 45, max_scrolls
         return pd.DataFrame(columns=columns)
 
 
-def update_manager_transactions_from_recent_crib(days_back: int = 45, max_messages: int = 30, headless: bool = True, progress=None) -> dict:
+def update_manager_transactions_from_recent_crib(days_back: int = 365, max_messages: int = 1000, headless: bool = True, progress=None) -> dict:
     stats = {
         "manager_messages_found": 0,
         "manager_messages_processed": 0,
         "manager_messages_found_directly": 0,
+        "sync_from_date": None,
         "manager_transactions_saved": 0,
         "manager_transactions_errors": 0,
         "module_available": True,
     }
 
+    # Pagrindinė eiga yra inkrementinė: nuo paskutinio sėkmingai įrašyto
+    # pranešimo, o ne nuo vartotojo įvesto savavališko dienų skaičiaus.
+    last_saved_date = _last_saved_manager_notice_date()
+    sync_from = (last_saved_date - timedelta(days=1)) if last_saved_date else (date.today() - timedelta(days=days_back))
+    stats["sync_from_date"] = sync_from.isoformat()
+    notices = _load_manager_crib_notices_since(sync_from)
+    if notices is None or notices.empty:
+        return stats
+
+    notices = notices.head(max_messages).copy()
+    stats["manager_messages_found"] = len(notices)
+
     driver = _init_driver(headless=headless)
     try:
-        # 1) Jau sukaupti bendrojo naujienų srauto įrašai.
-        cached_notices = _load_recent_manager_crib_notices(days_back=days_back)
-        # 2) Tiesioginis CRIB patikrinimas — padengia naujienas, kurių dar
-        # nėra market_news lentelėje.
-        direct_notices = _load_manager_crib_notices_directly(driver, days_back=days_back)
-        stats["manager_messages_found_directly"] = len(direct_notices)
-
-        frames = [df for df in [cached_notices, direct_notices] if df is not None and not df.empty]
-        if not frames:
-            return stats
-        notices = pd.concat(frames, ignore_index=True, sort=False)
-        for col in ["url", "published_at", "title", "category", "content", "company"]:
-            if col not in notices.columns:
-                notices[col] = ""
-        notices["published_at_dt"] = pd.to_datetime(notices["published_at"], errors="coerce")
-        notices = notices.sort_values("published_at_dt", ascending=False)
-        notices = notices.drop_duplicates(subset=["url"], keep="first").head(max_messages).copy()
-        stats["manager_messages_found"] = len(notices)
-
         for _, row in notices.iterrows():
             url = str(row.get("url", "") or "").strip()
             if not url:
@@ -2322,26 +2368,28 @@ def show_manager_transactions_page():
         manager_end_date = st.date_input("Pranešimo data iki", value=date.today(), key="manager_end_date")
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-card-subtitle">Tiesiogiai tikrina CRIB ir papildomai naudoja jau sukauptus market_news pranešimus. Todėl gali įrašyti ir iki šiol praleistus sandorius.</div>',
+            '<div class="sidebar-card-subtitle">Vienu paspaudimu papildo vadovų sandorius nuo paskutinio DB įrašyto CRIB pranešimo. Jau įrašyti PDF automatiškai praleidžiami.</div>',
             unsafe_allow_html=True,
         )
-        manager_update_days = st.number_input("Tikrinti paskutines dienas", min_value=7, max_value=180, value=45, step=1, key="manager_update_days")
-        manager_update_btn = st.button("🔄 Atnaujinti vadovų sandorius", use_container_width=True, key="manager_transactions_update_btn")
-        latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
-        duplicate_cleanup_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_btn")
-        repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
-        cleanup_hidden_btn = st.button("🧹 Ištrinti techninius tuščius įrašus", use_container_width=True, key="manager_cleanup_hidden_btn")
-        repair_limit = st.number_input("Blogų PDF / dublikatų limitas", min_value=10, max_value=5000, value=1000, step=10, key="manager_repair_limit")
+        last_saved = _last_saved_manager_notice_date()
+        st.caption(f"Paskutinis DB pranešimas: {last_saved.isoformat() if last_saved else 'nėra — bus tikrinami paskutiniai 365 d.'}")
+        manager_update_btn = st.button("🔄 Papildyti naujais vadovų sandoriais", use_container_width=True, key="manager_transactions_update_btn")
+        with st.expander("Techninis DB tvarkymas"):
+            latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
+            duplicate_cleanup_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_btn")
+            repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
+            cleanup_hidden_btn = st.button("🧹 Ištrinti techninius tuščius įrašus", use_container_width=True, key="manager_cleanup_hidden_btn")
+            repair_limit = st.number_input("Blogų PDF / dublikatų limitas", min_value=10, max_value=5000, value=1000, step=10, key="manager_repair_limit")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if manager_update_btn:
         try:
-            with st.spinner("Tikrinami paskutiniai CRIB vadovų sandorių pranešimai ir PDF..."):
-                stats = update_manager_transactions_from_recent_crib(days_back=int(manager_update_days), max_messages=50, headless=True, progress=None)
+            with st.spinner("Ieškomi nauji CRIB vadovų sandorių pranešimai ir PDF..."):
+                stats = update_manager_transactions_from_recent_crib(headless=True, progress=None)
             st.success(
                 "Vadovų sandoriai atnaujinti: "
+                f"tikrinta nuo {stats.get('sync_from_date', '—')}, "
                 f"rasta CRIB pranešimų {stats.get('manager_messages_found', 0)}, "
-                f"iš jų tiesiogiai CRIB {stats.get('manager_messages_found_directly', 0)}, "
                 f"apdorota {stats.get('manager_messages_processed', 0)}, "
                 f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
                 f"klaidų {stats.get('manager_transactions_errors', 0)}."
