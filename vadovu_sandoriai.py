@@ -2406,12 +2406,14 @@ def show_manager_transactions_page():
     if manager_update_btn:
         try:
             with st.spinner("Ieškomi nauji CRIB vadovų sandorių pranešimai ir PDF..."):
-                stats = update_manager_transactions_from_recent_crib(headless=True, progress=None)
+                # Bendras programos mygtukas ir šis puslapis naudoja tą pačią
+                # DB → PDF papildymo eigą.
+                from manager_transactions_update import update_manager_transactions_from_recent_crib as sync_manager_transactions
+                stats = sync_manager_transactions(headless=True, progress=None)
             st.success(
                 "Vadovų sandoriai atnaujinti: "
                 f"tikrinta nuo {stats.get('sync_from_date', '—')}, "
                 f"rasta CRIB pranešimų {stats.get('manager_messages_found', 0)}, "
-                f"iš jų tiesiogiai CRIB {stats.get('manager_messages_found_directly', 0)}, "
                 f"apdorota {stats.get('manager_messages_processed', 0)}, "
                 f"naujai įrašyta sandorių/PDF {stats.get('manager_transactions_saved', 0)}, "
                 f"klaidų {stats.get('manager_transactions_errors', 0)}."
