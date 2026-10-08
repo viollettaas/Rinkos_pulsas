@@ -23,6 +23,7 @@ except Exception:
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -655,12 +656,30 @@ def _download_pdf_bytes_with_browser(driver, pdf_url: str, crib_url: str = "") -
         )
         # GlobeNewswire kai kuriems priedams reikalauja, kad PDF užklausa
         # ateitų iš pranešimo puslapio, o ne iš tiesioginio serverio kliento.
+        clicked_attachment = False
         if crib_url:
             try:
                 driver.get(crib_url)
+                resource_id = pdf_url.rstrip("/").split("/")[-1].lower()
+                anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+                # Pirmiausia spaudžiame konkretų priedą. Jei CRIB HTML turi
+                # GlobeNewswire Tracker nuorodą, būtent paspaudimas išlaiko
+                # reikiamą nukreipimo ir sesijos grandinę.
+                for anchor in anchors:
+                    href = str(anchor.get_attribute("href") or "")
+                    label = str(anchor.text or "").lower()
+                    href_l = href.lower()
+                    if resource_id in href_l or (
+                        any(token in href_l for token in ("viewattachment", "attachment", "tracker", "resource/download"))
+                        and any(token in label for token in ("pdf", "pried", "attachment", "sandori"))
+                    ):
+                        driver.execute_script("arguments[0].click();", anchor)
+                        clicked_attachment = True
+                        break
             except Exception:
                 pass
-        driver.get(pdf_url)
+        if not clicked_attachment:
+            driver.get(pdf_url)
         deadline = time.time() + 30
         while time.time() < deadline:
             files = []
