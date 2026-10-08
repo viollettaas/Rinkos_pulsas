@@ -14,6 +14,11 @@ import pdfplumber
 import urllib3
 from bs4 import BeautifulSoup
 
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
@@ -631,16 +636,73 @@ def _extract_pdf_text(pdf_url: str) -> str:
     if not content:
         return ""
 
-    texts = []
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page in pdf.pages:
-            try:
-                txt = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
-            except Exception:
-                txt = page.extract_text() or ""
-            if txt:
-                texts.append(txt)
-    return "\n".join(texts).strip()
+    # Tas pats PDF skirtingose CRIB bendrovėse gali būti sugeneruotas su
+    # skirtinga vidine lentelės struktūra. Vien ``extract_text`` metodo
+    # neužtenka: kartais jis praleidžia lentelės celėse esančias reikšmes.
+    candidates = []
+    try:
+        with pdfplumber.open(BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                for kwargs in (
+                    {"x_tolerance": 1, "y_tolerance": 3},
+                    {"layout": True},
+                ):
+                    try:
+                        txt = page.extract_text(**kwargs) or ""
+                        if txt.strip():
+                            candidates.append(txt)
+                    except Exception:
+                        pass
+
+                # Žodžių srautas dažnai išlaiko reikšmes, kurių paprastas
+                # eilutinis ištraukimas nepateikia.
+                try:
+                    words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+                    word_text = " ".join(str(word.get("text") or "") for word in words).strip()
+                    if word_text:
+                        candidates.append(word_text)
+                except Exception:
+                    pass
+
+                # PDMR formos yra lentelės, todėl papildomai surenkame ir
+                # visas lentelės celes.
+                try:
+                    for table in page.extract_tables() or []:
+                        table_text = "\n".join(
+                            " ".join(str(cell or "") for cell in row)
+                            for row in table if row
+                        ).strip()
+                        if table_text:
+                            candidates.append(table_text)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Antras variklis padengia PDF, kurių koduotę pdfplumber perskaito tik
+    # dalinai. Jis yra papildomas, todėl programa veikia ir senesnėje aplinkoje.
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(BytesIO(content))
+            pypdf_text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+            if pypdf_text:
+                candidates.append(pypdf_text)
+        except Exception:
+            pass
+
+    if not candidates:
+        return ""
+
+    # Sujungiame skirtingus metodus: parseris turi ir lentelės antraštes, ir
+    # jų reikšmes. Dublikatai pašalinami, kad tekstas netaptų be reikalo ilgas.
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        normalized = _collapse_ws(candidate)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(candidate)
+    return "\n".join(unique).strip()
 
 
 # ------------------------------------------------------------
@@ -839,7 +901,7 @@ def _extract_isin(text: str) -> str:
     return ""
 
 
-def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> dict:
+def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", issuer_hint: str = "") -> dict:
     text = text or ""
     norm_text = _collapse_ws(text)
 
@@ -894,7 +956,11 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
             r"Issuer name",
             r"Name of the issuer",
         ], max_len=180)
-    issuer = _clean_issuer(issuer) or _extract_issuer_fallback(text, role=role, venue=venue, crib_title=crib_title)
+    issuer = (
+        _clean_issuer(issuer)
+        or _extract_issuer_fallback(text, role=role, venue=venue, crib_title=crib_title)
+        or _clean_issuer(issuer_hint)
+    )
 
     if not transaction_type:
         transaction_type = _text_after_label(text, [
@@ -1001,7 +1067,7 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
 # Naujų vadovų sandorių įrašymas iš market_news
 # ------------------------------------------------------------
 
-def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "") -> int:
+def save_manager_transactions_from_crib_selenium(driver, crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", issuer_hint: str = "") -> int:
     """Išsaugo po vieną DB eilutę kiekvienam CRIB PDF priedui.
 
     ``manager_transactions`` lentelėje privalomi tik CRIB ir PDF URL, todėl
@@ -1041,6 +1107,7 @@ def save_manager_transactions_from_crib_selenium(driver, crib_url: str, publishe
                     published_at=published_at,
                     crib_title=crib_title,
                     crib_category=crib_category,
+                    issuer_hint=issuer_hint,
                 )
 
             # Vienas PDF = viena eilutė. Negalima atmesti įrašo vien todėl,
@@ -1367,7 +1434,25 @@ def _load_bad_manager_transactions(limit: int = 200) -> pd.DataFrame:
     return df[mask].copy().reset_index(drop=True)
 
 
-def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", preferred_pdf_url: str = "") -> dict | None:
+def _issuer_hint_from_crib_news(crib_url: str, published_at=None) -> str:
+    """Pasiima emitento pavadinimą iš jau sukauptos CRIB market_news eilutės."""
+    if not crib_url:
+        return ""
+    try:
+        published = pd.to_datetime(published_at, errors="coerce")
+        center = published.date() if pd.notna(published) else date.today()
+        news = load_news_df("crib", center - timedelta(days=4), center + timedelta(days=4))
+        if news is None or news.empty or "url" not in news.columns:
+            return ""
+        matched = news[news["url"].fillna("").astype(str).str.strip().eq(str(crib_url).strip())]
+        if matched.empty or "company" not in matched.columns:
+            return ""
+        return _clean_issuer(str(matched.iloc[0].get("company") or ""))
+    except Exception:
+        return ""
+
+
+def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: str = "", crib_category: str = "", preferred_pdf_url: str = "", issuer_hint: str = "") -> dict | None:
     """Bando parsinti nurodytą PDF, o jei jis tuščias - ieško geresnės CRIB attachment nuorodos tame pačiame pranešime."""
     candidate_links = []
     if preferred_pdf_url:
@@ -1398,6 +1483,7 @@ def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: s
                 published_at=published_at,
                 crib_title=crib_title,
                 crib_category=crib_category,
+                issuer_hint=issuer_hint,
             )
             # Grąžiname ir dalinį rezultatą: taisymo eiga užpildo tai, ką
             # parseriui pavyko perskaityti, o likusios reikšmės lieka matomos
@@ -1443,6 +1529,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
         row_id = int(current_row.get("id"))
         pdf_url = str(current_row.get("pdf_url") or "").strip()
         crib_url = str(current_row.get("crib_url") or "").strip()
+        issuer_hint = _issuer_hint_from_crib_news(crib_url, current_row.get("published_at"))
 
         if not pdf_url and not crib_url:
             stats["failed"] += 1
@@ -1461,6 +1548,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                     crib_title=str(current_row.get("crib_title") or ""),
                     crib_category=str(current_row.get("crib_category") or ""),
                     preferred_pdf_url=pdf_url,
+                    issuer_hint=issuer_hint,
                 )
 
             # 2) Jei CRIB alternatyvų nėra, bet turime PDF URL, bandome tiesiogiai.
@@ -1475,6 +1563,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                             published_at=current_row.get("published_at"),
                             crib_title=str(current_row.get("crib_title") or ""),
                             crib_category=str(current_row.get("crib_category") or ""),
+                            issuer_hint=issuer_hint,
                         )
                 except Exception:
                     parsed = None
@@ -1488,6 +1577,7 @@ def repair_bad_manager_transactions(limit: int = 200, progress=None) -> dict:
                     published_at=current_row.get("published_at"),
                     crib_title=str(current_row.get("crib_title") or ""),
                     crib_category=str(current_row.get("crib_category") or ""),
+                    issuer_hint=issuer_hint,
                 )
 
             if parsed is None:
