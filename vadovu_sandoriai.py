@@ -21,6 +21,18 @@ try:
 except Exception:
     PdfReader = None
 
+# Dalis CRIB priedų yra skenuoti PDF: juose nėra nė vieno teksto simbolio.
+# Šios priklausomybės paliktos neprivalomos, kad modulis veiktų ir aplinkoje,
+# kurioje OCR dar neįdiegtas.
+try:
+    import fitz  # PyMuPDF
+    import pytesseract
+    from PIL import Image
+except Exception:
+    fitz = None
+    pytesseract = None
+    Image = None
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -709,6 +721,80 @@ def _download_pdf_bytes_with_browser(driver, pdf_url: str, crib_url: str = "") -
     return b""
 
 
+def _normalise_ocr_labels(text: str) -> str:
+    """Pataiso kelis dažniausius LT lentelių OCR užrašų variantus.
+
+    Reikšmių (vardų, emitentų) nekeičiamas, tik formos etiketės, pagal kurias
+    veikia parseris. Tesseract su anglišku modeliu dažnai ``ū/ė/š`` perskaito
+    kaip paprastą raidę arba didžiąją raidę vidury žodžio.
+    """
+    replacements = {
+        "Sandorio pobudis": "Sandorio pobūdis",
+        "Sandorio pobidis": "Sandorio pobūdis",
+        "Sandorio pobtdis": "Sandorio pobūdis",
+        "Finansinés priemonés": "Finansinės priemonės",
+        "Finansines priemones": "Finansinės priemonės",
+        "Finansines priemonés": "Finansinės priemonės",
+        "Finansinės priemonés": "Finansinės priemonės",
+        "priemones rusis": "priemonės rūšis",
+        "priemones riSis": "priemonės rūšis",
+        "apraSymas": "aprašymas",
+        "ISN kodas": "ISIN kodas",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _extract_scanned_pdf_text(content: bytes) -> str:
+    """Nuskaito vaizdinį PDF per OCR ir grąžina kelis jo išdėstymo variantus."""
+    if not content or fitz is None or pytesseract is None or Image is None:
+        return ""
+
+    candidates = []
+    document = None
+    try:
+        document = fitz.open(stream=content, filetype="pdf")
+        try:
+            installed_languages = set(pytesseract.get_languages(config=""))
+        except Exception:
+            installed_languages = set()
+        language = "lit+eng" if {"lit", "eng"}.issubset(installed_languages) else "eng"
+
+        for page in document:
+            # 216 DPI pakanka mažam šriftui lentelėje ir neapkrauna Streamlit.
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+            image = Image.open(BytesIO(pixmap.tobytes("png")))
+            # PSM 3 išlaiko eilutes (geriausia parseriui); PSM 11 papildomai
+            # surenka atskiras lentelės celes, jei PSM 3 kurią nors praleistų.
+            for psm in (3, 11):
+                try:
+                    value = pytesseract.image_to_string(
+                        image,
+                        lang=language,
+                        config=f"--oem 1 --psm {psm}",
+                        timeout=60,
+                    ).strip()
+                    if value:
+                        candidates.append(_normalise_ocr_labels(value))
+                except Exception:
+                    continue
+    except Exception:
+        return ""
+    finally:
+        if document is not None:
+            document.close()
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = _collapse_ws(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return "\n".join(unique).strip()
+
+
 def _extract_pdf_text(pdf_url: str, driver=None, crib_url: str = "") -> str:
     content = _download_pdf_bytes(pdf_url)
     if not content:
@@ -769,6 +855,14 @@ def _extract_pdf_text(pdf_url: str, driver=None, crib_url: str = "") -> str:
                 candidates.append(pypdf_text)
         except Exception:
             pass
+
+    # Jei PDF neturi tekstinio sluoksnio (pvz. nuskenuota pasirašyta forma),
+    # pereiname prie OCR. Anksčiau būtent čia grįždavo tuščias tekstas ir DB
+    # likdavo tik PDF nuoroda bei data.
+    if not candidates:
+        ocr_text = _extract_scanned_pdf_text(content)
+        if ocr_text:
+            candidates.append(ocr_text)
 
     if not candidates:
         return ""
