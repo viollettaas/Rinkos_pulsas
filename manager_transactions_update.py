@@ -9,6 +9,11 @@ import pandas as pd
 from supabase_cache import load_news_df, _supabase_headers, _supabase_rest_url, _http_client
 from vadovu_sandoriai import _init_driver, save_manager_transactions_from_crib_selenium
 
+# Vienkartiniam istorinių vadovų sandorių papildymui pradedame nuo šios datos.
+# Negalima remtis paskutine DB data: joje gali būti vėlesni pavieniai įrašai,
+# nors tarp ankstesnių datų vis dar yra neįrašytų CRIB PDF.
+HISTORICAL_SYNC_FROM = date(2026, 6, 1)
+
 
 def _is_manager_notice(row) -> bool:
     text = " ".join(
@@ -73,9 +78,8 @@ def update_manager_transactions_from_recent_crib(
     headless: bool = True,
     progress=None,
 ) -> dict:
-    """Papildo visus vadovų sandorius nuo paskutinio DB įrašo."""
-    last_date = _last_manager_notice_date()
-    start_date = last_date - timedelta(days=1) if last_date else date.today() - timedelta(days=days_back)
+    """Papildo istorinius ir naujus vadovų sandorius nuo 2026-06-01."""
+    start_date = HISTORICAL_SYNC_FROM
     stats = {
         "sync_from_date": start_date.isoformat(),
         "manager_messages_found": 0,
