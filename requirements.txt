@@ -9,6 +9,7 @@ urllib3
 supabase
 bs4 
 pdfplumber
+pypdf
 beautifulsoup4
 httpx
 requests
