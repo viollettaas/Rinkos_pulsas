@@ -633,13 +633,19 @@ def _download_pdf_bytes(pdf_url: str) -> bytes:
         "Accept": "application/pdf,application/octet-stream,*/*",
         "Accept-Language": "lt-LT,lt;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    resp = requests.get(pdf_url, headers=headers, verify=False, timeout=45, allow_redirects=True)
-    resp.raise_for_status()
-    content = resp.content or b""
-    # Kai kurių ml-eu.globenewswire nuorodų turinys nėra PDF arba yra tuščias.
-    if len(content) < 100 or not content[:20].lstrip().startswith(b"%PDF"):
+    try:
+        resp = requests.get(pdf_url, headers=headers, verify=False, timeout=45, allow_redirects=True)
+        # GlobeNewswire Resource URL dažnai grąžina 403 serveriniam klientui.
+        # Tai nėra galutinė klaida: grąžiname tuščią rezultatą, kad toliau
+        # būtų paleistas Chrome / CRIB priedo paspaudimo kelias.
+        if not resp.ok:
+            return b""
+        content = resp.content or b""
+        if len(content) < 100 or not content[:20].lstrip().startswith(b"%PDF"):
+            return b""
+        return content
+    except requests.RequestException:
         return b""
-    return content
 
 
 def _download_pdf_bytes_with_browser(driver, pdf_url: str, crib_url: str = "") -> bytes:
