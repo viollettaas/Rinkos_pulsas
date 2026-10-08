@@ -364,6 +364,13 @@ def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dic
     Gerų reikšmių tuščiomis neperrašome.
     """
     update = {}
+    # Įrašai su šiais statusais atsirado iš ankstesnio, silpnesnio parserio.
+    # Perskaitę PDF nauju parseriu galime pakeisti ir jau esančią, bet klaidingą
+    # reikšmę — ne vien užpildyti NULL lauką.
+    reparsing_incomplete_row = str(current_row.get("parse_status") or "").strip().lower() in {
+        "pdf_parse_error", "pdf_text_empty", "parsed_incomplete",
+        "pdf_parse_empty_after_retry", "repaired_partial_fields",
+    }
 
     fill_if_empty_or_bad = [
         "issuer", "lei", "person_name", "person_role", "isin", "instrument",
@@ -376,7 +383,11 @@ def _update_manager_transaction_empty_fields_by_id(row_id: int, current_row: dic
         old_val = current_row.get(col)
         if col == "issuer" and _has_useful_value(new_val):
             new_val = _canonical_issuer_name(new_val)
-        if (_is_empty_db_value(old_val) or _is_bad_existing_value(col, old_val)) and _has_useful_value(new_val):
+        if (
+            _is_empty_db_value(old_val)
+            or _is_bad_existing_value(col, old_val)
+            or reparsing_incomplete_row
+        ) and _has_useful_value(new_val):
             # Neįrašome akivaizdžiai blogos naujos reikšmės.
             if not _is_bad_existing_value(col, new_val):
                 update[col] = new_val
@@ -677,6 +688,44 @@ def _text_after_label(text: str, labels, max_len: int = 160) -> str:
     return ""
 
 
+def _pdmar_section_value(text: str, section: int, letter: str, labels, next_marker: str, max_len: int = 260) -> str:
+    """Ištraukia reikšmę iš standartinės PDMR/MAR formos lentelės.
+
+    PDF tekstas dažnai neturi originalių lentelės stulpelių: antraštė ir
+    reikšmė būna skirtingose eilutėse. Todėl ieškome pagal formos numerius
+    (pvz. ``3. a) Name``), o ne pagal vieną nekintamą eilutę.
+    """
+    flat = _collapse_ws(text)
+    if not flat:
+        return ""
+    label_re = "|".join(labels)
+    pattern = (
+        rf"\b{section}\s*[.)].*?\b{re.escape(letter)}\)\s*"
+        rf"(?:{label_re})\s*[:\-]?\s*(.+?)"
+        rf"(?=\s*(?:{next_marker}|{section + 1}\s*[.)])|$)"
+    )
+    match = re.search(pattern, flat, flags=re.I | re.S)
+    return _collapse_ws(match.group(1))[:max_len] if match else ""
+
+
+def _pdmar_price_quantity(text: str):
+    """Nuskaito 4(c) lentelės kainą ir kiekį LT bei EN PDMR formose."""
+    flat = _collapse_ws(text)
+    # Standartinės 4(c) skilties ribos apsaugo nuo datos ir LEI skaičių.
+    block_match = re.search(
+        r"\b4\s*[.)].*?\bc\)\s*(.+?)(?=\s*d\)|\s*5\s*[.)]|$)",
+        flat,
+        flags=re.I | re.S,
+    )
+    block = block_match.group(1) if block_match else flat
+    number_tokens = re.findall(r"(?<![A-Z0-9])\d[\d\s]*(?:[.,]\d+)?", block)
+    values = [_parse_number(token) for token in number_tokens]
+    values = [value for value in values if value is not None]
+    if len(values) >= 2:
+        return values[0], _parse_number(number_tokens[1], as_int=True)
+    return None, None
+
+
 def _extract_date_from_text(text: str):
     if not text:
         return None
@@ -802,6 +851,20 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     venue = _regex_value(text, r"f\)\s*Sandorio vieta\s+(.+?)\s*$")
     transaction_date = _regex_value(text, r"e\)\s*Sandorio data\s+(\d{4}[-.]\d{2}[-.]\d{2})") or _extract_date_from_text(text)
 
+    # Standartinės angliškos / lietuviškos PDMR formos. Ši eiga ypač svarbi
+    # GlobalNewswire PDF, kuriuose lentelės stulpeliai ištraukiami į atskiras
+    # teksto eilutes.
+    person = person or _pdmar_section_value(text, 1, "a", [r"Pavadinimas", r"Name"], r"b\)|2\s*[.)]")
+    role = role or _pdmar_section_value(text, 2, "a", [r"Pareigos\s*/\s*statusas", r"Position\s*/\s*status", r"Position", r"Status"], r"b\)|3\s*[.)]")
+    issuer = issuer or _pdmar_section_value(text, 3, "a", [r"Pavadinimas", r"Name(?:\s+of\s+the\s+issuer)?"], r"b\)|4\s*[.)]")
+    lei = lei or _pdmar_section_value(text, 3, "b", [r"LEI", r"Legal Entity Identifier"], r"4\s*[.)]")
+    transaction_type = transaction_type or _pdmar_section_value(text, 4, "b", [r"Sandorio pobūdis", r"Sandorio rūšis", r"Nature of the transaction", r"Transaction type"], r"c\)|5\s*[.)]")
+    venue = venue or _pdmar_section_value(text, 4, "f", [r"Sandorio vieta", r"Prekybos vieta", r"Place of the transaction", r"Trading venue"], r"5\s*[.)]")
+    date_value = _pdmar_section_value(text, 4, "e", [r"Sandorio data", r"Date of transaction"], r"f\)|5\s*[.)]")
+    if date_value:
+        extracted = _extract_date_from_text(date_value)
+        transaction_date = extracted or transaction_date
+
     # Alternatyvios formos, kur laukai vadinasi kitaip.
     if not person:
         person = _text_after_label(text, [
@@ -857,6 +920,11 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
         isin = ""
 
     instrument_block = _regex_value(text, r"a\)\s*Finansinės priemonės\s+(.+?)\s+b\)\s*Sandorio pobūdis")
+    instrument_block = instrument_block or _pdmar_section_value(
+        text, 4, "a",
+        [r"Finansinės priemonės.*?aprašymas", r"Financial instrument.*?description", r"Description of the financial instrument"],
+        r"b\)|5\s*[.)]",
+    )
     if not instrument_block:
         instrument_block = _text_after_label(text, [
             r"Finansinės priemonės aprašymas.*?Identifikavimo kodas",
@@ -876,6 +944,11 @@ def _parse_manager_transaction_pdf_text(text: str, pdf_url: str, crib_url: str, 
     if pq:
         price = _parse_number(pq.group(1))
         quantity = _parse_number(pq.group(2), as_int=True)
+
+    if price is None or quantity is None:
+        section_price, section_quantity = _pdmar_price_quantity(text)
+        price = price if price is not None else section_price
+        quantity = quantity if quantity is not None else section_quantity
 
     if quantity is None:
         q = re.search(r"(?:Akcijų\s+kiekis|apibendrinta\s+apimtis)\s*[:\-]?\s*([\d\s]+)", text, flags=re.I)
