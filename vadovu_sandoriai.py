@@ -142,7 +142,12 @@ def _is_hidden_manager_report_row(row: dict) -> bool:
 
 
 def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Pašalina techninius / tuščius PDF įrašus prieš rodant Streamlit ataskaitoje."""
+    """Palieka visus DB įrašus, pašalindama tik tikslius jų dublikatus.
+
+    Nepilnai nuskaitytas PDF yra svarbus vadovų sandorių pranešimas, todėl jo
+    negalima slėpti vien dėl ``parse_status``. Statusas ir pastaba rodomi
+    lentelėje, kad būtų aišku, kuriuos PDF dar verta perparsinti.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -150,9 +155,6 @@ def _filter_hidden_manager_report_rows(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["issuer", "parse_status", "price_quantity_note", "raw_text"]:
         if col not in df.columns:
             df[col] = ""
-
-    mask_hidden = df.apply(lambda r: _is_hidden_manager_report_row(r.to_dict()), axis=1)
-    df = df[~mask_hidden].copy()
 
     # Papildoma apsauga nuo to paties sandorio dubliavimo, jei jis į DB pateko keliais keliais.
     dedup_cols = [
@@ -1336,7 +1338,11 @@ def _try_parse_best_pdf_for_crib(crib_url: str, published_at=None, crib_title: s
                 crib_title=crib_title,
                 crib_category=crib_category,
             )
-            if _is_good_parsed_row(parsed):
+            # Grąžiname ir dalinį rezultatą: taisymo eiga užpildo tai, ką
+            # parseriui pavyko perskaityti, o likusios reikšmės lieka matomos
+            # su statusu. Anksčiau čia buvo reikalaujama visų 4 laukų ir PDF
+            # nebuvo atnaujinamas net tada, kai dalis duomenų buvo perskaityta.
+            if str(parsed.get("raw_text") or "").strip():
                 return parsed
         except Exception:
             continue
@@ -1824,8 +1830,7 @@ def prepare_manager_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Čia atliekamas pagrindinis pataisymas: techniniai nepavykusio PDF
-    # nuskaitymo įrašai nerodomi ataskaitoje ir nepatenka į santraukas.
+    # Rodyti visus įrašytus PDF, įskaitant nepilnai išparsintus.
     df = _filter_hidden_manager_report_rows(df)
     if df.empty:
         return pd.DataFrame()
@@ -2414,11 +2419,11 @@ def show_manager_transactions_page():
     with st.sidebar:
         st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-card-title">👔 Vadovų sandoriai</div>', unsafe_allow_html=True)
-        manager_start_date = st.date_input("Pranešimo data nuo", value=date.today() - timedelta(days=30), key="manager_start_date")
+        manager_start_date = st.date_input("Pranešimo data nuo", value=date(2026, 6, 1), key="manager_start_date_from_2026_06_01")
         manager_end_date = st.date_input("Pranešimo data iki", value=date.today(), key="manager_end_date")
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-card-subtitle">Vienu paspaudimu papildo vadovų sandorius nuo paskutinio DB įrašyto CRIB pranešimo. Jau įrašyti PDF automatiškai praleidžiami.</div>',
+            '<div class="sidebar-card-subtitle">Papildymas tikrina CRIB pranešimus nuo 2026-06-01. Jau įrašyti PDF automatiškai praleidžiami.</div>',
             unsafe_allow_html=True,
         )
         last_saved = _last_saved_manager_notice_date()
@@ -2427,8 +2432,7 @@ def show_manager_transactions_page():
         with st.expander("Techninis DB tvarkymas"):
             latest_recalc_btn = st.button("🔁 Perskaičiuoti paskutinį pranešimą", use_container_width=True, key="manager_latest_recalc_btn")
             duplicate_cleanup_btn = st.button("🧽 Ištrinti dublikatus DB", use_container_width=True, key="manager_duplicate_cleanup_btn")
-            repair_bad_btn = st.button("🔧 Sutvarkyti blogai nuskaitytus PDF", use_container_width=True, key="manager_repair_bad_btn")
-            cleanup_hidden_btn = st.button("🧹 Ištrinti techninius tuščius įrašus", use_container_width=True, key="manager_cleanup_hidden_btn")
+            repair_bad_btn = st.button("🔄 Perskaityti iš naujo ir pataisyti nepilnus PDF", use_container_width=True, key="manager_repair_bad_btn")
             repair_limit = st.number_input("Blogų PDF / dublikatų limitas", min_value=10, max_value=5000, value=1000, step=10, key="manager_repair_limit")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2503,34 +2507,17 @@ def show_manager_transactions_page():
 
     if repair_bad_btn:
         try:
-            with st.spinner("Taisomi blogai nuskaityti PDF įrašai..."):
+            with st.spinner("PDF atsisiunčiami ir perskaitomi iš naujo..."):
                 stats = repair_bad_manager_transactions(limit=int(repair_limit), progress=None)
             st.success(
-                "Blogų PDF taisymas baigtas: "
+                "Pakartotinis PDF nuskaitymas baigtas: "
                 f"rasta {stats.get('bad_found', 0)}, "
                 f"sutvarkyta {stats.get('repaired', 0)}, "
                 f"ištrinta tuščių dublikatų {stats.get('deleted_duplicates', 0)}, "
                 f"dalinai {stats.get('partial', 0)}, nepakeista {stats.get('unchanged', 0)}, nepavyko {stats.get('failed', 0)}."
             )
-            st.rerun()
         except Exception as exc:
-            st.error("Nepavyko sutvarkyti blogai nuskaitytų PDF.")
-            st.exception(exc)
-            st.stop()
-
-    if cleanup_hidden_btn:
-        try:
-            with st.spinner("Trinami techniniai tušti vadovų sandorių įrašai..."):
-                stats = delete_hidden_manager_report_rows(limit=int(repair_limit))
-            st.success(
-                "Techniniai tušti įrašai sutvarkyti: "
-                f"rasta {stats.get('found', 0)}, "
-                f"ištrinta {stats.get('deleted', 0)}, "
-                f"klaidų {stats.get('errors', 0)}."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error("Nepavyko ištrinti techninių tuščių įrašų.")
+            st.error("Nepavyko pakartotinai perskaityti PDF.")
             st.exception(exc)
             st.stop()
 
