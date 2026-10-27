@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from datetime import date, datetime
+import re
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -1288,8 +1289,15 @@ with tab5:
             with st.expander(f"{ticker} · {len(posts)} komentarai"):
                 for _, post in posts.iterrows():
                     moment = post["published_at"].strftime("%Y-%m-%d %H:%M")
-                    st.markdown(f"**{moment}** · [{post['title']}]({post['url']})")
-                    st.write(post["content"])
+                    with st.container(border=True):
+                        st.markdown(f"**{moment}** · [{post['title']}]({post['url']})")
+                        for line in str(post["content"]).splitlines():
+                            # Traders.lt citatos prasideda „Vartotojas [data]:“.
+                            # Jas rodome atskirai, kad būtų aišku, kas cituojama.
+                            if re.match(r"^.+\s\[20\d{2}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\]:$", line):
+                                st.markdown(f"> **Cituojama:** {line}")
+                            else:
+                                st.markdown(line)
 
 with tab6:
     components.html(
