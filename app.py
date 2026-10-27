@@ -1289,8 +1289,14 @@ with tab5:
             with st.expander(f"{ticker} · {len(posts)} komentarai"):
                 for _, post in posts.iterrows():
                     moment = post["published_at"].strftime("%Y-%m-%d %H:%M")
+                    meta = str(post["title"]).split("|||")
+                    topic = meta[0] if meta else str(post["title"])
+                    author, status, location, messages = (meta[1:] + ["", "", "", ""])[:4]
+                    profile = " · ".join(value for value in [author, status, location, messages] if value)
                     with st.container(border=True):
-                        st.markdown(f"**{moment}** · [{post['title']}]({post['url']})")
+                        st.markdown(f"**{moment}** · [{topic}]({post['url']})")
+                        if profile:
+                            st.caption(f"👤 {profile}")
                         for line in str(post["content"]).splitlines():
                             # Traders.lt citatos prasideda „Vartotojas [data]:“.
                             # Jas rodome atskirai, kad būtų aišku, kas cituojama.
