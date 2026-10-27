@@ -78,6 +78,15 @@ def save_news_df(df: pd.DataFrame, source: str):
             published_at = r.get("__dt", None)
             content = r.get("Nasdaq_pilnas_tekstas", "")
 
+        elif source == "traders":
+            company = r.get("Ticker", "")
+            company_norm = str(company).lower()
+            category = "Traders.lt diskusija"
+            title = r.get("Tema", "")
+            url = r.get("Nuoroda", "")
+            published_at = r.get("Data", None)
+            content = r.get("Tekstas", "")
+
         else:
             continue
 
