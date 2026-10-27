@@ -13,6 +13,7 @@ import re
 import time
 import hashlib
 import warnings
+from html import escape
 from difflib import SequenceMatcher
 from datetime import datetime, date, timedelta
 from io import BytesIO
@@ -1037,7 +1038,69 @@ def render_visos_naujienos(df_all: pd.DataFrame, caption="Visos skirtingos nauji
     )
 
 
-def build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos) -> str:
+def build_traders_html_section(traders_df: pd.DataFrame, allowed_tickers) -> str:
+    """Sukuria pilnos HTML ataskaitos Traders.lt komentarų skyrių."""
+    if traders_df is None or traders_df.empty:
+        return """
+        <section class=\"traders-section\">
+            <h1>💬 Traders.lt diskusijos</h1>
+            <p class=\"traders-note\">Pasirinktam laikotarpiui ataskaitos bendrovių komentarų nėra.</p>
+        </section>
+        """
+
+    posts = traders_df.copy()
+    posts["published_at"] = pd.to_datetime(posts.get("published_at"), errors="coerce")
+    allowed = {str(value).upper() for value in allowed_tickers if pd.notna(value)}
+    posts = posts[
+        posts["company"].astype(str).str.upper().isin(allowed)
+        & posts["published_at"].notna()
+    ].sort_values(["company", "published_at"])
+
+    if posts.empty:
+        return """
+        <section class=\"traders-section\">
+            <h1>💬 Traders.lt diskusijos</h1>
+            <p class=\"traders-note\">Pasirinktam laikotarpiui ataskaitos bendrovių komentarų nėra.</p>
+        </section>
+        """
+
+    groups = []
+    for ticker, company_posts in posts.groupby("company", sort=True):
+        cards = []
+        for _, post in company_posts.iterrows():
+            meta = str(post.get("title", "")).split("|||")
+            topic = meta[0] if meta else str(post.get("title", ""))
+            author, status, location, messages = (meta[1:] + ["", "", "", ""])[:4]
+            profile = " · ".join(
+                str(value) for value in [author, status, location, messages] if str(value).strip()
+            )
+            moment = post["published_at"].strftime("%Y-%m-%d %H:%M")
+            url = escape(str(post.get("url", "")), quote=True)
+            topic_html = escape(str(topic))
+            heading = (
+                f'<a href="{url}" target="_blank" rel="noopener">{topic_html}</a>'
+                if url else topic_html
+            )
+            profile_html = f'<div class="traders-profile">👤 {escape(profile)}</div>' if profile else ""
+            content = escape(str(post.get("content", ""))).replace("\n", "<br>")
+            cards.append(
+                f'<article class="traders-post"><div class="traders-post-head">'
+                f'<strong>{moment}</strong> · {heading}</div>{profile_html}'
+                f'<div class="traders-content">{content}</div></article>'
+            )
+        groups.append(
+            f'<section class="traders-company"><h2>{escape(str(ticker))} '
+            f'<span>({len(company_posts)} komentarai)</span></h2>{"".join(cards)}</section>'
+        )
+
+    return (
+        '<section class="traders-section"><h1>💬 Traders.lt diskusijos</h1>'
+        '<p class="traders-note">Neoficialūs investuotojų komentarai; tai nėra bendrovių pranešimai ar investavimo rekomendacijos.</p>'
+        f'{"".join(groups)}</section>'
+    )
+
+
+def build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos, traders_html="") -> str:
     return f"""
 <!DOCTYPE html>
 <html lang="lt">
@@ -1049,6 +1112,16 @@ def build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, st
         table {{ border-collapse: collapse; width: 100%; margin-bottom: 25px; }}
         th, td {{ border: 1px solid #ddd; padding: 6px; vertical-align: top; }}
         a {{ color: #0645ad; }}
+        .traders-section {{ margin-top: 34px; }}
+        .traders-section h1 {{ color: #12345a; }}
+        .traders-note {{ color: #5c6673; font-size: 13px; }}
+        .traders-company {{ margin: 25px 0; }}
+        .traders-company h2 {{ color: #12345a; border-bottom: 2px solid #cbd8e6; padding-bottom: 7px; }}
+        .traders-company h2 span {{ color: #697586; font-size: 14px; font-weight: normal; }}
+        .traders-post {{ border: 1px solid #dce3ea; border-radius: 8px; padding: 14px; margin: 10px 0; }}
+        .traders-post-head {{ color: #1e293b; margin-bottom: 6px; }}
+        .traders-profile {{ color: #697586; font-size: 13px; margin-bottom: 12px; }}
+        .traders-content {{ line-height: 1.55; white-space: normal; }}
     </style>
 </head>
 <body>
@@ -1059,6 +1132,8 @@ def build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, st
     {styled_first_north.to_html()}
     <br><hr><br>
     {styled_visos.to_html()}
+    <br><hr><br>
+    {traders_html}
 </body>
 </html>
 """
@@ -1400,7 +1475,22 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
         "Visos skirtingos naujienos (Nasdaq Baltic + CRIB + VŽ, pilnas tekstas)",
     )
 
-    html = build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos)
+    # Traders.lt komentarai į pilną HTML pridedami atskiru, nuo pagrindinių
+    # naujienų lentelių nepriklausomu skyriumi. Rodomi tik Excel faile esančių
+    # emitentų trumpiniai ir tik pasirinktas ataskaitinis laikotarpis.
+    try:
+        df_traders = load_news_df("traders", start_date, end_date)
+    except Exception:
+        df_traders = pd.DataFrame()
+    traders_html = build_traders_html_section(df_traders, df.get("Trumpinys", pd.Series(dtype=str)))
+
+    html = build_html_report(
+        styled_akcijos,
+        styled_obligacijos,
+        styled_first_north,
+        styled_visos,
+        traders_html=traders_html,
+    )
 
     return {
         "start_date": start_date,
@@ -1413,6 +1503,7 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
         "df_crib": df_news,
         "df_vz": vz_df,
         "df_nasdaq": df_nasdaq,
+        "df_traders": df_traders,
         "styled_akcijos": styled_akcijos,
         "styled_obligacijos": styled_obligacijos,
         "styled_first_north": styled_first_north,
