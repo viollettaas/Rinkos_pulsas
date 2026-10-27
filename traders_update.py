@@ -3,7 +3,7 @@
 import re
 import time
 from datetime import date, timedelta
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import pandas as pd
 import requests
 import urllib3
@@ -15,8 +15,16 @@ TOPICS = BASE + "forums.php?m=topics&s=8&o=updated&w=desc&d={}"
 DATE_RE = re.compile(r"20\d{2}-\d{2}-\d{2}\s+\d{1,2}:\d{2}")
 POST_ID_RE = re.compile(r"#\s*(\d+)")
 PROFILE_SEPARATOR = "|||"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RinkosPulsas/1.0)"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "lt-LT,lt;q=0.9,en;q=0.8",
+}
 SESSION = requests.Session()
+REQUEST_PAUSE_SECONDS = 1.2
 
 # Kai kuriuose darbiniuose tinkluose HTTPS srautas tikrinamas per vidinį
 # sertifikatą, kurio Windows Python sertifikatų saugykla nepažįsta.
@@ -24,19 +32,48 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def _get(url):
     """Nuskaito puslapį su pakartojimu, nes forumas riboja greitas užklausas."""
+    global SESSION
     last_error = None
     for attempt in range(3):
         try:
             response = SESSION.get(url, headers={**HEADERS, "Referer": BASE}, timeout=45, verify=False)
+            # Traders.lt kartais pateikia tariamą 404 po daug nuoseklių
+            # užklausų. Nauja sesija ir ilgesnė pauzė tokiu atveju leidžia
+            # pakartoti tą patį puslapį, o ne prarasti visą emitento temą.
+            if response.status_code == 404:
+                response.close()
+                SESSION.close()
+                SESSION = requests.Session()
+                raise requests.HTTPError(f"HTTP 404 (bandymas {attempt + 1})")
             if response.status_code in (429, 500, 502, 503, 504):
                 raise requests.HTTPError(f"HTTP {response.status_code}")
             response.raise_for_status()
-            time.sleep(0.20)
+            time.sleep(REQUEST_PAUSE_SECONDS)
             return BeautifulSoup(response.text, "html.parser")
         except requests.RequestException as exc:
             last_error = exc
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(5 * (attempt + 1))
     raise RuntimeError(f"Nepavyko nuskaityti {url}: {last_error}")
+
+
+def _canonical_topic_url(url):
+    """Sutvarko temos parametrų eilę į Traders.lt naudojamą formą.
+
+    Kai kuriems seniems puslapiams svetainė nestabiliai atsako į ``m, q, d``
+    eiliškumą, nors naršyklėje kanoninė nuoroda yra ``d, m, q``.
+    """
+    parsed = urlparse(urljoin(BASE, url))
+    query = parse_qs(parsed.query)
+    topic_id = query.get("q", [""])[0]
+    if not topic_id:
+        return urljoin(BASE, url)
+    pairs = []
+    # Net pirmasis puslapis turi būti su ``d=0``. Kai kurioms senesnėms
+    # temoms URL be šio parametro serveris per requests grąžina 404.
+    offset = query.get("d", ["0"])[0] or "0"
+    pairs.append(("d", offset))
+    pairs.extend((("m", "posts"), ("q", topic_id)))
+    return BASE + "forums.php?" + urlencode(pairs)
 
 def _topics(start):
     out = []
@@ -56,7 +93,7 @@ def _topics(start):
             last = pd.to_datetime(dates[-1], errors="coerce")
             if pd.isna(last):
                 continue
-            page.append((ticker.group(1), title, urljoin(BASE, a.get("href", "")), last.date()))
+            page.append((ticker.group(1), title, _canonical_topic_url(a.get("href", "")), last.date()))
         if not page:
             break
         out.extend(x for x in page if x[3] >= start)
@@ -84,7 +121,7 @@ def _topic_page_urls(last_page_url, max_pages=12):
     # puslapiavimo nuorodų būtina paimti tikrą paskutinio puslapio URL.
     offsets = []
     for anchor in first.select('a[href*="m=posts"][href*="d="]'):
-        candidate = urljoin(BASE, anchor.get("href", ""))
+        candidate = _canonical_topic_url(anchor.get("href", ""))
         offset = _page_offset(candidate)
         if offset is not None:
             offsets.append((offset, candidate))
@@ -145,6 +182,28 @@ def _rows_from_page(ticker, topic, page_url, soup, start, end):
     status_re = re.compile(r"^(Senbuvis|Aktyvusis|Naujokas|Narys|Moderatorius)$", re.I)
     messages_re = re.compile(r"^\d[\d ]* žinutės", re.I)
 
+    def is_profile_block_start(values, index):
+        """Atpažįsta autoriaus kortelę, kuri forumo HTML kartojama po tekstu.
+
+        Kortelė paprastai yra ``vardas, statusas, [vieta], X žinutės``.
+        Jos negalima pridėti prie komentaro turinio.
+        """
+        if index + 2 >= len(values) or not status_re.match(values[index + 1]):
+            return False
+        return any(messages_re.match(candidate) for candidate in values[index + 2:index + 7])
+
+    def is_forum_footer_start(values, index):
+        """Atpažįsta navigaciją po paskutiniu temos komentaru.
+
+        Išskleistame Traders.lt tekste ji prasideda eilutėmis
+        ``Pradžia`` ir ``Aktyvios temos``, o po jų eina puslapių numeriai.
+        """
+        return (
+            values[index] == "Pradžia"
+            and index + 1 < len(values)
+            and values[index + 1] == "Aktyvios temos"
+        )
+
     for position, (date_index, marker_index, post_id) in enumerate(headers):
         timestamp = pd.to_datetime(DATE_RE.search(lines[date_index]).group(0), errors="coerce")
         if pd.isna(timestamp):
@@ -169,8 +228,15 @@ def _rows_from_page(ticker, topic, page_url, soup, start, end):
 
         next_date_index = headers[position + 1][0] if position + 1 < len(headers) else len(lines)
         body_lines = []
-        for value in lines[marker_index + 1:next_date_index]:
+        candidate_lines = lines[marker_index + 1:next_date_index]
+        for line_index, value in enumerate(candidate_lines):
             if value.startswith(("Puslapiai:", "Forumas", "Norėdami rašyti forume", "© traders.lt")):
+                break
+            # Po teksto forumas dar kartą išveda autoriaus šoninę kortelę.
+            # Ji prasideda autoriaus vardu, o kitoje eilutėje yra statusas.
+            if is_profile_block_start(candidate_lines, line_index):
+                break
+            if is_forum_footer_start(candidate_lines, line_index):
                 break
             if value in {"Redaguoti", "Cituoti", "Pranešti"}:
                 continue
@@ -194,7 +260,15 @@ def _rows_from_page(ticker, topic, page_url, soup, start, end):
 def _posts(ticker, topic, url, start, end, max_pages=12):
     rows = []
     for page_url, already_loaded in _topic_page_urls(url, max_pages=max_pages):
-        soup = already_loaded or _get(page_url)
+        try:
+            soup = already_loaded or _get(page_url)
+        except RuntimeError as exc:
+            # Vienas laikinai nepasiekiamas puslapis neturi panaikinti visų
+            # tos bendrovės jau rastų (ar kituose puslapiuose esančių) įrašų.
+            # Kitas senesnis puslapis bus bandomas toliau.
+            if "404" in str(exc):
+                continue
+            raise
         page_rows, page_dates = _rows_from_page(ticker, topic, page_url, soup, start, end)
         rows.extend(page_rows)
         # Kadangi einame nuo naujausio puslapio atgal, tolesni puslapiai jau
