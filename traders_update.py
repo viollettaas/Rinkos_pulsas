@@ -59,17 +59,30 @@ def _topic_page_urls(last_page_url, max_pages=12):
     atgal. Baigiame anksti, kai įrašai jau senesni už pasirinktą laikotarpį.
     """
     first = _get(last_page_url)
-    numbered = [_page_number(urljoin(BASE, a.get("href", "")))
-                for a in first.select('a[href*="m=posts"][href*="n="]')]
-    numbered = [n for n in numbered if n is not None]
-    last_number = max(numbered) if numbered else _page_number(last_page_url)
+    # Temos pavadinimo nuoroda dažnai atidaro pirmą puslapį (be ``n=``),
+    # todėl iš puslapiavimo nuorodų būtina paimti tikrą paskutinio puslapio URL.
+    numbered = []
+    for anchor in first.select('a[href*="m=posts"][href*="n="]'):
+        candidate = urljoin(BASE, anchor.get("href", ""))
+        number = _page_number(candidate)
+        if number is not None:
+            numbered.append((number, candidate))
+
+    last_number = max((number for number, _ in numbered), default=_page_number(last_page_url))
     if last_number is None:
         return [(last_page_url, first)]
 
-    def page_url(number):
-        return re.sub(r"([?&]n=)(?:last|\\d+)", rf"\\g<1>{number}", last_page_url)
+    last_url = next((candidate for number, candidate in numbered if number == last_number), None)
 
-    urls = [(page_url(last_number), first)]
+    def page_url(number):
+        if last_url:
+            return re.sub(r"([?&]n=)(?:last|\\d+)", rf"\\g<1>{number}", last_url)
+        # Atsarginis variantas temoms, kurios turi tik vieną puslapį.
+        separator = "&" if "?" in last_page_url else "?"
+        return last_page_url + f"{separator}n={number}"
+
+    # ``first`` yra pirmo puslapio HTML, todėl naujausią puslapį keliame iš naujo.
+    urls = [(page_url(last_number), None)]
     for number in range(last_number - 1, max(0, last_number - max_pages), -1):
         urls.append((page_url(number), None))
     return urls
