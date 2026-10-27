@@ -141,4 +141,4 @@ def update_traders_forum(days_back=45):
     inserted = save_news_df(df, "traders") if not df.empty else 0
     try: log_scrape("traders", start, end, "success", len(df))
     except Exception: pass
-    return {"found": len(df), "inserted"
+    return {"found": len(df), "inserted": inserted}
