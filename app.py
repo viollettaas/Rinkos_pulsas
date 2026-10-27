@@ -8,6 +8,7 @@ import streamlit.components.v1 as components
 from rinkos_logika import generate_report, download_nasdaq_statistics_excel
 from emitentu_atranka import generate_emitentu_ataskaita
 from crib_update import update_crib_news, get_latest_crib_news_date
+from nasdaq_update import update_nasdaq_news
 from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
 from vz_update import update_vz_news_fast
 
@@ -571,6 +572,8 @@ def refresh_all_data() -> dict:
     result = {
         "crib_inserted": 0,
         "crib_pages": 0,
+        "nasdaq_found": 0,
+        "nasdaq_inserted": 0,
         "manager_found": 0,
         "manager_processed": 0,
         "manager_saved": 0,
@@ -599,10 +602,19 @@ def refresh_all_data() -> dict:
     except Exception as exc:
         result["errors"].append(f"CRIB: {type(exc).__name__}: {exc}")
 
+    # 2. Nasdaq Baltic: čia skelbiami ir First North pranešimai, kurių CRIB nebūna.
+    try:
+        with st.spinner("Tikrinami Nasdaq Baltic ir First North pranešimai..."):
+            nasdaq_stats = update_nasdaq_news(days_back=370, headless=True, progress=None) or {}
+        result["nasdaq_found"] = _safe_int(nasdaq_stats.get("records_found"))
+        result["nasdaq_inserted"] = _safe_int(nasdaq_stats.get("records_inserted"))
+    except Exception as exc:
+        result["errors"].append(f"Nasdaq Baltic: {type(exc).__name__}: {exc}")
+
     # Būtina išvalyti kešą prieš vadovų sandorių modulį, nes jis skaito market_news.
     st.cache_data.clear()
 
-    # 2. Vadovų sandoriai
+    # 3. Vadovų sandoriai
     if update_manager_transactions_from_recent_crib is None:
         result["notes"].append("Vadovų sandoriai neatnaujinti: modulis manager_transactions_update nerastas.")
     else:
@@ -622,7 +634,7 @@ def refresh_all_data() -> dict:
         except Exception as exc:
             result["errors"].append(f"Vadovų sandoriai: {type(exc).__name__}: {exc}")
 
-    # 3. VŽ naujienos
+    # 4. VŽ naujienos
     try:
         with st.spinner("Kraunamas emitentų sąrašas VŽ atrankai..."):
             df_issuers_for_vz = load_issuer_df()
@@ -645,7 +657,7 @@ def refresh_all_data() -> dict:
     except Exception as exc:
         result["errors"].append(f"VŽ: {type(exc).__name__}: {exc}")
 
-    # 4. Galutinis visų kešų ir senų rezultatų išvalymas
+    # 5. Galutinis visų kešų ir senų rezultatų išvalymas
     st.cache_data.clear()
     st.cache_resource.clear()
     _clear_generated_report_state()
@@ -658,6 +670,7 @@ def build_refresh_message(result: dict) -> str:
     message = (
         f"Atnaujinta: CRIB naujai įrašyta {result['crib_inserted']} pranešimų "
         f"(patikrinta puslapių: {result['crib_pages']}); "
+        f"Nasdaq Baltic / First North: rasta {result['nasdaq_found']}, naujai įrašyta {result['nasdaq_inserted']}; "
         f"vadovų sandoriai: rasta {result['manager_found']}, "
         f"apdorota {result['manager_processed']}, įrašyta {result['manager_saved']}, "
         f"klaidų {result['manager_errors']}; "
