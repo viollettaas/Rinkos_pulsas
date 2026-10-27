@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import re
 import pandas as pd
 import streamlit as st
@@ -13,7 +13,7 @@ from nasdaq_update import update_nasdaq_news
 from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
 from vz_update import update_vz_news_fast
 from traders_update import update_traders_forum
-from supabase_cache import load_news_df
+from supabase_cache import get_latest_news_datetime, load_news_df
 
 try:
     from manager_transactions_update import update_manager_transactions_from_recent_crib
@@ -616,12 +616,26 @@ def refresh_all_data() -> dict:
     except Exception as exc:
         result["errors"].append(f"Nasdaq Baltic: {type(exc).__name__}: {exc}")
 
-    # 3. Traders.lt: tik Baltijos akcijų rinkos temos, atrinktos pagal datą.
+    # 3. Traders.lt: tęsiame nuo naujausio jau turimo komentaro, o ne visada
+    # kartojame 60 dienų nuskaitymą. Vienos dienos persidengimas apsaugo nuo
+    # kelių tos pačios dienos komentarų praleidimo; Supabase dublikatų neįrašo.
     try:
         with st.spinner("Tikrinamos Traders.lt Baltijos akcijų rinkos diskusijos..."):
-            traders_stats = update_traders_forum(days_back=60) or {}
+            latest_traders = get_latest_news_datetime("traders")
+            traders_start = (
+                latest_traders.date() - timedelta(days=1)
+                if latest_traders is not None
+                else date.today() - timedelta(days=60)
+            )
+            traders_stats = update_traders_forum(
+                start_date=traders_start,
+                end_date=date.today(),
+            ) or {}
         result["traders_found"] = _safe_int(traders_stats.get("found"))
         result["traders_inserted"] = _safe_int(traders_stats.get("inserted"))
+        result["notes"].append(
+            f"Traders.lt tikrinta nuo {traders_start.isoformat()}."
+        )
     except Exception as exc:
         result["errors"].append(f"Traders.lt: {type(exc).__name__}: {exc}")
 
