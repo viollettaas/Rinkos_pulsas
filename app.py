@@ -11,6 +11,8 @@ from crib_update import update_crib_news, get_latest_crib_news_date
 from nasdaq_update import update_nasdaq_news
 from issuer_cache import save_issuer_list_from_stat_df, load_issuer_df
 from vz_update import update_vz_news_fast
+from traders_update import update_traders_forum
+from supabase_cache import load_news_df
 
 try:
     from manager_transactions_update import update_manager_transactions_from_recent_crib
@@ -574,6 +576,8 @@ def refresh_all_data() -> dict:
         "crib_pages": 0,
         "nasdaq_found": 0,
         "nasdaq_inserted": 0,
+        "traders_found": 0,
+        "traders_inserted": 0,
         "manager_found": 0,
         "manager_processed": 0,
         "manager_saved": 0,
@@ -611,10 +615,19 @@ def refresh_all_data() -> dict:
     except Exception as exc:
         result["errors"].append(f"Nasdaq Baltic: {type(exc).__name__}: {exc}")
 
+    # 3. Traders.lt: tik Baltijos akcijų rinkos temos, atrinktos pagal datą.
+    try:
+        with st.spinner("Tikrinamos Traders.lt Baltijos akcijų rinkos diskusijos..."):
+            traders_stats = update_traders_forum(days_back=60) or {}
+        result["traders_found"] = _safe_int(traders_stats.get("found"))
+        result["traders_inserted"] = _safe_int(traders_stats.get("inserted"))
+    except Exception as exc:
+        result["errors"].append(f"Traders.lt: {type(exc).__name__}: {exc}")
+
     # Būtina išvalyti kešą prieš vadovų sandorių modulį, nes jis skaito market_news.
     st.cache_data.clear()
 
-    # 3. Vadovų sandoriai
+    # 4. Vadovų sandoriai
     if update_manager_transactions_from_recent_crib is None:
         result["notes"].append("Vadovų sandoriai neatnaujinti: modulis manager_transactions_update nerastas.")
     else:
@@ -634,7 +647,7 @@ def refresh_all_data() -> dict:
         except Exception as exc:
             result["errors"].append(f"Vadovų sandoriai: {type(exc).__name__}: {exc}")
 
-    # 4. VŽ naujienos
+    # 5. VŽ naujienos
     try:
         with st.spinner("Kraunamas emitentų sąrašas VŽ atrankai..."):
             df_issuers_for_vz = load_issuer_df()
@@ -657,7 +670,7 @@ def refresh_all_data() -> dict:
     except Exception as exc:
         result["errors"].append(f"VŽ: {type(exc).__name__}: {exc}")
 
-    # 5. Galutinis visų kešų ir senų rezultatų išvalymas
+    # 6. Galutinis visų kešų ir senų rezultatų išvalymas
     st.cache_data.clear()
     st.cache_resource.clear()
     _clear_generated_report_state()
@@ -671,6 +684,7 @@ def build_refresh_message(result: dict) -> str:
         f"Atnaujinta: CRIB naujai įrašyta {result['crib_inserted']} pranešimų "
         f"(patikrinta puslapių: {result['crib_pages']}); "
         f"Nasdaq Baltic / First North: rasta {result['nasdaq_found']}, naujai įrašyta {result['nasdaq_inserted']}; "
+        f"Traders.lt: rasta {result['traders_found']}, naujai įrašyta {result['traders_inserted']}; "
         f"vadovų sandoriai: rasta {result['manager_found']}, "
         f"apdorota {result['manager_processed']}, įrašyta {result['manager_saved']}, "
         f"klaidų {result['manager_errors']}; "
@@ -1229,11 +1243,12 @@ if result is None:
     st.stop()
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📈 Akcijos",
     "🏦 Obligacijos",
     "🌱 First North",
     "📰 Visos naujienos",
+    "💬 Traders.lt diskusijos",
     "🧾 Pilna HTML peržiūra",
 ])
 
@@ -1251,6 +1266,32 @@ with tab4:
     show_styled_table(result["styled_visos"])
 
 with tab5:
+    st.caption("Neoficialūs investuotojų komentarai iš Traders.lt. Tai nėra bendrovių pranešimai ar investavimo rekomendacijos.")
+    try:
+        traders_df = load_news_df("traders", result["start_date"], result["end_date"])
+    except Exception as exc:
+        traders_df = pd.DataFrame()
+        st.warning(f"Nepavyko įkelti Traders.lt įrašų: {exc}")
+
+    if not traders_df.empty:
+        traders_df["published_at"] = pd.to_datetime(traders_df["published_at"], errors="coerce")
+        traders_df = traders_df.dropna(subset=["published_at"]).sort_values(["company", "published_at"])
+        report_df = result.get("df_raw", pd.DataFrame())
+        if "Trumpinys" in report_df.columns:
+            report_tickers = set(report_df["Trumpinys"].dropna().astype(str).str.upper())
+            traders_df = traders_df[traders_df["company"].astype(str).str.upper().isin(report_tickers)]
+
+    if traders_df.empty:
+        st.info("Pasirinktam laikotarpiui ir ataskaitos bendrovėms Traders.lt komentarų nėra.")
+    else:
+        for ticker, posts in traders_df.groupby("company", sort=True):
+            with st.expander(f"{ticker} · {len(posts)} komentarai"):
+                for _, post in posts.iterrows():
+                    moment = post["published_at"].strftime("%Y-%m-%d %H:%M")
+                    st.markdown(f"**{moment}** · [{post['title']}]({post['url']})")
+                    st.write(post["content"])
+
+with tab6:
     components.html(
         result["html"],
         height=900,
