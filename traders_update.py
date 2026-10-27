@@ -24,7 +24,9 @@ HEADERS = {
     "Accept-Language": "lt-LT,lt;q=0.9,en;q=0.8",
 }
 SESSION = requests.Session()
-REQUEST_PAUSE_SECONDS = 1.2
+# Įprastam tęstiniam atnaujinimui užtenka trumpesnės pauzės, nes skaitome tik
+# paskutinius aktyvių temų puslapius. 404 atveju vis tiek taikomas ilgas retry.
+REQUEST_PAUSE_SECONDS = 0.6
 
 # Kai kuriuose darbiniuose tinkluose HTTPS srautas tikrinamas per vidinį
 # sertifikatą, kurio Windows Python sertifikatų saugykla nepažįsta.
@@ -93,7 +95,21 @@ def _topics(start):
             last = pd.to_datetime(dates[-1], errors="coerce")
             if pd.isna(last):
                 continue
-            page.append((ticker.group(1), title, _canonical_topic_url(a.get("href", "")), last.date()))
+            topic_url = _canonical_topic_url(a.get("href", ""))
+            topic_id = parse_qs(urlparse(topic_url).query).get("q", [""])[0]
+
+            # Temos sąraše jau yra nuoroda į paskutinį tos temos puslapį.
+            # Pasiimame ją čia, kad vėliau nereikėtų atidaryti pirmo puslapio
+            # vien tam, kad sužinotume puslapiavimo pabaigą.
+            page_urls = [topic_url]
+            if row:
+                for page_link in row.select('a[href*="m=posts"][href*="d="]'):
+                    candidate = _canonical_topic_url(page_link.get("href", ""))
+                    candidate_topic_id = parse_qs(urlparse(candidate).query).get("q", [""])[0]
+                    if candidate_topic_id == topic_id:
+                        page_urls.append(candidate)
+            latest_page_url = max(page_urls, key=lambda value: _page_offset(value) or 0)
+            page.append((ticker.group(1), title, latest_page_url, last.date()))
         if not page:
             break
         out.extend(x for x in page if x[3] >= start)
@@ -116,21 +132,33 @@ def _topic_page_urls(last_page_url, max_pages=12):
     puslapio pasiimame didžiausią poslinkį, tada keliaujame
     atgal. Baigiame anksti, kai įrašai jau senesni už pasirinktą laikotarpį.
     """
-    first = _get(last_page_url)
-    # Temos pavadinimo nuoroda atidaro pirmą puslapį (be ``d=``), todėl iš
-    # puslapiavimo nuorodų būtina paimti tikrą paskutinio puslapio URL.
+    loaded_page = _get(last_page_url)
+    known_last_offset = _page_offset(last_page_url)
+    # Įprastu atveju ``last_page_url`` jau gaunamas iš temų sąrašo ir veda
+    # tiesiai į paskutinį puslapį. Taip sutaupoma viena HTTP užklausa kiekvienai
+    # aktyviai bendrovei.
+    if known_last_offset and known_last_offset > 0:
+        last_offset = known_last_offset
+        last_url = last_page_url
+        newest_page = loaded_page
+    else:
+        # Atsarginis kelias vieno puslapio arba nestandartinei temai.
+        newest_page = None
+        last_url = None
+        last_offset = known_last_offset
     offsets = []
-    for anchor in first.select('a[href*="m=posts"][href*="d="]'):
-        candidate = _canonical_topic_url(anchor.get("href", ""))
-        offset = _page_offset(candidate)
-        if offset is not None:
-            offsets.append((offset, candidate))
-
-    last_offset = max((offset for offset, _ in offsets), default=_page_offset(last_page_url))
+    if last_offset in (None, 0):
+        for anchor in loaded_page.select('a[href*="m=posts"][href*="d="]'):
+            candidate = _canonical_topic_url(anchor.get("href", ""))
+            offset = _page_offset(candidate)
+            if offset is not None:
+                offsets.append((offset, candidate))
+        last_offset = max((offset for offset, _ in offsets), default=known_last_offset)
+        last_url = next((candidate for offset, candidate in offsets if offset == last_offset), last_page_url)
+        if last_offset == 0:
+            newest_page = loaded_page
     if last_offset is None:
-        return [(last_page_url, first)]
-
-    last_url = next((candidate for offset, candidate in offsets if offset == last_offset), None)
+        return [(last_page_url, loaded_page)]
 
     def page_url(offset):
         if last_url:
@@ -139,8 +167,7 @@ def _topic_page_urls(last_page_url, max_pages=12):
         separator = "&" if "?" in last_page_url else "?"
         return last_page_url + f"{separator}d={offset}"
 
-    # ``first`` yra pirmo puslapio HTML, todėl naujausią puslapį keliame iš naujo.
-    urls = [(page_url(last_offset), None)]
+    urls = [(page_url(last_offset), newest_page)]
     first_offset = 0 if max_pages is None else max(0, last_offset - 20 * (max_pages - 1))
     for offset in range(last_offset - 20, first_offset - 1, -20):
         urls.append((page_url(offset), None))
