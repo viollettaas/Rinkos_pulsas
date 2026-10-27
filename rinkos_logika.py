@@ -1141,6 +1141,11 @@ def _normalize_cached_news_columns(df_cached: pd.DataFrame, source: str) -> pd.D
             ])
         if source == "vz":
             return pd.DataFrame(columns=["Antraštė", "Nuoroda", "Data", "Pilnas_tekstas"])
+        if source == "nasdaq":
+            return pd.DataFrame(columns=[
+                "Nasdaq_bendrovė", "Nasdaq_antraštė", "Nasdaq_pilna_antraštė",
+                "Nasdaq_nuoroda", "Nasdaq_pilnas_tekstas", "__dt",
+            ])
         return pd.DataFrame()
 
     df = df_cached.copy()
@@ -1177,6 +1182,18 @@ def _normalize_cached_news_columns(df_cached: pd.DataFrame, source: str) -> pd.D
             "content": "Pilnas_tekstas",
         })
         df["Data"] = pd.to_datetime(df.get("Data"), errors="coerce").dt.date
+        return df
+
+    if source == "nasdaq" and "source" in df.columns:
+        df = df.rename(columns={
+            "company": "Nasdaq_bendrovė",
+            "title": "Nasdaq_pilna_antraštė",
+            "url": "Nasdaq_nuoroda",
+            "published_at": "__dt",
+            "content": "Nasdaq_pilnas_tekstas",
+        })
+        df["Nasdaq_antraštė"] = df["Nasdaq_pilna_antraštė"].fillna("")
+        df["__dt"] = pd.to_datetime(df.get("__dt"), errors="coerce")
         return df
 
     return df
@@ -1319,11 +1336,29 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     )
     vz_map = build_vz_map_from_df(vz_df, df)
 
-    # Atskiro Nasdaq naujienų scraperio nebenaudojame, nes CRIB jau yra Nasdaq / emitentų pranešimų šaltinis.
-    df_nasdaq = pd.DataFrame(columns=[
-        "Diena", "Laikas", "Nasdaq_antraštė", "Nasdaq_nuoroda", "Nasdaq_bendrovė", "Birža", "Kalba",
-        "Nasdaq_pilna_antraštė", "Nasdaq_pilnas_tekstas", "__dt",
-    ])
+    # Nasdaq Baltic yra atskiras šaltinis First North pranešimams, kurių CRIB dažnai neturi.
+    df_nasdaq = get_news_with_supabase_cache("nasdaq", start_date, end_date, progress=progress)
+
+    df_exchange_notices = df_news.copy()
+    if df_nasdaq is not None and not df_nasdaq.empty:
+        nasdaq_for_table = pd.DataFrame({
+            "Bendrovė": df_nasdaq.get("Nasdaq_bendrovė", ""),
+            "Bendrovė_norm": df_nasdaq.get("Nasdaq_bendrovė", "").astype(str).map(normalize),
+            "Kategorija": "Nasdaq Baltic (įskaitant First North)",
+            "Published_dt": df_nasdaq.get("__dt"),
+            "Nuoroda": df_nasdaq.get("Nasdaq_nuoroda", ""),
+            "Pilna_antraštė": df_nasdaq.get("Nasdaq_pilna_antraštė", ""),
+            "Pilnas_tekstas": df_nasdaq.get("Nasdaq_pilnas_tekstas", ""),
+        })
+        nasdaq_for_table["Naujiena"] = nasdaq_for_table.apply(
+            lambda r: (
+                f'<a href="{r["Nuoroda"]}" target="_blank">'
+                f'{pd.to_datetime(r["Published_dt"]).strftime("%Y-%m-%d %H:%M")} – {r["Pilna_antraštė"]}</a>'
+                if str(r["Nuoroda"]).strip() and pd.notna(r["Published_dt"])
+                else str(r["Pilna_antraštė"] or "")
+            ), axis=1,
+        )
+        df_exchange_notices = pd.concat([df_exchange_notices, nasdaq_for_table], ignore_index=True, sort=False)
 
     if progress:
         progress("Formuojamos akcijų, obligacijų ir First North lentelės...")
@@ -1331,9 +1366,9 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df_akcijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Akcijos"])].copy()
     df_obligacijos = df[df["Sąrašas/segmentas"].isin(SEGMENTAI["Obligacijos"])].copy()
 
-    # Visose pagrindinėse lentelėse rodome CRIB ir VŽ.
-    df_akcijos = sujungti_naujienas_keli(df_akcijos, df_news)
-    df_obligacijos = sujungti_naujienas_keli(df_obligacijos, df_news)
+    # Visose pagrindinėse lentelėse rodome CRIB ir Nasdaq Baltic pranešimus.
+    df_akcijos = sujungti_naujienas_keli(df_akcijos, df_exchange_notices)
+    df_obligacijos = sujungti_naujienas_keli(df_obligacijos, df_exchange_notices)
     df_obligacijos = df_obligacijos[df_obligacijos["Naujiena"] != ""]
 
     df_akcijos["Verslo žinios"] = df_akcijos["Bendrovė"].map(vz_map).fillna("")
@@ -1345,10 +1380,9 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     df_first_north = df[
         df["Sąrašas/segmentas"].astype(str).str.contains("First North", case=False, na=False)
     ].copy()
-    df_first_north = sujungti_naujienas_keli(df_first_north, df_news)
+    df_first_north = sujungti_naujienas_keli(df_first_north, df_exchange_notices)
     df_first_north["Verslo žinios"] = df_first_north["Bendrovė"].map(vz_map).fillna("")
-    # First North filtravimo funkcija tikrina stulpelį "Nasdaq pranešimai",
-    # todėl į jį dedame CRIB / emitentų pranešimus iš DB.
+    # First North filtravimo funkcija tikrina šį pagalbinį stulpelį.
     df_first_north["Nasdaq pranešimai"] = df_first_north["Naujiena"].fillna("")
     df_first_north = filter_traded_or_has_news(df_first_north)
 
@@ -1359,11 +1393,11 @@ def generate_report(excel_file, filename: str, start_date: date = None, end_date
     styled_obligacijos = render_lentele(df_obligacijos, "Baltijos skolos VP sąrašas (obligacijos)")
     styled_first_north = render_first_north(
         df_first_north,
-        f"First North (prekiauta arba yra CRIB / VŽ naujienų) ({start_date} – {end_date})",
+        f"First North (prekiauta arba yra Nasdaq Baltic / CRIB / VŽ naujienų) ({start_date} – {end_date})",
     )
     styled_visos = render_visos_naujienos(
         df_visos,
-        "Visos skirtingos naujienos (CRIB + VŽ, pilnas tekstas)",
+        "Visos skirtingos naujienos (Nasdaq Baltic + CRIB + VŽ, pilnas tekstas)",
     )
 
     html = build_html_report(styled_akcijos, styled_obligacijos, styled_first_north, styled_visos)
