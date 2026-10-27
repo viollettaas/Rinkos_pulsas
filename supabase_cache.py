@@ -172,6 +172,32 @@ def load_news_df(source: str, start_date: date, end_date: date) -> pd.DataFrame:
     return pd.DataFrame(data or [])
 
 
+def get_latest_news_datetime(source: str):
+    """Grąžina naujausio nurodyto šaltinio įrašo laiką iš Supabase.
+
+    Naudojama tęstiniam nuskaitymui: nereikia kiekvieną kartą iš naujo tikrinti
+    ilgo fiksuoto laikotarpio.
+    """
+    url = _supabase_rest_url("market_news")
+    params = {
+        "select": "published_at",
+        "source": f"eq.{source}",
+        "published_at": "not.is.null",
+        "order": "published_at.desc",
+        "limit": 1,
+    }
+
+    with _http_client() as client:
+        response = client.get(url, headers=_supabase_headers(), params=params)
+        response.raise_for_status()
+        data = response.json() or []
+
+    if not data or not data[0].get("published_at"):
+        return None
+    latest = pd.to_datetime(data[0]["published_at"], errors="coerce")
+    return None if pd.isna(latest) else latest.to_pydatetime()
+
+
 def log_scrape(source, date_from, date_to, status, records_found=0, error_message=None):
     url = _supabase_rest_url("market_news_scrape_log")
 
