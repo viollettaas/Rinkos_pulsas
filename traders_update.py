@@ -14,6 +14,7 @@ BASE = "https://www.traders.lt/"
 TOPICS = BASE + "forums.php?m=topics&s=8&o=updated&w=desc&d={}"
 DATE_RE = re.compile(r"20\d{2}-\d{2}-\d{2}\s+\d{1,2}:\d{2}")
 POST_ID_RE = re.compile(r"#\s*(\d+)")
+PROFILE_SEPARATOR = "|||"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RinkosPulsas/1.0)"}
 SESSION = requests.Session()
 
@@ -110,67 +111,76 @@ def _topic_page_urls(last_page_url, max_pages=12):
 
 
 def _rows_from_page(ticker, topic, page_url, soup, start, end):
-    """Paima atskirus forumo komentarus iš jų HTML konteinerių.
+    """Paima atskirus komentarus pagal jų unikalią ``p=`` nuorodą.
 
-    Ankstesnė versija skaitė visą puslapį kaip vieną tekstą. Dėl citatų, kurių
-    viduje taip pat būna datos, keli komentarai kartais susijungdavo į vieną.
-    Kiekvienas komentaras turi unikalią ``p=`` nuorodą, todėl ja nustatomas
-    aukščiausias HTML konteineris, kuriame yra tik vienas forumo įrašas.
+    Kiekvieną komentaro ID pakeičiame vidiniu žymekliu ir tuomet skaitome
+    puslapį eilės tvarka. Taip komentaro tekstas prasideda iškart po jo ID ir
+    baigiasi prieš kito komentaro datos antraštę; citatoje esanti data naujo
+    įrašo nesukuria, nes šalia jos nėra ``p=`` žymeklio.
     """
-    rows, dates, seen = [], [], set()
     post_links = soup.select('a[href*="m=posts"][href*="p="]')
-
     for link in post_links:
         post_id = parse_qs(urlparse(urljoin(BASE, link.get("href", ""))).query).get("p", [""])[0]
-        if not post_id or post_id in seen:
-            continue
-        seen.add(post_id)
+        if post_id:
+            link.replace_with(f"\n__TRADERS_POST_{post_id}__\n")
 
-        # Kylame iki didžiausio elemento, kuriame vis dar yra tik ši p= nuoroda.
-        container = link.parent
-        for parent in link.parents:
-            ids = {
-                parse_qs(urlparse(urljoin(BASE, item.get("href", ""))).query).get("p", [""])[0]
-                for item in parent.select('a[href*="m=posts"][href*="p="]')
-            }
-            ids.discard("")
-            if ids == {post_id}:
-                container = parent
-            elif len(ids) > 1:
-                break
+    lines = [value.strip() for value in soup.get_text("\n", strip=True).splitlines() if value.strip()]
+    markers = []
+    for index, value in enumerate(lines):
+        match = re.fullmatch(r"__TRADERS_POST_(\d+)__", value)
+        if match:
+            markers.append((index, match.group(1)))
 
-        lines = [value.strip() for value in container.get_text("\n", strip=True).splitlines() if value.strip()]
-        date_index = next((i for i, value in enumerate(lines) if DATE_RE.search(value)), None)
-        if date_index is None:
-            continue
-        date_match = DATE_RE.search(lines[date_index])
-        timestamp = pd.to_datetime(date_match.group(0), errors="coerce")
+    headers = []
+    for marker_index, post_id in markers:
+        # Datos eilutė yra netoli prieš pat komentaro numerį.
+        date_index = next(
+            (i for i in range(marker_index - 1, max(-1, marker_index - 6), -1) if DATE_RE.search(lines[i])),
+            None,
+        )
+        if date_index is not None:
+            headers.append((date_index, marker_index, post_id))
+
+    rows, dates = [], []
+    status_re = re.compile(r"^(Senbuvis|Aktyvusis|Naujokas|Narys|Moderatorius)$", re.I)
+    messages_re = re.compile(r"^\d[\d ]* žinutės", re.I)
+
+    for position, (date_index, marker_index, post_id) in enumerate(headers):
+        timestamp = pd.to_datetime(DATE_RE.search(lines[date_index]).group(0), errors="coerce")
         if pd.isna(timestamp):
             continue
         dates.append(timestamp.date())
         if not (start <= timestamp.date() <= end):
             continue
 
-        # Autorius įprastai yra pirmas prasmingas tekstas prieš datos eilutę.
-        author = ""
-        for value in lines[:date_index]:
-            if not re.fullmatch(r"[\d() ]+", value) and not re.match(
-                r"^(Senbuvis|Aktyvusis|Naujokas|Narys|Moderatorius|Online būsena)", value, re.I
-            ):
-                author = value
-                break
+        previous_marker = headers[position - 1][1] if position else -1
+        profile_lines = lines[max(previous_marker + 1, date_index - 12):date_index]
+        status_index = next((i for i, value in enumerate(profile_lines) if status_re.match(value)), None)
+        messages_index = next((i for i, value in enumerate(profile_lines) if messages_re.match(value)), None)
 
+        author = profile_lines[status_index - 1] if status_index and status_index > 0 else ""
+        status = profile_lines[status_index] if status_index is not None else ""
+        messages = profile_lines[messages_index] if messages_index is not None else ""
+        location = ""
+        if messages_index is not None and messages_index > 0:
+            candidate = profile_lines[messages_index - 1]
+            if candidate not in {"Online būsena", author, status} and not re.fullmatch(r"[\d() ]+", candidate):
+                location = candidate
+
+        next_date_index = headers[position + 1][0] if position + 1 < len(headers) else len(lines)
         body_lines = []
-        for value in lines[date_index + 1:]:
-            if POST_ID_RE.fullmatch(value) or value.startswith(("Puslapiai:", "Forumas")):
-                continue
+        for value in lines[marker_index + 1:next_date_index]:
+            if value.startswith(("Puslapiai:", "Forumas", "Norėdami rašyti forume", "© traders.lt")):
+                break
             if value in {"Redaguoti", "Cituoti", "Pranešti"}:
                 continue
             body_lines.append(value)
         body = "\n".join(body_lines).strip()
 
         if body:
-            display_topic = f"{topic} — {author}" if author else topic
+            # Metaduomenys laikomi title lauke, nes market_news lentelėje nėra
+            # atskirų autoriaus stulpelių. Atvaizduojant jie išskiriami į eilutę.
+            display_topic = PROFILE_SEPARATOR.join([topic, author, status, location, messages])
             rows.append({
                 "Ticker": ticker,
                 "Tema": display_topic,
