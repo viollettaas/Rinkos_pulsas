@@ -25,26 +25,6 @@ try:
 except Exception:
     show_manager_transactions_page = None
 
-try:
-    from metines import show_metines_page
-except Exception as exc:
-    show_metines_page = None
-    show_metines_page_import_error = exc
-else:
-    show_metines_page_import_error = None
-
-try:
-    from metines import show_annual_reports_page
-except Exception:
-    show_annual_reports_page = None
-
-# Suderinamumas: jei metines.py turi senesnį funkcijos pavadinimą,
-# aplikacija vis tiek užkraus puslapį.
-if show_metines_page is None and show_annual_reports_page is not None:
-    show_metines_page = show_annual_reports_page
-    show_metines_page_import_error = None
-
-
 st.set_page_config(
     page_title="Rinkos pulsas",
     page_icon="🏦",
@@ -729,8 +709,6 @@ if report_param == "emitentai":
     report_mode = "Emitentų atranka"
 elif report_param == "vadovai":
     report_mode = "Vadovų sandoriai"
-elif report_param == "metines":
-    report_mode = "Metinės ataskaitos"
 else:
     report_mode = "Rinkos apžvalga"
 
@@ -743,7 +721,6 @@ with st.sidebar:
     rinkos_active = "active" if report_mode == "Rinkos apžvalga" else ""
     emitentai_active = "active" if report_mode == "Emitentų atranka" else ""
     vadovai_active = "active" if report_mode == "Vadovų sandoriai" else ""
-    metines_active = "active" if report_mode == "Metinės ataskaitos" else ""
 
     nav_html = f"""
         <div class="report-nav-title">
@@ -767,12 +744,6 @@ with st.sidebar:
                 <div class="report-nav-item {vadovai_active}">
                     <div class="nav-icon">👔</div>
                     <div>Vadovų sandoriai</div>
-                </div>
-            </a>
-            <a href="?report=metines" target="_self">
-                <div class="report-nav-item {metines_active}">
-                    <div class="nav-icon">📚</div>
-                    <div>Metinės ataskaitos</div>
                 </div>
             </a>
         </div>
@@ -833,23 +804,6 @@ if report_mode == "Vadovų sandoriai":
         st.stop()
 
     show_manager_transactions_page()
-    st.stop()
-
-
-# ============================================================
-# METINĖS ATASKAITOS
-# ============================================================
-
-if report_mode == "Metinės ataskaitos":
-    if show_metines_page is None:
-        st.error("Nepavyko užkrauti metinių ataskaitų modulio metines.py.")
-        if show_metines_page_import_error is not None:
-            import traceback
-            st.warning("Žemiau rodoma tikroji importavimo klaida. Ji padės sutvarkyti metines.py.")
-            st.code("".join(traceback.format_exception(type(show_metines_page_import_error), show_metines_page_import_error, show_metines_page_import_error.__traceback__)))
-        st.stop()
-
-    show_metines_page()
     st.stop()
 
 
