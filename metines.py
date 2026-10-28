@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Metinių ataskaitų modulis Rinkos pulsui.
+Metinių ir pusmečio ataskaitų modulis Rinkos pulsui.
 
 Šio failo paskirtis:
-- paimti CRIB kategorijos „Metinė informacija“ / „Annual information“ pranešimus iš Supabase market_news;
+- paimti CRIB metinės ir pusmečio informacijos pranešimus iš Supabase market_news;
 - naudoti tik tuos emitentus, kurie yra Supabase market_issuers sąraše su market='VLN'
   ir, jei užpildytas segmentas, priklauso oficialiajam arba papildomajam sąrašui;
 - atsisiųsti CRIB priedus per viešas file_url / viewAttachment nuorodas;
@@ -64,7 +64,7 @@ except Exception:
 # KONFIGŪRACIJA
 # ============================================================
 
-MODULE_VERSION = "metines_pipeline_visible_buttons_2026-07-16m_display_fix"
+MODULE_VERSION = "metines_financial_reports_2026-10-28"
 
 TABLE_REPORTS = "annual_reports"
 TABLE_FILES = "annual_report_files"
@@ -84,6 +84,35 @@ ANNUAL_CATEGORY_TOKENS = (
     "financial statements",
     "audituota metinė",
     "audituota metine",
+)
+
+# CRIB gairėse pusmečio informacija turi atskirą kategoriją, bet praktikoje
+# emitentai 6 mėn. ataskaitas skelbia ir „Tarpinė informacija“ kategorijoje.
+# Todėl kategoriškai nepakanka filtruoti tik pagal žodį „metinė“.
+HALF_YEAR_CATEGORY_TOKENS = (
+    "pusmečio informacija",
+    "pusmecio informacija",
+    "pusmečio finansinė ataskaita",
+    "pusmecio finansine ataskaita",
+    "half-year information",
+    "half year information",
+    "half-year financial report",
+)
+INTERIM_CATEGORY_TOKENS = (
+    "tarpinė informacija",
+    "tarpine informacija",
+    "interim information",
+    "interim financial report",
+)
+HALF_YEAR_PERIOD_PATTERNS = (
+    r"\b(?:i|1|pirm(?:asis|ojo)?)\s*(?:m\.?\s*)?pusme(?:čio|cio)\b",
+    r"\b(?:šešių|sesiu|6)\s*(?:mėn(?:esių)?|men(?:esiu)?|months?)\b",
+    r"\bhalf[- ]year\b",
+    r"\bfirst\s+half\b",
+)
+NON_HALF_YEAR_PERIOD_PATTERNS = (
+    r"\b(?:3|9|trijų|triju|devynių|devyniu)\s*(?:mėn|men|months?)\b",
+    r"\b(?:i|ii|iii|iv|1|2|3|4)\s*(?:ketvirt|quarter)\b",
 )
 
 # Tikros metinės ataskaitos. Filtras tyčia nėra per siauras, nes dalis emitentų
@@ -116,27 +145,40 @@ SOFT_NON_REPORT_TITLE_TOKENS = (
 OFFICIAL_SECONDARY_TOKENS = (
     "oficial", "official", "main list", "baltic main", "pagrind", "papild", "secondary", "additional",
 )
+FIRST_NORTH_EQUITY_TOKENS = (
+    "first north akcij", "first north shares", "first north foreign shares", "first north užsienio akcij",
+)
 
 EXCLUDED_SEGMENT_TOKENS = (
-    "first north", "bond", "oblig", "fund", "etf", "vyriausyb", "government",
+    "bond", "oblig", "fund", "etf", "vyriausyb", "government",
 )
 
 ALLOWED_ATTACHMENT_EXTENSIONS = (
     ".pdf", ".zip", ".xhtml", ".html", ".htm", ".xml", ".xbrl",
 )
 
-METRIC_ORDER = ["Turtas", "Nuosavas kapitalas", "Grynasis pelnas", "Pajamos", "Darbuotojų skaičius"]
+METRIC_ORDER = [
+    "Turtas", "Nuosavas kapitalas", "Įsipareigojimai", "Pinigai ir pinigų ekvivalentai",
+    "Pajamos", "EBITDA", "Veiklos pelnas", "Grynasis pelnas", "Darbuotojų skaičius",
+]
 GROUP_ORDER = ["Grupė", "Bendrovė", "Neatskirta"]
 
 METRIC_UNITS = {
     "Turtas": "tūkst. EUR",
     "Nuosavas kapitalas": "tūkst. EUR",
+    "Įsipareigojimai": "tūkst. EUR",
+    "Pinigai ir pinigų ekvivalentai": "tūkst. EUR",
     "Grynasis pelnas": "tūkst. EUR",
     "Pajamos": "tūkst. EUR",
+    "EBITDA": "tūkst. EUR",
+    "Veiklos pelnas": "tūkst. EUR",
     "Darbuotojų skaičius": "vnt.",
 }
 
-FINANCIAL_METRICS = {"Turtas", "Nuosavas kapitalas", "Grynasis pelnas", "Pajamos"}
+FINANCIAL_METRICS = {
+    "Turtas", "Nuosavas kapitalas", "Įsipareigojimai", "Pinigai ir pinigų ekvivalentai",
+    "Grynasis pelnas", "Pajamos", "EBITDA", "Veiklos pelnas",
+}
 
 
 # ============================================================
@@ -414,14 +456,15 @@ def _annual_reports_write_preflight() -> Dict[str, Any]:
 
 
 # ============================================================
-# EMITENTAI: TIK VLN OFICIALUSIS / PAPILDOMASIS
+# EMITENTAI: VLN AKCIJŲ SĄRAŠAI, ĮSKAITANT FIRST NORTH
 # ============================================================
 
 
 def load_vln_official_secondary_issuers() -> pd.DataFrame:
     """Užkrauna leidžiamus emitentus iš market_issuers.
 
-    Jei `segment` stulpelyje yra reikšmių, paliekami tik oficialusis / papildomasis sąrašas.
+    Jei `segment` stulpelyje yra reikšmių, paliekami oficialusis / papildomasis
+    ir First North akcijų sąrašai. Obligacijos, fondai ir VVP atmetami.
     Jei `segment` tuščias visiems, paliekami visi market='VLN' įrašai, nes kai kuriuose projektuose
     `market_issuers` jau būna iš anksto užpildyta tik reikiamais emitentais.
     """
@@ -462,7 +505,10 @@ def load_vln_official_secondary_issuers() -> pd.DataFrame:
     # Segmento filtras.
     if "segment" in df.columns and df["segment"].fillna("").astype(str).str.strip().ne("").any():
         seg = df["segment"].fillna("").astype(str).str.lower()
-        keep = seg.apply(lambda x: any(t in x for t in OFFICIAL_SECONDARY_TOKENS))
+        keep = seg.apply(
+            lambda x: any(t in x for t in OFFICIAL_SECONDARY_TOKENS)
+            or any(t in x for t in FIRST_NORTH_EQUITY_TOKENS)
+        )
         excluded = seg.apply(lambda x: any(t in x for t in EXCLUDED_SEGMENT_TOKENS))
         df = df[keep & ~excluded].copy()
 
@@ -561,23 +607,52 @@ def _load_crib_news_df(start_date: date, end_date: date) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _is_annual_information_row(row: pd.Series) -> bool:
-    text = " ".join([
+def _financial_report_text(row: pd.Series) -> str:
+    return " ".join([
         str(row.get("category", "") or ""),
         str(row.get("category_src", "") or ""),
         str(row.get("type", "") or ""),
         str(row.get("title", "") or ""),
         str(row.get("content", "") or "")[:2000],
     ]).lower()
-    return any(t in text for t in ANNUAL_CATEGORY_TOKENS)
 
 
-def _looks_like_real_annual_report(row: pd.Series) -> bool:
+def _classify_financial_report(row: pd.Series) -> str:
+    """Grąžina ``Metinė`` arba ``Pusmečio`` tik tikrai finansinei ataskaitai.
+
+    Pusmečio ataskaita CRIB gali būti ir „Pusmečio finansinė ataskaita“, ir
+    „Tarpinė informacija“. Pastarojoje kategoriškai atmetame 3 ir 9 mėn.
+    pranešimus.
+    """
+    category = " ".join([
+        str(row.get("category", "") or ""),
+        str(row.get("category_src", "") or ""),
+        str(row.get("type", "") or ""),
+    ]).lower()
+    text = _financial_report_text(row)
+    if any(token in category for token in ANNUAL_CATEGORY_TOKENS):
+        return "Metinė"
+    if any(token in category for token in HALF_YEAR_CATEGORY_TOKENS):
+        return "Pusmečio"
+    if any(token in category for token in INTERIM_CATEGORY_TOKENS):
+        if any(re.search(pattern, text, re.I) for pattern in NON_HALF_YEAR_PERIOD_PATTERNS):
+            return ""
+        if any(re.search(pattern, text, re.I) for pattern in HALF_YEAR_PERIOD_PATTERNS):
+            return "Pusmečio"
+    return ""
+
+
+def _looks_like_real_financial_report(row: pd.Series, report_type: str) -> bool:
     title = str(row.get("title", "") or "").lower()
     content = str(row.get("content", "") or "").lower()
     text = f"{title} {content[:1500]}"
 
-    if not any(t in text for t in REAL_ANNUAL_TITLE_TOKENS):
+    if report_type == "Metinė" and not any(t in text for t in REAL_ANNUAL_TITLE_TOKENS):
+        return False
+
+    if report_type == "Pusmečio" and not any(
+        re.search(pattern, text, re.I) for pattern in HALF_YEAR_PERIOD_PATTERNS
+    ):
         return False
 
     # Jeigu tai tik datos ar kalendoriaus pranešimas ir nėra priedų požymio, neparsinsime kaip ataskaitos.
@@ -590,6 +665,19 @@ def _looks_like_real_annual_report(row: pd.Series) -> bool:
 
 def _extract_report_year_from_text(*values: Any) -> Optional[int]:
     text = " ".join(str(v or "") for v in values)
+    normalized = _strip_accents_lithuanian(text).lower()
+    # Pirmenybė aiškiam ataskaitiniam laikotarpiui. Taip 2025 m. metinė
+    # ataskaita, paskelbta 2026 m., nėra neteisingai priskiriama 2026 metams.
+    patterns = (
+        r"(?:uz|for)\s+(20\d{2})\s*(?:m\.?|metus|year)",
+        r"\b(20\d{2})\s*(?:m\.?|metu)\s*(?:metin|annual|audituot|financial|finansin)",
+        r"\b(20\d{2})[-./]0?6[-./](?:30|31)\b",
+        r"\b(20\d{2})\s*(?:m\.?|metu)\s*(?:i|1|pirm)\s*(?:pusm|half)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.I)
+        if match:
+            return int(match.group(1))
     years = [int(y) for y in re.findall(r"\b(20\d{2})\b", text)]
     if not years:
         return None
@@ -602,7 +690,7 @@ def _extract_report_year_from_text(*values: Any) -> Optional[int]:
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
-def load_annual_crib_news(start_date: date, end_date: date, allowed: pd.DataFrame) -> pd.DataFrame:
+def load_financial_crib_news(start_date: date, end_date: date, allowed: pd.DataFrame) -> pd.DataFrame:
     raw = _load_crib_news_df(start_date, end_date)
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -616,11 +704,12 @@ def load_annual_crib_news(start_date: date, end_date: date, allowed: pd.DataFram
     df["category"] = df["category"].where(df["category"].ne(""), df["category_src"])
     df["category"] = df["category"].where(df["category"].ne(""), df["type"])
 
-    df = df[df.apply(_is_annual_information_row, axis=1)].copy()
+    df["report_type"] = df.apply(_classify_financial_report, axis=1)
+    df = df[df["report_type"].ne("")].copy()
     if df.empty:
         return df
 
-    df = df[df.apply(_looks_like_real_annual_report, axis=1)].copy()
+    df = df[df.apply(lambda row: _looks_like_real_financial_report(row, row.get("report_type", "")), axis=1)].copy()
     if df.empty:
         return df
 
@@ -643,6 +732,10 @@ def load_annual_crib_news(start_date: date, end_date: date, allowed: pd.DataFram
     df = df.sort_values("published_at_dt", ascending=False)
     df = df.drop_duplicates(subset=["crib_url"], keep="first")
     return df.reset_index(drop=True)
+
+
+# Paliekame seną pavadinimą dėl suderinamumo su ankstesniais kvietimais.
+load_annual_crib_news = load_financial_crib_news
 
 
 # ============================================================
@@ -808,6 +901,14 @@ METRIC_LABELS = {
         "nuosavas kapitalas", "equity", "total equity", "equity total", "total shareholders equity",
         "shareholders equity", "equity attributable",
     ],
+    "Įsipareigojimai": [
+        "įsipareigojimai iš viso", "isipareigojimai is viso", "viso įsipareigojimų", "viso isipareigojimu",
+        "iš viso įsipareigojimų", "is viso isipareigojimu", "total liabilities", "liabilities total",
+    ],
+    "Pinigai ir pinigų ekvivalentai": [
+        "pinigai ir pinigų ekvivalentai", "pinigai ir pinigu ekvivalentai", "pinigai ir jų ekvivalentai",
+        "pinigai ir ju ekvivalentai", "cash and cash equivalents", "cash equivalents", "cash and cash",
+    ],
     "Grynasis pelnas": [
         "grynasis pelnas", "grynasis nuostolis", "grynasis pelnas (nuostoliai)", "grynasis pelnas nuostoliai",
         "metų pelnas", "metu pelnas", "metų nuostolis", "metu nuostolis", "laikotarpio pelnas", "laikotarpio nuostolis",
@@ -816,6 +917,13 @@ METRIC_LABELS = {
     "Pajamos": [
         "pardavimo pajamos", "pagrindinės veiklos pajamos", "pagrindines veiklos pajamos", "pajamos iš sutarčių", "pajamos is sutarciu",
         "pajamos", "revenue", "sales revenue", "net sales", "sales",
+    ],
+    "EBITDA": [
+        "ebitda", "koreguota ebitda", "adjusted ebitda", "earnings before interest taxes depreciation and amortisation",
+    ],
+    "Veiklos pelnas": [
+        "veiklos pelnas", "veiklos nuostolis", "pelnas iš veiklos", "pelnas is veiklos",
+        "operating profit", "operating loss", "profit from operations",
     ],
     "Darbuotojų skaičius": [
         "vidutinis darbuotojų skaičius", "vidutinis darbuotoju skaicius", "darbuotojų skaičius", "darbuotoju skaicius",
@@ -828,6 +936,8 @@ NEGATIVE_LABEL_GUARDS = {
     "Pajamos": ["finansinės pajamos", "finansines pajamos", "kitos pajamos", "palūkanų pajamos", "palukanu pajamos", "other income", "finance income"],
     "Turtas": ["ilgalaikis turtas", "trumpalaikis turtas", "finansinis turtas", "investicinis turtas", "non current assets", "current assets"],
     "Nuosavas kapitalas": ["nuosavas kapitalas ir įsipareigojimai", "nuosavas kapitalas ir isipareigojimai", "nuosavo kapitalo ir įsipareigojimų", "nuosavo kapitalo ir isipareigojimu", "equity and liabilities", "total equity and liabilities"],
+    "Įsipareigojimai": ["trumpalaikiai įsipareigojimai", "trumpalaikiai isipareigojimai", "ilgalaikiai įsipareigojimai", "ilgalaikiai isipareigojimai", "current liabilities", "non-current liabilities"],
+    "Pinigai ir pinigų ekvivalentai": ["grynieji pinigų srautai", "grynieji pinigu srautai", "cash flows", "cash flow"],
     "Darbuotojų skaičius": ["akcijų", "akciju", "shares", "shareholders", "balsų", "balsu"],
 }
 
@@ -839,6 +949,12 @@ CONCEPTS = {
         "equity", "ifrsfullequity", "ifrsfull_equity", "ifrs_full_equity",
         "equityattributabletoownersofparent", "ifrsfullequityattributabletoownersofparent",
     },
+    "Įsipareigojimai": {
+        "liabilities", "ifrsfullliabilities", "ifrsfull_liabilities", "ifrs_full_liabilities",
+    },
+    "Pinigai ir pinigų ekvivalentai": {
+        "cashandcashequivalents", "ifrsfullcashandcashequivalents", "cash", "cashandbankbalances",
+    },
     "Grynasis pelnas": {
         "profitloss", "profitlossattributabletoownersofparent", "profitlossfromcontinuingoperations",
         "ifrsfullprofitloss", "ifrsfull_profitloss",
@@ -847,6 +963,10 @@ CONCEPTS = {
         "revenue", "salesrevenue", "ifrsfullrevenue", "ifrs_full_revenue", "ifrsfull_revenue",
         "revenuefromcontractswithcustomers", "revenuefromcontractswithcustomersexcludingassessedtax",
         "ifrsfullrevenuefromcontractswithcustomers", "ifrsfullrevenuefromcontractswithcustomersexcludingassessedtax",
+    },
+    "Veiklos pelnas": {
+        "operatingprofitloss", "operatingprofit", "profitlossfromoperatingactivities",
+        "ifrsfullprofitlossfromoperatingactivities",
     },
     "Darbuotojų skaičius": {
         "averagenumberofemployeesduringtheperiod", "averagenumberofemployees", "numberofemployees",
@@ -1795,6 +1915,7 @@ def ensure_annual_report(news: pd.Series) -> Optional[int]:
         return None
 
     report_year = _safe_int(news.get("report_year")) or _extract_report_year_from_text(news.get("title"), news.get("content"), news.get("published_at"))
+    report_type = _collapse_ws(news.get("report_type")) or "Metinė"
     issuer = _collapse_ws(news.get("issuer"))
     issuer_norm = _issuer_key(issuer)
 
@@ -1804,7 +1925,7 @@ def ensure_annual_report(news: pd.Series) -> Optional[int]:
         "company": issuer,
         "market": "VLN",
         "report_year": report_year,
-        "report_type": "Metinė",
+        "report_type": report_type,
         "crib_url": crib_url,
         "crib_title": _collapse_ws(news.get("title")),
         "crib_category": _collapse_ws(news.get("category")),
@@ -2066,7 +2187,7 @@ def update_annual_reports_metrics(start_date: date, end_date: date, max_reports:
     allowed = load_vln_official_secondary_issuers()
     stats["allowed_issuers"] = int(len(allowed)) if allowed is not None else 0
 
-    news_df = load_annual_crib_news(start_date, end_date, allowed)
+    news_df = load_financial_crib_news(start_date, end_date, allowed)
     if news_df is None or news_df.empty:
         return stats
 
@@ -2079,10 +2200,11 @@ def update_annual_reports_metrics(start_date: date, end_date: date, max_reports:
         title = _collapse_ws(news.get("title"))
         crib_url = _collapse_ws(news.get("crib_url"))
         report_year = _safe_int(news.get("report_year"))
+        report_type = _collapse_ws(news.get("report_type")) or "Metinė"
         published_at = news.get("published_at")
 
         stats["annual_news_processed"] += 1
-        log(f"Tikrinama: {issuer} | {title[:120]}")
+        log(f"Tikrinama: {issuer} | {report_type} | {title[:100]}")
 
         try:
             annual_report_id = ensure_annual_report(news)
@@ -2712,10 +2834,10 @@ def show_metines_page():
             <div class="hero-inner">
                 <div class="hero-icon">📚</div>
                 <div>
-                    <h1 class="hero-title">Metinės ataskaitos</h1>
+                        <h1 class="hero-title">Metinės ir pusmečio ataskaitos</h1>
                     <div class="hero-text">
-                        CRIB kategorijos „Metinė informacija“ dokumentai. Modulis išsaugo ataskaitų tekstą,
-                        ištraukia balanso ir pelno (nuostolių) rodiklius ir įrašo juos į annual_report_metrics.
+                        CRIB metinės ir pusmečio informacijos dokumentai. Modulis išsaugo PDF, ZIP, XHTML ir XBRL failų tekstą,
+                        ištraukia pagrindinius finansinius rodiklius ir įrašo juos į annual_report_metrics.
                     </div>
                 </div>
             </div>
@@ -2733,17 +2855,17 @@ def show_metines_page():
     )
 
     with st.container(border=True):
-        st.subheader("Metinių ataskaitų veiksmai")
+        st.subheader("Finansinių ataskaitų veiksmai")
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             start_date = st.date_input(
-                "Metinės informacijos data nuo",
+                "Ataskaitų paskelbimo data nuo",
                 value=date.today() - timedelta(days=730),
                 key="metines_main_start_date",
             )
         with c2:
             end_date = st.date_input(
-                "Metinės informacijos data iki",
+                "Ataskaitų paskelbimo data iki",
                 value=date.today(),
                 key="metines_main_end_date",
             )
