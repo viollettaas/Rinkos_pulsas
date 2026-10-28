@@ -41,7 +41,7 @@ try:
 except Exception:  # pragma: no cover
     BeautifulSoup = None
 
-PARSER_VERSION = "financial_parser_2026-07-16a"
+PARSER_VERSION = "financial_parser_2026-10-28_financial_reports"
 
 LT_TRANS = str.maketrans({
     "ą": "a", "č": "c", "ę": "e", "ė": "e", "į": "i", "š": "s", "ų": "u", "ū": "u", "ž": "z",
@@ -63,11 +63,37 @@ METRIC_LABELS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
             "nuosavas kapitalas", "total equity", "equity total", "equity",
         ),
     ),
+    "liabilities": (
+        "Įsipareigojimai",
+        (
+            "isipareigojimai is viso", "įsipareigojimai iš viso", "viso isipareigojimu", "viso įsipareigojimų",
+            "total liabilities", "liabilities total",
+        ),
+    ),
+    "cash": (
+        "Pinigai ir pinigų ekvivalentai",
+        (
+            "pinigai ir pinigu ekvivalentai", "pinigai ir pinigų ekvivalentai",
+            "pinigai ir ju ekvivalentai", "pinigai ir jų ekvivalentai",
+            "cash and cash equivalents", "cash equivalents",
+        ),
+    ),
     "revenue": (
         "Pajamos",
         (
             "pajamos pagal sutartis su klientais", "pardavimo pajamos", "pajamos is sutarciu", "pajamos iš sutarčių",
             "pajamos", "revenue from contracts with customers", "sales revenue", "revenue", "sales",
+        ),
+    ),
+    "ebitda": (
+        "EBITDA",
+        ("ebitda", "koreguota ebitda", "adjusted ebitda"),
+    ),
+    "operating_profit": (
+        "Veiklos pelnas",
+        (
+            "veiklos pelnas", "veiklos nuostolis", "pelnas is veiklos", "pelnas iš veiklos",
+            "operating profit", "operating loss", "profit from operations",
         ),
     ),
     "profit": (
@@ -91,7 +117,10 @@ METRIC_LABELS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
 CONCEPT_ALIASES = {
     "assets": {"assets", "ifrsfullassets", "ifrsfullassetstotal", "totalassets"},
     "equity": {"equity", "ifrsfullequity", "equityattributabletoownersofparent", "totalequity"},
+    "liabilities": {"liabilities", "ifrsfullliabilities", "totalliabilities"},
+    "cash": {"cashandcashequivalents", "ifrsfullcashandcashequivalents", "cashandbankbalances"},
     "revenue": {"revenue", "ifrsfullrevenue", "revenuefromcontractswithcustomers", "salesrevenue"},
+    "operating_profit": {"operatingprofitloss", "operatingprofit", "profitlossfromoperatingactivities", "ifrsfullprofitlossfromoperatingactivities"},
     "profit": {"profitloss", "ifrsfullprofitloss", "profitlossattributabletoownersofparent", "netprofitloss"},
     "employees_average": {"averagenumberofemployees", "numberofemployees", "employees"},
 }
